@@ -28,6 +28,10 @@ fulu-tools = { path = "crates/fulu-tools" }
 fulu-skills = { path = "crates/fulu-skills" }
 fulu-audit = { path = "crates/fulu-audit" }
 fulu-app = { path = "crates/fulu-app" }
+# v0.3 能力面增量（占位，M2.5 落地）
+fulu-mcp = { path = "crates/fulu-mcp" }
+fulu-context = { path = "crates/fulu-context" }
+fulu-prompt = { path = "crates/fulu-prompt" }
 
 [profile.release]
 opt-level = "z"

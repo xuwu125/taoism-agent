@@ -1,0 +1,9 @@
+[package]
+name = "fulu-mcp"
+description = "外宗箓：全局 MCP 配置发现（只读）、stdio JSON-RPC 客户端、MCP 工具归一化适配（v0.3 占位骨架）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

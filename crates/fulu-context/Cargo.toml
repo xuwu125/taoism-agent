@@ -1,0 +1,9 @@
+[package]
+name = "fulu-context"
+description = "会话头：无授权硬件信息与 IP 所在地采集、容错降级、会话头装配（v0.3 占位骨架）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

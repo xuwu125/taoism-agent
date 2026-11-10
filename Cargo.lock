@@ -631,6 +631,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fulu-context"
+version = "0.1.0"
+
+[[package]]
 name = "fulu-core"
 version = "0.1.0"
 dependencies = [
@@ -638,6 +642,10 @@ dependencies = [
  "serde_json",
  "sha2",
 ]
+
+[[package]]
+name = "fulu-mcp"
+version = "0.1.0"
 
 [[package]]
 name = "fulu-model"
@@ -651,6 +659,10 @@ dependencies = [
 
 [[package]]
 name = "fulu-orchestrator"
+version = "0.1.0"
+
+[[package]]
+name = "fulu-prompt"
 version = "0.1.0"
 
 [[package]]
