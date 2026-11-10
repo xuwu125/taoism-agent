@@ -10,12 +10,15 @@
 //! 2. 焚化在后台线程执行，界面不卡死、也不假装「正在思考」；
 //! 3. 保留 M0 的中文 IME 探针——那是尚未完成的真人验收项，不能因为做了新界面就藏起来。
 
+mod confirm;
 mod fonts;
 
+use confirm::ConfirmExchange;
 use eframe::egui;
-use fulu_app::{AltarSession, DryRunPlan, Fu, Receipt, RiskClass};
+use fulu_app::{AltarSession, ConfirmVerdict, DryRunPlan, Fu, Receipt, RiskClass};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 
 /// 焚化任务：后台线程持有 session，跑完连人带结果送回来。
 type BurnOutcome = (AltarSession, Result<Receipt, String>);
@@ -30,6 +33,12 @@ enum Tone {
 struct FuluApp {
     session: Option<AltarSession>,
     burning: Option<Receiver<BurnOutcome>>,
+    /// 界面线程的 Context：供焚符线程里的敕门确认器唤醒界面。
+    ctx: Option<egui::Context>,
+    /// 敕门收件箱：焚符线程的 ChannelConfirmer 往这里丢「请人点头」。
+    confirm_inbox: Option<Arc<Mutex<Receiver<ConfirmExchange>>>>,
+    /// 当前正在问人的敕门请求（焚符串行，同一时刻最多一张卡）。
+    pending_confirm: Option<ConfirmExchange>,
 
     fu_text: String,
     loaded: Option<Fu>,
@@ -79,6 +88,9 @@ impl FuluApp {
         let mut app = Self {
             session: Some(session),
             burning: None,
+            ctx: None,
+            confirm_inbox: None,
+            pending_confirm: None,
             fu_text,
             loaded: None,
             seal: None,
@@ -202,12 +214,19 @@ impl FuluApp {
             self.say("法坛正忙", Tone::Bad);
             return;
         };
-        // 确认门先于焚化装好：没勾就等于无人值守，需要确认的召将一律敕否。
-        session.set_risk_ceiling(if self.allow_high_risk {
-            Some(RiskClass::Destructive)
+        let Some(ctx) = self.ctx.clone() else {
+            self.session = Some(session);
+            self.say("界面尚未就绪，稍后再焚", Tone::Bad);
+            return;
+        };
+        // 确认门先于焚化装好：默认逐次弹卡问人；勾了预授权则一次放行、不再弹窗。
+        if self.allow_high_risk {
+            session.set_risk_ceiling(Some(RiskClass::Destructive));
         } else {
-            None
-        });
+            let (confirm_tx, confirm_rx) = std::sync::mpsc::channel();
+            session.set_confirmer(Box::new(confirm::ChannelConfirmer::new(confirm_tx, ctx)));
+            self.confirm_inbox = Some(Arc::new(Mutex::new(confirm_rx)));
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let outcome = session
@@ -216,7 +235,12 @@ impl FuluApp {
             let _ = tx.send((session, outcome));
         });
         self.burning = Some(rx);
-        self.say("焚符上表……（后台执行，此点起不可撤销）", Tone::Info);
+        let note = if self.allow_high_risk {
+            "焚符上表……（后台执行，此点起不可撤销；已预授权，不再逐次弹窗）"
+        } else {
+            "焚符上表……（后台执行；高危召将弹出敕门卡片，等你逐次点头）"
+        };
+        self.say(note, Tone::Info);
     }
 
     fn poll_burn(&mut self) {
@@ -238,6 +262,8 @@ impl FuluApp {
                     .collect();
                 self.session = Some(session);
                 self.burning = None;
+                self.confirm_inbox = None;
+                self.pending_confirm = None;
                 match outcome {
                     Ok(receipt) => {
                         self.say(
@@ -273,12 +299,28 @@ impl FuluApp {
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.burning = None;
+                self.confirm_inbox = None;
+                self.pending_confirm = None;
                 self.say("焚符线程异常退出", Tone::Bad);
             }
         }
         // 后台有活时持续重绘，否则结果要等下一次鼠标动才显示。
         if self.burning.is_some() {
             std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+    }
+
+    /// 敕门收件箱：把焚符线程的「请人点头」接到界面（每帧最多取一张）。
+    fn poll_confirms(&mut self) {
+        if self.pending_confirm.is_some() {
+            return;
+        }
+        let Some(inbox) = &self.confirm_inbox else {
+            return;
+        };
+        let next = inbox.lock().expect("敕门收件箱锁中毒").try_recv().ok();
+        if let Some(exchange) = next {
+            self.pending_confirm = Some(exchange);
         }
     }
 
@@ -572,11 +614,15 @@ impl FuluApp {
                 ui.checkbox(&mut self.confirm_checked, "我确认焚化不可撤销");
             });
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.allow_high_risk, "本次焚符放行高危召将（破坏性）")
-                    .on_hover_text(
-                        "不勾选时：只读工具照常，需确认的工具（可变更/破坏性，含外宗）\
-                     在召将时一律被敕否，并记入缴符。勾选等于对自己预授权。",
-                    );
+                ui.checkbox(
+                    &mut self.allow_high_risk,
+                    "免逐次弹窗：预授权放行全部高危召将",
+                )
+                .on_hover_text(
+                    "不勾选（默认）：每个需要确认的召将在执行前弹出「敕门」卡片，\
+                     逐次问人，拒绝的理由会回喂给模型换路；\
+                     勾选等于一次性预授权，整张符不再弹窗。两种路径都会记入缴符。",
+                );
             });
 
             ui.separator();
@@ -584,6 +630,34 @@ impl FuluApp {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("焚符中……（后台线程，界面仍可操作，但不能重复提交）");
+                });
+            }
+
+            // 敕门卡片：默认逐次问人，答完即弃。
+            if let Some(exchange) = self.pending_confirm.clone() {
+                let (request, reply) = &exchange;
+                ui.separator();
+                ui.heading("敕门 · 高危召将等待确认");
+                ui.label(egui::RichText::new(request.summary()).strong());
+                if !request.description.is_empty() {
+                    ui.label(&request.description);
+                }
+                ui.label("参数原文（模型输出，原样展示，不解释）：");
+                egui::ScrollArea::vertical()
+                    .id_salt("confirm_args")
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        ui.monospace(&request.arguments_json);
+                    });
+                ui.horizontal(|ui| {
+                    if ui.button("敕可 · 本次放行").clicked() {
+                        let _ = reply.send(ConfirmVerdict::Allow);
+                        self.pending_confirm = None;
+                    }
+                    if ui.button("敕否 · 本次拒绝").clicked() {
+                        let _ = reply.send(ConfirmVerdict::Deny);
+                        self.pending_confirm = None;
+                    }
                 });
             }
 
@@ -638,7 +712,9 @@ impl eframe::App for FuluApp {
                 }
             }
         }
+        self.ctx = Some(ctx.clone());
         self.poll_burn();
+        self.poll_confirms();
         if self.burning.is_some() {
             ctx.request_repaint();
         }

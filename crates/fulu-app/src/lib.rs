@@ -11,8 +11,8 @@ use fulu_model::{ModelManifest, VerifyStatus, model_path, status, verify_file};
 use fulu_provider::{Health, LocalLfmProvider};
 use fulu_register::{Register, ToolGrant};
 
-/// 风险等级对外暴露：CLI/GUI 需要它来解析 `--allow-risk` 与渲染勾选项。
-pub use fulu_register::RiskClass;
+/// 风险等级与确认档位对外暴露：CLI/GUI 需要它们解析 `--allow-risk` 与渲染敕门卡片。
+pub use fulu_register::{Confirmation, RiskClass};
 use fulu_runtime::{AllowUpTo, Altar, Confirmer, RitualConfig, RitualError};
 use fulu_script::{decode_fu, encode_fu, seal_hex};
 use fulu_tools::{Tool, ToolPolicy, ToolRegistry};
