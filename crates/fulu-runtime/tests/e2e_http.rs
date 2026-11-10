@@ -11,8 +11,41 @@ use fulu_register::Register;
 use fulu_runtime::{Altar, RitualConfig};
 use fulu_tools::ToolRegistry;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::thread;
+use std::time::Duration;
+
+/// 把请求读完整：客户端可能把请求头和请求体分两次写，
+/// 只 `read` 一次就响应会在 Windows 上偶发 ECONNRESET（写端未完成即被关闭）。
+fn read_request(stream: &mut TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buffer.extend_from_slice(&chunk[..n]);
+                if request_complete(&buffer) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn request_complete(buffer: &[u8]) -> bool {
+    let Some(head_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+    let length = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    buffer.len() >= head_end + 4 + length
+}
 
 /// 按脚本顺序为每个连接返回一段 JSON；连接数用尽后线程自行退出。
 fn spawn_mock_server(responses: Vec<String>) -> (u16, thread::JoinHandle<()>) {
@@ -21,8 +54,7 @@ fn spawn_mock_server(responses: Vec<String>) -> (u16, thread::JoinHandle<()>) {
     let handle = thread::spawn(move || {
         for body in responses {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 8192];
-            let _ = stream.read(&mut buffer);
+            read_request(&mut stream);
             let raw = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()

@@ -602,12 +602,16 @@ name = "fulu-app"
 version = "0.1.0"
 dependencies = [
  "fulu-audit",
+ "fulu-context",
  "fulu-core",
+ "fulu-mcp",
  "fulu-model",
+ "fulu-prompt",
  "fulu-provider",
  "fulu-register",
  "fulu-runtime",
  "fulu-script",
+ "fulu-skills",
  "fulu-tools",
 ]
 
@@ -654,6 +658,7 @@ dependencies = [
 name = "fulu-mcp"
 version = "0.1.0"
 dependencies = [
+ "fulu-provider",
  "fulu-tools",
  "serde_json",
 ]

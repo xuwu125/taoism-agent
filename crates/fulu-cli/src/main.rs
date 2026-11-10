@@ -60,12 +60,13 @@ fn help() {
          \x20 fulu altar run <文件.fu> --confirm 显式确认后焚化→回执→缴符\n\
          \x20 fulu context show [--no-ip]         会话头：硬件与 IP 所在地（粗粒度，全容错）\n\
          \x20 fulu prompt show                    分层系统提示词装配预览（含逐层占用）\n\
-         \x20 fulu mcp list [配置路径]             外宗箓：全局 MCP 只读展示（绝不写配置）\n\
+         \x20 fulu mcp list [配置路径] [--attach] 外宗箓：只读展示；--attach 真正握手并列工具\n\
          \x20 fulu skills list [根目录]            符胆：全局技能包只读展示\n\
          \x20 fulu init [--workspace <目录>]       引符：开箱基础配置（生成第一张示例符）\n\
          \x20 fulu help                          本帮助\n\
          \n\
          可选参数（altar）：--confirm --endpoint <回环URL> --workspace <目录> --export <日志.jsonl>\n\
+         \x20                 --mcp [配置路径]  焚化时接入外宗（受限级，需沙箱 ≥ limited）\n\
          环境变量：{ENDPOINT_ENV}=http://127.0.0.1:8080\n\
          槽位默认 default；可用：default / lowmem / fallback / finetune_base"
     );
@@ -313,6 +314,8 @@ struct AltarOptions {
     endpoint: Option<String>,
     workspace: Option<PathBuf>,
     export: Option<PathBuf>,
+    /// `--mcp`：焚化时接入本机全局 MCP（外宗），`--mcp <配置>` 可指定单份配置。
+    mcp: Option<Option<PathBuf>>,
 }
 
 fn parse_altar_options(args: &[String]) -> AltarOptions {
@@ -338,6 +341,17 @@ fn parse_altar_options(args: &[String]) -> AltarOptions {
                     options.export = Some(PathBuf::from(value));
                     index += 1;
                 }
+            }
+            "--mcp" => {
+                // 裸 `--mcp` 走系统默认路径；`--mcp <path>` 只读那一份配置。
+                let explicit = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .map(PathBuf::from);
+                if explicit.is_some() {
+                    index += 1;
+                }
+                options.mcp = Some(explicit);
             }
             other => eprintln!("[WARN] 忽略未知参数：{other}"),
         }
@@ -382,6 +396,39 @@ fn altar(args: &[String]) -> i32 {
     }
     if let Some(root) = &options.workspace {
         session.set_workspace(root.clone());
+    }
+    if let Some(explicit) = &options.mcp {
+        // 外宗接入发生在 dry-run 之前：工具面必须出现在待焚计划里，
+        // 否则用户是在「不知道这张符能召哪些外宗将」的情况下按下确认。
+        let paths = match explicit {
+            Some(path) => vec![path.clone()],
+            None => fulu_mcp::default_config_paths(),
+        };
+        let (servers, issues) = fulu_mcp::discover(&paths);
+        for issue in &issues {
+            eprintln!("[WARN] 外宗配置：{issue}");
+        }
+        let report = session.attach_mcp(&servers);
+        println!("[OK] {}", report.summary());
+        for server in &report.servers {
+            if server.connected {
+                println!(
+                    "  - {:<16} {} 个工具：{}",
+                    server.name,
+                    server.tools.len(),
+                    server.tools.join(", ")
+                );
+            } else {
+                println!(
+                    "  - {:<16} [ERR] {}",
+                    server.name,
+                    server.error.as_deref().unwrap_or("未知原因")
+                );
+            }
+            for warning in &server.warnings {
+                println!("    [WARN] {warning}");
+            }
+        }
     }
 
     let plan = match session.dry_run(&fu) {
@@ -591,7 +638,7 @@ fn prompt_show() -> i32 {
     } else {
         let mcp = servers
             .iter()
-            .map(|server| format!("{}({})", server.name, server.command))
+            .map(|server| format!("{}({})", server.name, server.transport.label()))
             .collect::<Vec<_>>()
             .join("、");
         let skill = skills
@@ -646,7 +693,8 @@ fn mcp(args: &[String]) -> i32 {
         eprintln!("[ERR] 未知 mcp 子命令：{command}");
         return 2;
     }
-    let paths: Vec<PathBuf> = match args.get(1) {
+    let attach = args.iter().any(|arg| arg == "--attach");
+    let paths: Vec<PathBuf> = match args.iter().skip(1).find(|arg| !arg.starts_with("--")) {
         Some(explicit) => vec![PathBuf::from(explicit)],
         None => fulu_mcp::default_config_paths(),
     };
@@ -668,10 +716,7 @@ fn mcp(args: &[String]) -> i32 {
         return 0;
     }
     for server in &servers {
-        println!(
-            "  - {:<16} cmd={} args={:?}",
-            server.name, server.command, server.args
-        );
+        println!("  - {:<16} {}", server.name, server.transport.label());
         println!(
             "    env 键（值不读不出）: {}",
             if server.env_keys.is_empty() {
@@ -682,10 +727,58 @@ fn mcp(args: &[String]) -> i32 {
         );
         println!("    来源       : {}", server.config_path.display());
     }
+
+    if !attach {
+        println!(
+            "[INFO] 仅展示。加 --attach 可真正握手（stdio 子进程）并列出可用工具；\
+             调用时同样过箓核验，外宗工具固定为受限级。"
+        );
+        return 0;
+    }
+
+    println!("\n[RUN] 握手（每台 server 一个子进程，全部工具共享该进程）");
+    let mut total = 0_usize;
+    let mut failed = 0_usize;
+    for server in &servers {
+        match fulu_mcp::connect(server) {
+            Ok(session) => {
+                println!(
+                    "  [OK] {:<16} {} 个工具  protocol={}",
+                    session.server,
+                    session.tools.len(),
+                    session
+                        .handshake
+                        .pointer("/protocolVersion")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                );
+                for tool in &session.tools {
+                    println!(
+                        "       - {:<40} {}",
+                        tool.tool_id(),
+                        if tool.description().is_empty() {
+                            "（无描述）"
+                        } else {
+                            tool.description()
+                        }
+                    );
+                }
+                total += session.tools.len();
+                for warning in &session.warnings {
+                    println!("       [WARN] {warning}");
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                println!("  [ERR] {:<16} 接入失败：{error}", server.name);
+            }
+        }
+    }
     println!(
-        "[INFO] 接入：M2.5 起支持 stdio server 的 tools/list / tools/call；调用同样过箓核验，默认逐次确认。"
+        "[INFO] 共 {} 个外宗工具可用（受限级，需符的沙箱 ≥ limited 才能召）；{} 台接入失败。",
+        total, failed
     );
-    0
+    if failed > 0 { 1 } else { 0 }
 }
 
 fn skills(args: &[String]) -> i32 {

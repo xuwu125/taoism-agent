@@ -76,14 +76,20 @@ impl Endpoint {
             HttpError::InvalidEndpoint("只允许明文 HTTP 回环地址，不接受 HTTPS 或裸地址".into())
         })?;
         let authority = rest.split('/').next().unwrap_or(rest);
-        let (host, port_text) = authority
-            .rsplit_once(':')
-            .ok_or_else(|| HttpError::InvalidEndpoint("缺少端口".into()))?;
+        // 先判主机再判端口：否则 `http://example.com/mcp` 会报「缺少端口」，
+        // 把「不能发往网络」这个真正的原因盖掉。
+        let (host, port_text) = match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        };
         if host != "127.0.0.1" && host != "localhost" {
             return Err(HttpError::InvalidEndpoint(format!(
-                "主机 {host} 不是回环地址，禁止把推理流量发往网络"
+                "主机 {host} 不是回环地址，禁止把流量发往网络"
             )));
         }
+        let Some(port_text) = port_text else {
+            return Err(HttpError::InvalidEndpoint("缺少端口".into()));
+        };
         let port: u16 = port_text
             .parse()
             .map_err(|_| HttpError::InvalidEndpoint(format!("端口不合法：{port_text}")))?;
@@ -104,6 +110,8 @@ impl Endpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
+    /// 响应头原文（键统一小写）。MCP 的 `mcp-session-id` 依赖它，故不能只留 body。
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
@@ -111,6 +119,15 @@ impl HttpResponse {
     pub fn body_text(&self) -> Result<String, HttpError> {
         String::from_utf8(self.body.clone())
             .map_err(|e| HttpError::MalformedResponse(format!("响应不是 UTF-8：{e}")))
+    }
+
+    /// 按小写键取响应头（多值取第一个）。
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let lowered = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(key, _)| *key == lowered)
+            .map(|(_, value)| value.as_str())
     }
 
     /// 非 2xx 一律视为错误，不吞掉服务端的报错正文。
@@ -201,28 +218,69 @@ fn read_chunked<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, HttpError> {
     Ok(output)
 }
 
+/// 一次请求的全部要素。`headers` 用于外宗（MCP）这类需要认证头的明文回环服务；
+/// 值只在内存里用，不写日志、不进缴符。
+#[derive(Debug, Clone)]
+pub struct HttpRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub headers: &'a [(&'a str, &'a str)],
+    pub body: Option<&'a [u8]>,
+    pub timeout: Duration,
+}
+
+impl<'a> HttpRequest<'a> {
+    pub fn get(path: &'a str, timeout: Duration) -> Self {
+        Self {
+            method: "GET",
+            path,
+            headers: &[],
+            body: None,
+            timeout,
+        }
+    }
+
+    pub fn post(path: &'a str, body: &'a [u8], timeout: Duration) -> Self {
+        Self {
+            method: "POST",
+            path,
+            headers: &[],
+            body: Some(body),
+            timeout,
+        }
+    }
+
+    #[must_use]
+    pub fn with_headers(mut self, headers: &'a [(&'a str, &'a str)]) -> Self {
+        self.headers = headers;
+        self
+    }
+}
+
 /// 发一次请求并读完整响应。每次新建连接（`Connection: close`），避免连接复用状态。
-pub fn request(
-    endpoint: &Endpoint,
-    method: &str,
-    path: &str,
-    body: Option<&[u8]>,
-    timeout: Duration,
-) -> Result<HttpResponse, HttpError> {
+pub fn send(endpoint: &Endpoint, request: &HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
     let address = format!("{}:{}", endpoint.host, endpoint.port);
     let socket = address
         .to_socket_addrs()
         .map_err(|e| HttpError::Connect(e.to_string()))?
         .next()
         .ok_or_else(|| HttpError::Connect(format!("无法解析 {address}")))?;
-    let mut stream = TcpStream::connect_timeout(&socket, timeout).map_err(io_error)?;
-    stream.set_read_timeout(Some(timeout)).map_err(io_error)?;
-    stream.set_write_timeout(Some(timeout)).map_err(io_error)?;
+    let mut stream = TcpStream::connect_timeout(&socket, request.timeout).map_err(io_error)?;
+    stream
+        .set_read_timeout(Some(request.timeout))
+        .map_err(io_error)?;
+    stream
+        .set_write_timeout(Some(request.timeout))
+        .map_err(io_error)?;
 
-    let payload = body.unwrap_or(&[]);
+    let payload = request.body.unwrap_or(&[]);
     let mut header = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nUser-Agent: taoism-agent/fulu\r\nAccept: application/json\r\nConnection: close\r\n"
+        "{} {} HTTP/1.1\r\nHost: {address}\r\nUser-Agent: taoism-agent/fulu\r\nAccept: application/json\r\nConnection: close\r\n",
+        request.method, request.path
     );
+    for (name, value) in request.headers {
+        header.push_str(&format!("{name}: {value}\r\n"));
+    }
     if !payload.is_empty() {
         header.push_str("Content-Type: application/json\r\n");
     }
@@ -242,6 +300,7 @@ pub fn request(
 
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
+    let mut headers: Vec<(String, String)> = Vec::new();
     loop {
         line.clear();
         let read = read_line(&mut reader, &mut line)?;
@@ -254,15 +313,18 @@ pub fn request(
                 truncate(line.trim(), 120)
             )));
         };
-        match key.trim().to_ascii_lowercase().as_str() {
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().to_owned();
+        match key.as_str() {
             "content-length" => {
-                content_length = value.trim().parse().ok();
+                content_length = value.parse().ok();
             }
             "transfer-encoding" if value.to_ascii_lowercase().contains("chunked") => {
                 chunked = true;
             }
             _ => {}
         }
+        headers.push((key, value));
     }
 
     let body_bytes = if chunked {
@@ -275,8 +337,29 @@ pub fn request(
 
     Ok(HttpResponse {
         status,
+        headers,
         body: body_bytes,
     })
+}
+
+/// 兼容入口：无自定义请求头的简单调用（provider 自身用）。
+pub fn request(
+    endpoint: &Endpoint,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<HttpResponse, HttpError> {
+    send(
+        endpoint,
+        &HttpRequest {
+            method,
+            path,
+            headers: &[],
+            body,
+            timeout,
+        },
+    )
 }
 
 #[cfg(test)]

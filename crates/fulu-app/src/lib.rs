@@ -6,14 +6,21 @@
 
 use fulu_audit::AuditLog;
 use fulu_core::Talisman;
+use fulu_mcp::McpServerInfo;
 use fulu_model::{ModelManifest, VerifyStatus, model_path, status, verify_file};
 use fulu_provider::{Health, LocalLfmProvider};
-use fulu_register::Register;
-use fulu_runtime::{Altar, DryRunPlan, Receipt, RitualConfig, RitualError};
+use fulu_register::{Permission, Register, ToolGrant};
+use fulu_runtime::{Altar, RitualConfig, RitualError};
 use fulu_script::{decode_fu, encode_fu, seal_hex};
-use fulu_tools::{ToolPolicy, ToolRegistry};
+use fulu_tools::{Tool, ToolPolicy, ToolRegistry};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// 门面重导出：UI 只依赖 `fulu-app`，不直连 `fulu-core` / `fulu-runtime`。
+/// 契约是「UI 不构造运行时对象」，持有门面返回的值是允许的。
+pub use fulu_core::Talisman as Fu;
+pub use fulu_runtime::{DryRunPlan, Receipt};
 
 /// 本地推理服务端点环境变量；未设置时 provider 处于「未就绪」，不会静默联网。
 pub const ENDPOINT_ENV: &str = "FULU_LLAMA_ENDPOINT";
@@ -154,6 +161,11 @@ pub fn sample_fu_text() -> Result<String, AppError> {
     encode_fu(&Talisman::sample()).map_err(|e| AppError::Script(e.to_string()))
 }
 
+/// 从文本解析一张符：GUI 编辑器里的内容走这条，不落盘也能校验。
+pub fn parse_fu(text: &str) -> Result<Talisman, AppError> {
+    decode_fu(text).map_err(|e| AppError::Script(e.to_string()))
+}
+
 /// 从 `.fu` 文件加载；解析阶段即做结构校验，破符绝不进入法坛。
 pub fn load_fu(path: &Path) -> Result<Talisman, AppError> {
     let text = std::fs::read_to_string(path)
@@ -169,6 +181,57 @@ pub struct ProbeReport {
     pub models: Vec<String>,
 }
 
+/// 外宗（MCP）一台 server 的接入结果。
+///
+/// 「只展示不管理」的落地形态：fulu 负责发现、握手、把工具挂进箓，
+/// 但**不写**任何全局配置、不装不升级不删。连不上就如实记账，不猜。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OuterSectServer {
+    pub name: String,
+    /// 传输描述（`stdio: node x.js` / `http: http://...`），不含认证头值。
+    pub transport: String,
+    pub connected: bool,
+    /// 箓登记名：`mcp.<server>.<tool>`
+    pub tools: Vec<String>,
+    pub error: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OuterSectReport {
+    pub servers: Vec<OuterSectServer>,
+    /// 配置发现阶段的问题（非法 JSON、缺字段等），与连接失败分开记。
+    pub issues: Vec<String>,
+}
+
+impl OuterSectReport {
+    pub fn tool_ids(&self) -> Vec<String> {
+        self.servers
+            .iter()
+            .flat_map(|server| server.tools.iter().cloned())
+            .collect()
+    }
+
+    pub fn connected_count(&self) -> usize {
+        self.servers
+            .iter()
+            .filter(|server| server.connected)
+            .count()
+    }
+
+    pub fn summary(&self) -> String {
+        if self.servers.is_empty() {
+            return "外宗：未发现可接入的 MCP server".into();
+        }
+        format!(
+            "外宗：{}/{} 台已接入，共 {} 个工具",
+            self.connected_count(),
+            self.servers.len(),
+            self.tool_ids().len()
+        )
+    }
+}
+
 /// 一场仪轨的完整会话。provider / 箓 / 风火轮 / 缴符都在这里组装，
 /// GUI 与 CLI 各自只负责展示与收集「确认」。
 pub struct AltarSession {
@@ -176,6 +239,7 @@ pub struct AltarSession {
     register: Register,
     tools: ToolRegistry,
     audit: AuditLog,
+    outer_sect: OuterSectReport,
 }
 
 impl Default for AltarSession {
@@ -201,6 +265,7 @@ impl AltarSession {
             register: Register::baseline(),
             tools: ToolRegistry::default(),
             audit: AuditLog::new(),
+            outer_sect: OuterSectReport::default(),
         }
     }
 
@@ -223,10 +288,65 @@ impl AltarSession {
     }
 
     pub fn set_workspace(&mut self, root: PathBuf) {
-        self.tools = ToolRegistry::new(ToolPolicy {
+        // 只换策略，保留已注册的外宗工具：重建 registry 会把它们静默丢掉。
+        self.tools.set_policy(ToolPolicy {
             root: Some(root),
             allowed_domains: Vec::new(),
         });
+    }
+
+    pub fn outer_sect(&self) -> &OuterSectReport {
+        &self.outer_sect
+    }
+
+    /// 接入外宗：逐台握手、把暴露的工具挂进箓与风火轮。
+    ///
+    /// 权限档位固定为「受限执行」：MCP 工具的副作用 fulu 无法判断，
+    /// 因此只读符（`Strict`）申请它会被 `PermissionTooLow` 驳回——
+    /// 用户必须显式把符的沙箱提到 `limited` 才能召这些将。
+    pub fn attach_mcp(&mut self, servers: &[McpServerInfo]) -> OuterSectReport {
+        for info in servers {
+            match fulu_mcp::connect(info) {
+                Ok(session) => {
+                    let mut ids = Vec::new();
+                    for tool in &session.tools {
+                        let id = tool.tool_id().to_owned();
+                        let grant = ToolGrant::read_only(&id, tool.description())
+                            .with_parameters_json(tool.schema_json());
+                        let mut grant = grant;
+                        grant.permission = Permission::Limited;
+                        grant.max_calls = 16;
+                        self.register.grant_tool(grant);
+                        self.tools.register(tool.clone() as Arc<dyn Tool>);
+                        ids.push(id);
+                    }
+                    self.outer_sect.servers.push(OuterSectServer {
+                        name: session.server.clone(),
+                        transport: info.transport.label(),
+                        connected: true,
+                        tools: ids,
+                        error: None,
+                        warnings: session.warnings,
+                    });
+                }
+                Err(error) => self.outer_sect.servers.push(OuterSectServer {
+                    name: info.name.clone(),
+                    transport: info.transport.label(),
+                    connected: false,
+                    tools: Vec::new(),
+                    error: Some(error.to_string()),
+                    warnings: Vec::new(),
+                }),
+            }
+        }
+        self.outer_sect.clone()
+    }
+
+    /// 按系统约定路径发现并接入（只读配置文件，绝不写回）。
+    pub fn attach_mcp_from_defaults(&mut self) -> OuterSectReport {
+        let (servers, issues) = fulu_mcp::discover(&fulu_mcp::default_config_paths());
+        self.outer_sect.issues = issues;
+        self.attach_mcp(&servers)
     }
 
     pub fn endpoint(&self) -> &str {
@@ -266,7 +386,26 @@ impl AltarSession {
     /// 成符 → 盖印 → 待焚。零网络请求。
     pub fn dry_run(&mut self, fu: &Talisman) -> Result<DryRunPlan, AppError> {
         let mut altar = self.altar(fu);
-        Ok(altar.prepare(fu)?)
+        let mut plan = altar.prepare(fu)?;
+        // 把外宗的影响面写进 dry-run 计划：用户确认前必须看见「这张符能召哪些外宗将」。
+        if !self.outer_sect.servers.is_empty() {
+            plan.notes.push(self.outer_sect.summary());
+            for server in &self.outer_sect.servers {
+                let state = if server.connected {
+                    format!("{} 个工具", server.tools.len())
+                } else {
+                    format!(
+                        "连接失败：{}",
+                        server.error.as_deref().unwrap_or("未知原因")
+                    )
+                };
+                plan.notes.push(format!(
+                    "  外宗 {:<16} {}（{}）",
+                    server.name, state, server.transport
+                ));
+            }
+        }
+        Ok(plan)
     }
 
     /// 焚化。`confirmed` 由 UI 的按钮 / CLI 的 `--confirm` 提供，门面不替用户决定。

@@ -560,25 +560,27 @@ impl<'a> Altar<'a> {
 }
 
 /// 把「箓」中已受箓的工具定义转成 OpenAI 兼容 tools 数组。
+/// 把受箓工具渲染成 OpenAI 兼容的 `tools` 数组。
+///
+/// 参数 schema 一律取自箓牒（`ToolGrant::parameters_json`）：内置工具在
+/// baseline 里写好，外宗（MCP）工具用 server 声明的真实 `inputSchema`。
+/// 解析失败退回空参数——宁可让模型少知道，也不把坏 JSON 递进请求体。
 pub fn build_tools_json(auth: &Authorization, register: &Register) -> String {
     let tools: Vec<Value> = auth
         .allowed_tools
         .iter()
         .filter_map(|id| {
             let grant = register.tool(id)?;
-            let properties = match id.as_str() {
-                "fs.read" => {
-                    json!({"path": {"type": "string", "description": "相对工作区根目录的路径"}})
-                }
-                "echo" => json!({"text": {"type": "string"}}),
-                _ => json!({}),
-            };
+            let parameters = serde_json::from_str::<Value>(&grant.parameters_json)
+                .ok()
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
             Some(json!({
                 "type": "function",
                 "function": {
                     "name": id,
                     "description": grant.description,
-                    "parameters": {"type": "object", "properties": properties}
+                    "parameters": parameters
                 }
             }))
         })
@@ -817,5 +819,28 @@ mod tests {
         extended.grant_tool(grant);
         assert_eq!(build_tools_json(&auth, &extended), json);
         assert!(!json.contains("http.get"), "未受箓的工具不得下发给模型");
+    }
+
+    #[test]
+    fn outer_sect_schema_reaches_the_model_verbatim() {
+        // 外宗工具的参数必须原样来自 server 声明的 inputSchema，
+        // 否则模型只能猜参数名（M3 之前 build_tools_json 一律给空 properties）。
+        let mut fu = Talisman::sample();
+        fu.harness.sandbox = fulu_core::Sandbox::Limited;
+        fu.tool_refs = vec!["mcp.fake.shout".into()];
+        fu.harness.allow_tools = fu.tool_refs.clone();
+        let mut register = Register::baseline();
+        let mut grant = ToolGrant::read_only("mcp.fake.shout", "外宗回声");
+        grant.permission = fulu_register::Permission::Limited;
+        register.grant_tool(grant.with_parameters_json(
+            r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#,
+        ));
+        let auth = register.authorize(&fu).unwrap();
+        let value: Value = serde_json::from_str(&build_tools_json(&auth, &register)).unwrap();
+        assert_eq!(value[0]["function"]["name"], "mcp.fake.shout");
+        assert_eq!(
+            value[0]["function"]["parameters"]["required"][0],
+            Value::String("text".into())
+        );
     }
 }

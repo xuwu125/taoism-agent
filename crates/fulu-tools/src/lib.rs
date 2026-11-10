@@ -337,6 +337,12 @@ impl ToolRegistry {
         &self.policy
     }
 
+    /// 换工作区/域名策略时只换策略，**保留已注册的工具**。
+    /// 直接重建 registry 会把装配好的外宗（MCP）工具整批丢掉。
+    pub fn set_policy(&mut self, policy: ToolPolicy) {
+        self.policy = policy;
+    }
+
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.id().to_owned(), tool);
     }

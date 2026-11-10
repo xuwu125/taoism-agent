@@ -38,6 +38,13 @@ impl Permission {
     }
 }
 
+/// 无参工具的参数描述：合法 JSON Schema，模型据此知道「不需要参数」。
+pub const EMPTY_PARAMETERS_JSON: &str = r#"{"type":"object","properties":{}}"#;
+
+fn empty_parameters_json() -> String {
+    EMPTY_PARAMETERS_JSON.to_owned()
+}
+
 /// 一条箓牒：工具的授予上限。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolGrant {
@@ -49,6 +56,10 @@ pub struct ToolGrant {
     pub allowed_domains: Vec<String>,
     pub needs_network: bool,
     pub max_calls: u32,
+    /// 交给模型的参数 JSON Schema。外宗（MCP）工具用它携带 server 声明的
+    /// 真实 `inputSchema`，否则模型只能瞎猜参数名。
+    #[serde(default = "empty_parameters_json")]
+    pub parameters_json: String,
 }
 
 impl ToolGrant {
@@ -61,7 +72,22 @@ impl ToolGrant {
             allowed_domains: Vec::new(),
             needs_network: false,
             max_calls: 8,
+            parameters_json: empty_parameters_json(),
         }
+    }
+
+    /// 带上参数 schema（builder 风格，便于外宗工具登记时链式书写）。
+    ///
+    /// 这里只做形状检查（必须是一对大括号包住的 JSON 对象），不引入 JSON 解析器：
+    /// 箓层保持「只存授权事实、不解释内容」的定位，真正的解析在装配时完成，
+    /// 解析失败一律退回空参数，绝不把脏串塞给模型。
+    #[must_use]
+    pub fn with_parameters_json(mut self, schema: &str) -> Self {
+        let trimmed = schema.trim();
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            self.parameters_json = trimmed.to_owned();
+        }
+        self
     }
 }
 
@@ -175,9 +201,20 @@ impl Register {
         register
             .granted_credentials
             .insert("lu://default/local".into());
-        register.grant_tool(ToolGrant::read_only("fs.read", "读取工作区内的文本文件"));
-        register.grant_tool(ToolGrant::read_only("echo", "回显参数，无副作用"));
-        let mut shell = ToolGrant::read_only("shell.exec", "分 OS 命令行执行（受限级，工作区内）");
+        register.grant_tool(
+            ToolGrant::read_only("fs.read", "读取工作区内的文本文件").with_parameters_json(
+                r#"{"type":"object","properties":{"path":{"type":"string","description":"相对工作区根目录的路径"}},"required":["path"]}"#,
+            ),
+        );
+        register.grant_tool(
+            ToolGrant::read_only("echo", "回显参数，无副作用").with_parameters_json(
+                r#"{"type":"object","properties":{"text":{"type":"string"}}}"#,
+            ),
+        );
+        let mut shell = ToolGrant::read_only("shell.exec", "分 OS 命令行执行（受限级，工作区内）")
+            .with_parameters_json(
+                r#"{"type":"object","properties":{"command":{"type":"string","description":"单条命令，工作区内执行"}},"required":["command"]}"#,
+            );
         shell.permission = Permission::Limited;
         shell.max_calls = 8;
         register.grant_tool(shell);
@@ -357,5 +394,22 @@ mod tests {
             auth.check_call("shell.exec", 0),
             Err(RegisterError::ToolNotInRegister("shell.exec".into()))
         );
+    }
+
+    #[test]
+    fn grants_carry_parameter_schema_and_reject_garbage() {
+        let register = Register::baseline();
+        let fs_read = register.tool("fs.read").unwrap();
+        assert!(fs_read.parameters_json.contains("\"required\":[\"path\"]"));
+
+        // 未声明参数的工具仍必须给出合法空 schema，而不是空串。
+        let plain = ToolGrant::read_only("mcp.x.y", "外宗工具");
+        assert_eq!(plain.parameters_json, EMPTY_PARAMETERS_JSON);
+
+        // 脏串被拒，保持原值不变。
+        let kept = plain.clone().with_parameters_json("not json at all");
+        assert_eq!(kept.parameters_json, EMPTY_PARAMETERS_JSON);
+        let adopted = plain.with_parameters_json(r#"{"type":"object"}"#);
+        assert_eq!(adopted.parameters_json, r#"{"type":"object"}"#);
     }
 }

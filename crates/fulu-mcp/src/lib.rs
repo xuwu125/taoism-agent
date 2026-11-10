@@ -32,17 +32,92 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 // 只读发现
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 一台 server 的接入方式。
+///
+/// 只支持两种：本机 stdio 子进程、本机明文回环 HTTP。
+/// 远程 MCP（HTTPS）需要 TLS 边界，属独立增量，不在这里偷偷打开。
+#[derive(Clone, PartialEq, Eq)]
+pub enum Transport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+    },
+    StreamableHttp {
+        url: String,
+        /// 认证头等。**值只在内存里用**：Debug 打码、不进日志、不进缴符。
+        headers: Vec<(String, String)>,
+    },
+}
+
+impl Transport {
+    /// 给人看的一行描述（永不包含 header 值）。
+    pub fn label(&self) -> String {
+        match self {
+            Self::Stdio { command, args } => {
+                if args.is_empty() {
+                    format!("stdio: {command}")
+                } else {
+                    format!("stdio: {command} {}", args.join(" "))
+                }
+            }
+            Self::StreamableHttp { url, headers } => {
+                if headers.is_empty() {
+                    format!("http: {url}")
+                } else {
+                    format!("http: {url}（{} 个请求头）", headers.len())
+                }
+            }
+        }
+    }
+}
+
+/// 手写 Debug：`env` 与 `headers` 的值一律打码。
+/// 这条不是洁癖——`format!("{:?}")` 会顺手把配置里的 Bearer token 写进日志。
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdio { command, args } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                .finish(),
+            Self::StreamableHttp { url, headers } => f
+                .debug_struct("StreamableHttp")
+                .field("url", url)
+                .field(
+                    "headers",
+                    &headers
+                        .iter()
+                        .map(|(name, _)| format!("{name}: <masked>"))
+                        .collect::<Vec<_>>(),
+                )
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct McpServerInfo {
     pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
+    pub transport: Transport,
     /// 只记录键名，值不读不出。
     pub env_keys: Vec<String>,
     /// 来源配置文件路径。
     pub config_path: PathBuf,
     /// 该 server 的工具数（仅当配置中带预登记信息时才有，通常为空）。
     pub notes: Vec<String>,
+}
+
+impl std::fmt::Debug for McpServerInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServerInfo")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field("env_keys", &self.env_keys)
+            .field("config_path", &self.config_path)
+            .field("notes", &self.notes)
+            .finish()
+    }
 }
 
 /// 默认发现路径：用户主目录下的全局 MCP 配置（与生态约定的位置一致）。
@@ -77,27 +152,59 @@ pub fn discover(paths: &[PathBuf]) -> (Vec<McpServerInfo>, Vec<String>) {
             continue;
         };
         for (name, entry) in table {
-            let command = entry
-                .get("command")
+            let entry_type = entry
+                .get("type")
                 .and_then(Value::as_str)
-                .unwrap_or_default();
-            if command.is_empty() {
-                issues.push(format!("{name}：缺少 command，跳过"));
-                continue;
-            }
+                .unwrap_or("stdio")
+                .to_ascii_lowercase();
+            let transport = if entry_type.contains("http") || entry.get("url").is_some() {
+                let url = entry.get("url").and_then(Value::as_str).unwrap_or_default();
+                if url.is_empty() {
+                    issues.push(format!("{name}：声明为 HTTP 传输但缺少 url，跳过"));
+                    continue;
+                }
+                // 头部的值必须读（否则认证型 server 根本连不上），但只在内存里用。
+                let headers = entry
+                    .get("headers")
+                    .and_then(Value::as_object)
+                    .map(|map| {
+                        map.iter()
+                            .filter_map(|(key, value)| {
+                                value.as_str().map(|v| (key.clone(), v.to_owned()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Transport::StreamableHttp {
+                    url: url.to_owned(),
+                    headers,
+                }
+            } else {
+                let command = entry
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if command.is_empty() {
+                    issues.push(format!("{name}：缺少 command，跳过"));
+                    continue;
+                }
+                Transport::Stdio {
+                    command: command.to_owned(),
+                    args: entry
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(Value::as_str)
+                                .map(ToOwned::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            };
             servers.push(McpServerInfo {
                 name: name.clone(),
-                command: command.to_owned(),
-                args: entry
-                    .get("args")
-                    .and_then(Value::as_array)
-                    .map(|list| {
-                        list.iter()
-                            .filter_map(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                transport,
                 env_keys: entry
                     .get("env")
                     .and_then(Value::as_object)
@@ -123,6 +230,77 @@ pub struct McpToolDesc {
     pub schema_json: String,
 }
 
+/// 传输无关的 MCP 调用面：stdio 子进程与回环 HTTP 都实现它。
+///
+/// 存在的意义是「工具适配器只写一次」——`McpToolAdapter` 只认这个 trait，
+/// 换传输不动工具层，也不会出现两套略有差异的核验逻辑。
+pub trait McpCaller: Send {
+    fn server_name(&self) -> &str;
+    fn initialize(&mut self) -> Result<Value, McpError>;
+    fn list_tools(&mut self) -> Result<Vec<McpToolDesc>, McpError>;
+    fn call_tool(&mut self, tool: &str, arguments_json: &str) -> Result<ToolOutput, McpError>;
+}
+
+/// 把 `tools/call` 的 `content` 块拼成纯文本，并做上限截断。
+/// 外宗输出一律视为**不可信文本**，只能作为工具结果进入当轮对话。
+fn render_tool_result(
+    server: &str,
+    tool: &str,
+    result: &Value,
+) -> Result<(String, bool), McpError> {
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut content = String::new();
+    if let Some(blocks) = result.get("content").and_then(Value::as_array) {
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = block.get("text").and_then(Value::as_str)
+            {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(text);
+            }
+        }
+    }
+    if is_error {
+        return Err(McpError(format!("工具 {tool}（{server}）报错：{content}")));
+    }
+    let truncated = content.chars().count() > TOOL_OUTPUT_CHARS;
+    if truncated {
+        let cut: String = content.chars().take(TOOL_OUTPUT_CHARS).collect();
+        content = format!("{cut}\n[TRUNCATED：外宗输出超过 64 KiB 上限]");
+    }
+    Ok((content, truncated))
+}
+
+/// 把 `tools/list` 的结果转成工具描述。
+fn collect_tool_descs(server: &str, result: &Value) -> Vec<McpToolDesc> {
+    let Some(list) = result.get("tools").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|tool| {
+            let name = tool.get("name").and_then(Value::as_str)?.to_owned();
+            Some(McpToolDesc {
+                server: server.to_owned(),
+                name,
+                description: tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                schema_json: tool
+                    .get("inputSchema")
+                    .map(|schema| schema.to_string())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct McpError(pub String);
 
@@ -139,21 +317,7 @@ impl std::error::Error for McpError {}
 pub fn extract_response(line: &str, id: u64) -> Result<Option<Value>, McpError> {
     let value: Value =
         serde_json::from_str(line).map_err(|e| McpError(format!("非 JSON 行：{e}")))?;
-    let response_id = value.get("id").and_then(Value::as_u64);
-    if response_id != Some(id) {
-        return Ok(None);
-    }
-    if let Some(error) = value.get("error") {
-        return Err(McpError(format!(
-            "server 返回错误 {}：{}",
-            error.get("code").map(|c| c.to_string()).unwrap_or_default(),
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("未知")
-        )));
-    }
-    Ok(Some(value.get("result").cloned().unwrap_or(Value::Null)))
+    extract_response_value(&value, id)
 }
 
 pub struct McpStdioClient {
@@ -293,28 +457,7 @@ impl McpStdioClient {
 
     pub fn list_tools(&mut self) -> Result<Vec<McpToolDesc>, McpError> {
         let result = self.request("tools/list", json!({}))?;
-        let Some(list) = result.get("tools").and_then(Value::as_array) else {
-            return Ok(Vec::new());
-        };
-        Ok(list
-            .iter()
-            .filter_map(|tool| {
-                let name = tool.get("name").and_then(Value::as_str)?.to_owned();
-                Some(McpToolDesc {
-                    server: self.server.clone(),
-                    name,
-                    description: tool
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    schema_json: tool
-                        .get("inputSchema")
-                        .map(|schema| schema.to_string())
-                        .unwrap_or_default(),
-                })
-            })
-            .collect())
+        Ok(collect_tool_descs(&self.server, &result))
     }
 
     /// tools/call；输出截断到 `TOOL_OUTPUT_CHARS` 并标注，视为不可信文本。
@@ -322,37 +465,30 @@ impl McpStdioClient {
         let arguments: Value = serde_json::from_str(arguments_json)
             .map_err(|e| McpError(format!("参数不是合法 JSON：{e}")))?;
         let result = self.request("tools/call", json!({"name": tool, "arguments": arguments}))?;
-        let is_error = result
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let mut content = String::new();
-        if let Some(blocks) = result.get("content").and_then(Value::as_array) {
-            for block in blocks {
-                if block.get("type").and_then(Value::as_str) == Some("text")
-                    && let Some(text) = block.get("text").and_then(Value::as_str)
-                {
-                    if !content.is_empty() {
-                        content.push('\n');
-                    }
-                    content.push_str(text);
-                }
-            }
-        }
-        if is_error {
-            return Err(McpError(format!("工具 {tool} 报错：{content}")));
-        }
-        let tool_id = format!("mcp.{}.{}", self.server, tool);
-        let truncated = content.chars().count() > TOOL_OUTPUT_CHARS;
-        if truncated {
-            let cut: String = content.chars().take(TOOL_OUTPUT_CHARS).collect();
-            content = format!("{cut}\n[TRUNCATED：外宗输出超过 64 KiB 上限]");
-        }
+        let (content, truncated) = render_tool_result(&self.server, tool, &result)?;
         Ok(ToolOutput {
-            name: tool_id,
+            name: format!("mcp.{}.{}", self.server, tool),
             content,
             truncated,
         })
+    }
+}
+
+impl McpCaller for McpStdioClient {
+    fn server_name(&self) -> &str {
+        McpStdioClient::server_name(self)
+    }
+
+    fn initialize(&mut self) -> Result<Value, McpError> {
+        McpStdioClient::initialize(self)
+    }
+
+    fn list_tools(&mut self) -> Result<Vec<McpToolDesc>, McpError> {
+        McpStdioClient::list_tools(self)
+    }
+
+    fn call_tool(&mut self, tool: &str, arguments_json: &str) -> Result<ToolOutput, McpError> {
+        McpStdioClient::call_tool(self, tool, arguments_json)
     }
 }
 
@@ -364,25 +500,323 @@ impl Drop for McpStdioClient {
 }
 
 // ---------------------------------------------------------------------------
+// 回环 HTTP 传输（streamable-http）
+// ---------------------------------------------------------------------------
+
+/// MCP 的 streamable-http 客户端：POST JSON-RPC，响应可能是 JSON，也可能是 SSE。
+///
+/// 只允许明文回环地址（`http://127.0.0.1` / `localhost`）——MCP server 通常就起在
+/// 本机；远程 MCP 需要 TLS 边界，是独立增量，不在这里偷偷放开。
+pub struct McpHttpClient {
+    server: String,
+    endpoint: fulu_provider::http::Endpoint,
+    path: String,
+    headers: Vec<(String, String)>,
+    session_id: Option<String>,
+    next_id: u64,
+}
+
+impl McpHttpClient {
+    pub fn new(server: &str, url: &str, headers: Vec<(String, String)>) -> Result<Self, McpError> {
+        let endpoint = fulu_provider::http::Endpoint::parse(url)
+            .map_err(|error| McpError(format!("server {server} 的 URL 不被接受：{error}")))?;
+        let rest = url.strip_prefix("http://").unwrap_or(url);
+        let path = match rest.find('/') {
+            Some(index) => rest[index..].to_owned(),
+            None => "/".to_owned(),
+        };
+        Ok(Self {
+            server: server.to_owned(),
+            endpoint,
+            path,
+            headers,
+            session_id: None,
+            next_id: 0,
+        })
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let payload = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let body =
+            serde_json::to_vec(&payload).map_err(|e| McpError(format!("请求序列化失败：{e}")))?;
+
+        // 借用期受限：先把头部组装成拥有所有权的 String，再交给请求层。
+        let mut headers: Vec<(String, String)> = vec![
+            (
+                "Accept".to_owned(),
+                "application/json, text/event-stream".to_owned(),
+            ),
+            (
+                "MCP-Protocol-Version".to_owned(),
+                PROTOCOL_VERSION.to_owned(),
+            ),
+        ];
+        headers.extend(self.headers.iter().cloned());
+        if let Some(session) = &self.session_id {
+            headers.push(("Mcp-Session-Id".to_owned(), session.clone()));
+        }
+        let borrowed: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+
+        let response = fulu_provider::http::send(
+            &self.endpoint,
+            &fulu_provider::http::HttpRequest {
+                method: "POST",
+                path: &self.path,
+                headers: &borrowed,
+                body: Some(&body),
+                timeout: REQUEST_TIMEOUT,
+            },
+        )
+        .map_err(|error| McpError(format!("{method} 失败：{error}")))?;
+
+        if let Some(session) = response.header("mcp-session-id") {
+            self.session_id = Some(session.to_owned());
+        }
+        response
+            .require_success()
+            .map_err(|error| McpError(format!("{method} 失败：{error}")))?;
+        let text = response
+            .body_text()
+            .map_err(|error| McpError(error.to_string()))?;
+        extract_from_payload(&text, id)?
+            .ok_or_else(|| McpError(format!("{method} 的响应里没有 id={id} 的结果")))
+    }
+
+    /// 通知类消息（无 id）发出去即可，失败不致命。
+    fn notify(&mut self, method: &str) {
+        let payload = json!({"jsonrpc": "2.0", "method": method});
+        let Ok(body) = serde_json::to_vec(&payload) else {
+            return;
+        };
+        let mut headers: Vec<(String, String)> = vec![(
+            "Accept".to_owned(),
+            "application/json, text/event-stream".to_owned(),
+        )];
+        headers.extend(self.headers.iter().cloned());
+        if let Some(session) = &self.session_id {
+            headers.push(("Mcp-Session-Id".to_owned(), session.clone()));
+        }
+        let borrowed: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let _ = fulu_provider::http::send(
+            &self.endpoint,
+            &fulu_provider::http::HttpRequest {
+                method: "POST",
+                path: &self.path,
+                headers: &borrowed,
+                body: Some(&body),
+                timeout: REQUEST_TIMEOUT,
+            },
+        );
+    }
+}
+
+/// 兼容三种响应形态：单个 JSON、SSE 事件流、以及只有通知没有结果的空响应。
+fn extract_from_payload(text: &str, id: u64) -> Result<Option<Value>, McpError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        // 整体是一个 JSON 文档（单条响应或批量响应）。
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            return extract_response_value(&value, id);
+        }
+    }
+    for line in trimmed.lines() {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if let Some(found) = extract_response_value(&value, id)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+fn extract_response_value(value: &Value, id: u64) -> Result<Option<Value>, McpError> {
+    if let Some(batch) = value.as_array() {
+        for item in batch {
+            if item.get("id").and_then(Value::as_u64) == Some(id)
+                && let Some(found) = extract_response_value(item, id)?
+            {
+                return Ok(Some(found));
+            }
+        }
+        return Ok(None);
+    }
+    if value.get("id").and_then(Value::as_u64) != Some(id) {
+        return Ok(None);
+    }
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("未知");
+        let code = error.get("code").map(|c| c.to_string()).unwrap_or_default();
+        return Err(McpError(format!("server 返回错误 {code}：{message}")));
+    }
+    Ok(Some(value.get("result").cloned().unwrap_or(Value::Null)))
+}
+
+impl McpCaller for McpHttpClient {
+    fn server_name(&self) -> &str {
+        &self.server
+    }
+
+    fn initialize(&mut self) -> Result<Value, McpError> {
+        let result = self.request(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "fulu", "version": env!("CARGO_PKG_VERSION")}
+            }),
+        )?;
+        self.notify("notifications/initialized");
+        Ok(result)
+    }
+
+    fn list_tools(&mut self) -> Result<Vec<McpToolDesc>, McpError> {
+        let result = self.request("tools/list", json!({}))?;
+        Ok(collect_tool_descs(&self.server, &result))
+    }
+
+    fn call_tool(&mut self, tool: &str, arguments_json: &str) -> Result<ToolOutput, McpError> {
+        let arguments: Value = serde_json::from_str(arguments_json)
+            .map_err(|e| McpError(format!("参数不是合法 JSON：{e}")))?;
+        let result = self.request("tools/call", json!({"name": tool, "arguments": arguments}))?;
+        let (content, truncated) = render_tool_result(&self.server, tool, &result)?;
+        Ok(ToolOutput {
+            name: format!("mcp.{}.{}", self.server, tool),
+            content,
+            truncated,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 工具适配器：归一为 fulu-tools::Tool，走同一套箓核验
 // ---------------------------------------------------------------------------
 
 /// 一台已握手 server 的工具句柄。注册进 `ToolRegistry` 后与内置工具完全同权同责。
 pub struct McpToolAdapter {
-    client: Arc<Mutex<McpStdioClient>>,
+    client: Arc<Mutex<dyn McpCaller>>,
     tool: McpToolDesc,
     id: String,
 }
 
 impl McpToolAdapter {
-    pub fn new(client: McpStdioClient, tool: McpToolDesc) -> Self {
-        let id = format!("mcp.{}.{}", tool.server, tool.name);
-        Self {
-            client: Arc::new(Mutex::new(client)),
-            tool,
-            id,
-        }
+    pub fn new(client: impl McpCaller + 'static, tool: McpToolDesc) -> Self {
+        Self::shared(Arc::from(Mutex::from(client)), tool)
     }
+
+    /// 多个工具共用一台 server 的同一个调用端（子进程或 HTTP 会话）。
+    ///
+    /// 一台 server 通常暴露十几个工具；若每个工具各起一份，进程数/会话数与
+    /// 握手次数会随工具数线性膨胀，且同一 server 的状态会被切成多份。
+    pub fn shared(client: Arc<Mutex<dyn McpCaller>>, tool: McpToolDesc) -> Self {
+        let id = format!("mcp.{}.{}", tool.server, tool.name);
+        Self { client, tool, id }
+    }
+
+    /// 外宗工具在箓层的登记名（`mcp.<server>.<tool>`）。
+    /// 与 `Tool::id` 同值，但这里不需要引入 `fulu-tools::Tool` 就能取到。
+    pub fn tool_id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn description(&self) -> &str {
+        &self.tool.description
+    }
+
+    /// server 声明的参数 schema（可能为空对象，调用方需容错）。
+    pub fn schema_json(&self) -> &str {
+        &self.tool.schema_json
+    }
+}
+
+/// 一台 server 的握手结果：一个子进程 + 它暴露的全部工具。
+pub struct McpSession {
+    pub server: String,
+    /// `initialize` 的原始回执（含 protocolVersion / serverInfo / capabilities）
+    pub handshake: Value,
+    pub tools: Vec<Arc<McpToolAdapter>>,
+    /// 不阻断连接、但用户应当知道的实情（例如「该 server 声明了环境变量」）
+    pub warnings: Vec<String>,
+}
+
+/// 握手并收集工具。**唯一**的接入入口：stdio 一个 server 一个进程，HTTP 一个 server 一个会话。
+pub fn connect(info: &McpServerInfo) -> Result<McpSession, McpError> {
+    let mut warnings = Vec::new();
+    let shared: Arc<Mutex<dyn McpCaller>> = match &info.transport {
+        Transport::Stdio { command, args } => Arc::new(Mutex::new(McpStdioClient::spawn(
+            &info.name,
+            command,
+            args,
+            &BTreeMap::new(),
+        )?)),
+        Transport::StreamableHttp { url, headers } => {
+            if headers.is_empty() {
+                warnings.push(format!(
+                    "server「{}」未声明请求头；若对端要求认证，握手会以 401 失败",
+                    info.name
+                ));
+            }
+            Arc::new(Mutex::new(McpHttpClient::new(
+                &info.name,
+                url,
+                headers.clone(),
+            )?))
+        }
+    };
+
+    let (handshake, mut descs) = {
+        let mut caller = shared
+            .lock()
+            .map_err(|_| McpError("外宗客户端锁损坏".into()))?;
+        let handshake = caller.initialize()?;
+        let descs = caller.list_tools()?;
+        (handshake, descs)
+    };
+    descs.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if !info.env_keys.is_empty() {
+        warnings.push(format!(
+            "server「{}」声明了环境变量 {}；fulu 不读取配置文件中的密钥值，\
+             需在启动 fulu 前自行 export，否则相关工具可能失败",
+            info.name,
+            info.env_keys.join(", ")
+        ));
+    }
+    if descs.is_empty() {
+        warnings.push(format!("server「{}」未暴露任何工具", info.name));
+    }
+
+    let tools = descs
+        .into_iter()
+        .map(|desc| Arc::new(McpToolAdapter::shared(shared.clone(), desc)))
+        .collect();
+    Ok(McpSession {
+        server: info.name.clone(),
+        handshake,
+        tools,
+        warnings,
+    })
 }
 
 impl Tool for McpToolAdapter {
@@ -408,12 +842,62 @@ impl Tool for McpToolAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fulu_tools::{Tool, ToolArguments};
+
+    /// 一台最小的 MCP stdio server：list 两个工具，call 时回显大写 / 故意报错。
+    const FAKE_SERVER_SCRIPT: &str = r#"
+import json, sys
+# MCP stdio 约定 UTF-8；Windows 下 Python 默认跟随本地码页，必须显式重配。
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+for line in sys.stdin:
+    req = json.loads(line)
+    if req.get("method") == "initialize":
+        reply = {"jsonrpc": "2.0", "id": req["id"], "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}}}
+    elif req.get("method") == "tools/list":
+        reply = {"jsonrpc": "2.0", "id": req["id"], "result": {"tools": [
+            {"name": "shout", "description": "回显大写", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
+            {"name": "boom", "description": "故意报错", "inputSchema": {"type": "object"}}]}}
+    elif req.get("method") == "tools/call":
+        if req["params"]["name"] == "boom":
+            reply = {"jsonrpc": "2.0", "id": req["id"], "result": {"isError": True, "content": [{"type": "text", "text": "炸炉了"}]}}
+        else:
+            reply = {"jsonrpc": "2.0", "id": req["id"], "result": {"isError": False, "content": [{"type": "text", "text": req["params"]["arguments"]["text"].upper()}]}}
+    else:
+        continue
+    sys.stdout.write(json.dumps(reply) + "\n")
+    sys.stdout.flush()
+"#;
+
+    /// 落地 mock 脚本并找到可用的 python 解释器；没有解释器时返回 None（跳过而非失败）。
+    fn fake_server_fixture(name: &str) -> Option<(String, String)> {
+        let interpreter = ["python", "python3"]
+            .iter()
+            .find(|candidate| {
+                Command::new(candidate)
+                    .arg("--version")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            })
+            .map(|p| (*p).to_string());
+        let interpreter = interpreter?;
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("fake_mcp_server.py");
+        std::fs::write(&script_path, FAKE_SERVER_SCRIPT).unwrap();
+        Some((interpreter, script_path.to_string_lossy().into_owned()))
+    }
 
     fn server_info(name: &str, command: &str) -> McpServerInfo {
         McpServerInfo {
             name: name.into(),
-            command: command.into(),
-            args: vec!["--stdio".into()],
+            transport: Transport::Stdio {
+                command: command.into(),
+                args: vec!["--stdio".into()],
+            },
             env_keys: vec!["API_KEY".into()],
             config_path: PathBuf::from("config.json"),
             notes: Vec::new(),
@@ -436,8 +920,10 @@ mod tests {
             servers,
             vec![McpServerInfo {
                 name: "weather".into(),
-                command: "node".into(),
-                args: vec!["weather.js".into()],
+                transport: Transport::Stdio {
+                    command: "node".into(),
+                    args: vec!["weather.js".into()],
+                },
                 env_keys: vec!["API_KEY".into()],
                 config_path: path,
                 notes: Vec::new(),
@@ -479,56 +965,12 @@ mod tests {
     /// 找不到解释器时跳过而不是失败）。
     #[test]
     fn stdio_client_handshake_list_and_call_over_real_process() {
-        let script = r#"
-import json, sys
-# MCP stdio 约定 UTF-8；Windows 下 Python 默认跟随本地码页，必须显式重配。
-if hasattr(sys.stdin, "reconfigure"):
-    sys.stdin.reconfigure(encoding="utf-8")
-    sys.stdout.reconfigure(encoding="utf-8")
-for line in sys.stdin:
-    req = json.loads(line)
-    if req.get("method") == "initialize":
-        reply = {"jsonrpc": "2.0", "id": req["id"], "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}}}
-    elif req.get("method") == "tools/list":
-        reply = {"jsonrpc": "2.0", "id": req["id"], "result": {"tools": [
-            {"name": "shout", "description": "回显大写", "inputSchema": {"type": "object"}},
-            {"name": "boom", "description": "故意报错", "inputSchema": {"type": "object"}}]}}
-    elif req.get("method") == "tools/call":
-        if req["params"]["name"] == "boom":
-            reply = {"jsonrpc": "2.0", "id": req["id"], "result": {"isError": True, "content": [{"type": "text", "text": "炸炉了"}]}}
-        else:
-            reply = {"jsonrpc": "2.0", "id": req["id"], "result": {"isError": False, "content": [{"type": "text", "text": req["params"]["arguments"]["text"].upper()}]}}
-    else:
-        continue
-    sys.stdout.write(json.dumps(reply) + "\n")
-    sys.stdout.flush()
-"#;
-        let dir = std::env::temp_dir().join("fulu_mcp_test_stdio");
-        std::fs::create_dir_all(&dir).unwrap();
-        let script_path = dir.join("fake_mcp_server.py");
-        std::fs::write(&script_path, script).unwrap();
-        let interpreter = ["python", "python3"]
-            .iter()
-            .find(|candidate| {
-                Command::new(candidate)
-                    .arg("--version")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .is_ok_and(|status| status.success())
-            })
-            .map(|p| p.to_string());
-        let Some(interpreter) = interpreter else {
+        let Some((interpreter, script)) = fake_server_fixture("fulu_mcp_test_stdio") else {
             eprintln!("跳过：本机无 python 解释器");
             return;
         };
-        let mut client = McpStdioClient::spawn(
-            "fake",
-            &interpreter,
-            &[script_path.to_string_lossy().into_owned()],
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let mut client =
+            McpStdioClient::spawn("fake", &interpreter, &[script], &BTreeMap::new()).unwrap();
         client.initialize().unwrap();
         let tools = client.list_tools().unwrap();
         assert_eq!(tools.len(), 2);
@@ -542,6 +984,72 @@ for line in sys.stdin:
             client.call_tool("boom", "{}"),
             Err(McpError(msg)) if msg.contains("炸炉了")
         ));
+    }
+
+    /// connect：一台 server 只起**一个**子进程，全部工具共享同一个 client；
+    /// 参数 schema 原样带出，供箓层下发给模型。
+    #[test]
+    fn connect_shares_one_process_and_carries_real_schema() {
+        let Some((interpreter, script)) = fake_server_fixture("fulu_mcp_test_connect") else {
+            eprintln!("跳过：本机无 python 解释器");
+            return;
+        };
+        let info = McpServerInfo {
+            name: "fake".into(),
+            transport: Transport::Stdio {
+                command: interpreter,
+                args: vec![script],
+            },
+            env_keys: vec!["API_KEY".into()],
+            config_path: PathBuf::from("config.json"),
+            notes: Vec::new(),
+        };
+        let session = connect(&info).unwrap();
+        assert_eq!(session.server, "fake");
+        assert_eq!(session.tools.len(), 2);
+        assert!(session.handshake.is_object());
+        assert_eq!(session.tools[0].tool_id(), "mcp.fake.boom");
+        assert_eq!(session.tools[1].tool_id(), "mcp.fake.shout");
+        assert!(
+            session.warnings.iter().any(|w| w.contains("API_KEY")),
+            "声明了环境变量却没提示：{:?}",
+            session.warnings
+        );
+        // schema 必须是 server 声明的原文，而不是空壳。
+        let shout = &session.tools[1];
+        assert!(shout.schema_json().contains(r#""required":["text"]"#));
+
+        // 共享验证：先失败调用，再从另一工具成功调用，进程仍然可用。
+        let policy = ToolPolicy::default();
+        assert!(
+            shout
+                .invoke(
+                    &ToolArguments {
+                        json: r#"{"text":"云篆"}"#.into()
+                    },
+                    &policy
+                )
+                .unwrap()
+                .content
+                == "云篆"
+        );
+        assert!(
+            session.tools[0]
+                .invoke(&ToolArguments::empty(), &policy)
+                .is_err()
+        );
+        assert_eq!(
+            shout
+                .invoke(
+                    &ToolArguments {
+                        json: r#"{"text":"归一"}"#.into()
+                    },
+                    &policy
+                )
+                .unwrap()
+                .content,
+            "归一"
+        );
     }
 
     #[test]
@@ -562,6 +1070,181 @@ for line in sys.stdin:
         for path in default_config_paths() {
             assert!(!path.exists() || path.is_file(), "{path:?} 应只读不建");
         }
+    }
+
+    /// 一台最小的 streamable-http MCP server：POST /mcp，JSON-RPC 应答。
+    ///
+    /// 除 initialize 外，缺 `Authorization` 一律 401——这样「认证头是否真的带上」
+    /// 由服务端强制验证，而不是靠客户端自证。
+    fn spawn_http_mcp(requests: Arc<Mutex<Vec<String>>>) -> (u16, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let raw = read_http_request(&mut stream);
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                let head = text.to_ascii_lowercase();
+                let body = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body.to_owned())
+                    .unwrap_or_default();
+                let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let method = request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                requests
+                    .lock()
+                    .unwrap()
+                    .push(format!("{method} {}", head.lines().next().unwrap_or("")));
+
+                if method == "notifications/initialized" {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
+                if !head.contains("authorization: bearer t-123") {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
+                let result = match method.as_str() {
+                    "initialize" => json!({
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fake-http", "version": "0.0.1"}
+                    }),
+                    "tools/list" => json!({"tools": [{
+                        "name": "shout",
+                        "description": "回显大写",
+                        "inputSchema": {"type": "object",
+                                        "properties": {"text": {"type": "string"}},
+                                        "required": ["text"]}
+                    }]}),
+                    "tools/call" => json!({
+                        "isError": false,
+                        "content": [{"type": "text", "text": "HTTP 外宗回执"}]
+                    }),
+                    _ => json!({}),
+                };
+                let payload = json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+                let raw = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: s-42\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(raw.as_bytes());
+            }
+        });
+        (port, handle)
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buffer.extend_from_slice(&chunk[..n]);
+                    let Some(head_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buffer.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+        }
+        buffer
+    }
+
+    #[test]
+    fn http_transport_handshakes_lists_and_calls_with_auth_header() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (port, handle) = spawn_http_mcp(seen.clone());
+        let info = McpServerInfo {
+            name: "fake-http".into(),
+            transport: Transport::StreamableHttp {
+                url: format!("http://127.0.0.1:{port}/mcp"),
+                headers: vec![("Authorization".into(), "Bearer t-123".into())],
+            },
+            env_keys: Vec::new(),
+            config_path: PathBuf::from("<test>"),
+            notes: Vec::new(),
+        };
+        let session = connect(&info).unwrap();
+        assert_eq!(session.tools.len(), 1);
+        assert_eq!(session.tools[0].tool_id(), "mcp.fake-http.shout");
+        assert!(session.warnings.is_empty(), "{:?}", session.warnings);
+
+        let output = session.tools[0]
+            .invoke(&ToolArguments::empty(), &ToolPolicy::default())
+            .unwrap();
+        assert_eq!(output.content, "HTTP 外宗回执");
+        assert_eq!(output.name, "mcp.fake-http.shout");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            4,
+            "initialize / initialized / tools/list / tools/call：{seen:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn http_transport_refuses_non_loopback_urls() {
+        let remote = McpHttpClient::new("remote", "http://example.com/mcp", Vec::new());
+        let Err(McpError(message)) = remote else {
+            panic!("非回环地址必须被拒绝");
+        };
+        assert!(
+            message.contains("回环") || message.contains("主机"),
+            "{message}"
+        );
+
+        let tls = McpHttpClient::new("tls", "https://127.0.0.1:8443/mcp", Vec::new());
+        let Err(McpError(message)) = tls else {
+            panic!("HTTPS 必须被拒绝（需要 TLS 边界，属独立增量）");
+        };
+        assert!(message.contains("HTTP"), "{message}");
+    }
+
+    #[test]
+    fn discovery_reads_http_servers_and_masks_header_values() {
+        let dir = std::env::temp_dir().join("fulu_mcp_test_http_discovery");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"remote":{"type":"streamable-http","url":"http://127.0.0.1:64829/mcp","headers":{"Authorization":"Bearer sk-should-never-leak"}}}}"#,
+        )
+        .unwrap();
+        let (servers, issues) = discover(std::slice::from_ref(&path));
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0].transport.label(),
+            "http: http://127.0.0.1:64829/mcp（1 个请求头）"
+        );
+        // 值可以被读进内存（否则连不上认证型 server），但绝不出现在 Debug 里。
+        let debug = format!("{:?}", servers[0]);
+        assert!(!debug.contains("sk-should-never-leak"), "{debug}");
+        assert!(debug.contains("<masked>"));
     }
 
     #[test]
