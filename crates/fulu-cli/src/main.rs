@@ -19,6 +19,17 @@ fn run(args: &[String]) -> i32 {
         Some("model") => model(&args[1..]),
         Some("fu") => fu(&args[1..]),
         Some("altar") => altar(&args[1..]),
+        Some("context") => context(&args[1..]),
+        Some("prompt") => match args.get(1).map(String::as_str) {
+            Some("show") | None => prompt_show(),
+            Some(other) => {
+                eprintln!("[ERR] 未知 prompt 子命令：{other}");
+                2
+            }
+        },
+        Some("mcp") => mcp(&args[1..]),
+        Some("skills") => skills(&args[1..]),
+        Some("init") => init(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             help();
             0
@@ -33,7 +44,7 @@ fn run(args: &[String]) -> i32 {
 
 fn help() {
     println!(
-        "符箓台 CLI · taoism-agent M2\n\
+        "符箓台 CLI · taoism-agent M2.5\n\
          \n\
          用法：\n\
          \x20 fulu doctor                          环境体检（不联网、不启动推理）\n\
@@ -47,6 +58,11 @@ fn help() {
          \x20 fulu fu seal <文件>                 只打印符印\n\
          \x20 fulu altar dry-run <文件.fu>        成符→盖印→待焚（零网络）\n\
          \x20 fulu altar run <文件.fu> --confirm 显式确认后焚化→回执→缴符\n\
+         \x20 fulu context show [--no-ip]         会话头：硬件与 IP 所在地（粗粒度，全容错）\n\
+         \x20 fulu prompt show                    分层系统提示词装配预览（含逐层占用）\n\
+         \x20 fulu mcp list [配置路径]             外宗箓：全局 MCP 只读展示（绝不写配置）\n\
+         \x20 fulu skills list [根目录]            符胆：全局技能包只读展示\n\
+         \x20 fulu init [--workspace <目录>]       引符：开箱基础配置（生成第一张示例符）\n\
          \x20 fulu help                          本帮助\n\
          \n\
          可选参数（altar）：--confirm --endpoint <回环URL> --workspace <目录> --export <日志.jsonl>\n\
@@ -484,4 +500,389 @@ fn fu(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// M2.5：会话头 / 分层提示词 / 外宗箓 / 符胆 / 引符
+// ---------------------------------------------------------------------------
+
+fn context(args: &[String]) -> i32 {
+    let Some(command) = args.first().map(String::as_str) else {
+        eprintln!("[ERR] 缺少 context 子命令：show");
+        return 2;
+    };
+    if command != "show" {
+        eprintln!("[ERR] 未知 context 子命令：{command}");
+        return 2;
+    }
+    let include_ip = !args.iter().any(|arg| arg == "--no-ip");
+    println!("[..] 采集会话头（全项容错，失败降级为未知）…");
+    let snapshot = fulu_context::collect(None, include_ip);
+    println!("[OK] 会话头");
+    let rows = [
+        (
+            "系统",
+            snapshot.os_name.value.clone(),
+            snapshot.os_name.source.clone(),
+        ),
+        (
+            "内核",
+            snapshot.kernel.value.clone(),
+            snapshot.kernel.source.clone(),
+        ),
+        ("架构", snapshot.arch.clone(), "编译目标信息".into()),
+        (
+            "CPU",
+            snapshot.cpu_model.value.clone(),
+            snapshot.cpu_model.source.clone(),
+        ),
+        (
+            "CPU 核数",
+            snapshot.cpu_cores.value.clone(),
+            snapshot.cpu_cores.source.clone(),
+        ),
+        (
+            "内存总量",
+            snapshot.mem_total.value.clone(),
+            snapshot.mem_total.source.clone(),
+        ),
+        (
+            "可用磁盘",
+            snapshot.disk_free.value.clone(),
+            snapshot.disk_free.source.clone(),
+        ),
+        (
+            "时区",
+            snapshot.timezone.value.clone(),
+            snapshot.timezone.source.clone(),
+        ),
+        (
+            "区域",
+            snapshot.locale.value.clone(),
+            snapshot.locale.source.clone(),
+        ),
+    ];
+    for (label, value, source) in rows {
+        println!("  {label:<10}: {value}  （{source}）");
+    }
+    match &snapshot.ip {
+        Some(ip) => println!(
+            "  IP 所在地  : {} {}（{}，{}）",
+            ip.country, ip.city, ip.isp, ip.ip
+        ),
+        None => println!("  IP 所在地  : 未知（未查询/查询失败/已关闭）"),
+    }
+    if !snapshot.issues.is_empty() {
+        println!("  降级项     : {}", snapshot.issues.join("；"));
+    }
+    println!("  采集时间   : {}", snapshot.collected_at);
+    println!(
+        "[WARN] 只进会话头与缴符事件，不写符文正文；IP 为粗粒度（国家/城市/ISP），可用 --no-ip 关闭。"
+    );
+    0
+}
+
+fn prompt_show() -> i32 {
+    let snapshot = fulu_context::collect(None, false);
+    let (servers, _) = fulu_mcp::discover(&fulu_mcp::default_config_paths());
+    let (skills, _) = fulu_skills::discover_global(&fulu_skills::default_roots());
+    let outer = if servers.is_empty() && skills.is_empty() {
+        "外宗箓与符胆均未发现（全局配置为空不影响运行）".to_owned()
+    } else {
+        let mcp = servers
+            .iter()
+            .map(|server| format!("{}({})", server.name, server.command))
+            .collect::<Vec<_>>()
+            .join("、");
+        let skill = skills
+            .iter()
+            .map(|s| format!("{}@{}", s.name, &s.sha256[..8]))
+            .collect::<Vec<_>>()
+            .join("、");
+        format!("外宗箓：{mcp}；符胆：{skill}")
+    };
+    let draft = fulu_prompt::PromptDraft::new()
+        .set(fulu_prompt::LayerId::Core, fulu_prompt::CORE_TEXT)
+        .set(fulu_prompt::LayerId::SessionHeader, snapshot.summary())
+        .set(fulu_prompt::LayerId::OuterEnv, outer)
+        .set(
+            fulu_prompt::LayerId::TalismanBody,
+            "（本预览不含具体符文；焚符时由 Harness 注入）",
+        );
+    let assembled = fulu_prompt::assemble(
+        fulu_prompt::PromptMode::Full,
+        &draft,
+        &fulu_prompt::LayerCaps::default(),
+    );
+    println!("[OK] 分层装配预览（full 档）");
+    println!("  {:<12} {:>8}  截断", "层", "字符");
+    for section in &assembled.sections {
+        println!(
+            "  {:<12} {:>8}  {}",
+            section.layer.label(),
+            section.chars,
+            if section.truncated {
+                "是 [TRUNCATED]"
+            } else {
+                "否"
+            }
+        );
+    }
+    println!(
+        "  总字符     : {}（上限 {}）",
+        assembled.total_chars,
+        fulu_prompt::LayerCaps::default().total_chars
+    );
+    println!("[INFO] 召将子符用 minimal 档；纯机械调用用 none 档。");
+    0
+}
+
+fn mcp(args: &[String]) -> i32 {
+    let Some(command) = args.first().map(String::as_str) else {
+        eprintln!("[ERR] 缺少 mcp 子命令：list");
+        return 2;
+    };
+    if command != "list" {
+        eprintln!("[ERR] 未知 mcp 子命令：{command}");
+        return 2;
+    }
+    let paths: Vec<PathBuf> = match args.get(1) {
+        Some(explicit) => vec![PathBuf::from(explicit)],
+        None => fulu_mcp::default_config_paths(),
+    };
+    let (servers, issues) = fulu_mcp::discover(&paths);
+    println!("[OK] 外宗箓 · 全局 MCP 发现（只读；安装/升级/删除请在原生态完成）");
+    for issue in &issues {
+        println!("  [WARN] {issue}");
+    }
+    if servers.is_empty() {
+        println!("  （未发现任何全局 MCP 配置；这不影响符箓运行，内置工具照常可用）");
+        println!(
+            "  扫描路径：{}",
+            paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("、")
+        );
+        return 0;
+    }
+    for server in &servers {
+        println!(
+            "  - {:<16} cmd={} args={:?}",
+            server.name, server.command, server.args
+        );
+        println!(
+            "    env 键（值不读不出）: {}",
+            if server.env_keys.is_empty() {
+                "—".into()
+            } else {
+                server.env_keys.join(", ")
+            }
+        );
+        println!("    来源       : {}", server.config_path.display());
+    }
+    println!(
+        "[INFO] 接入：M2.5 起支持 stdio server 的 tools/list / tools/call；调用同样过箓核验，默认逐次确认。"
+    );
+    0
+}
+
+fn skills(args: &[String]) -> i32 {
+    let Some(command) = args.first().map(String::as_str) else {
+        eprintln!("[ERR] 缺少 skills 子命令：list");
+        return 2;
+    };
+    if command != "list" {
+        eprintln!("[ERR] 未知 skills 子命令：{command}");
+        return 2;
+    }
+    let roots: Vec<PathBuf> = match args.get(1) {
+        Some(explicit) => vec![PathBuf::from(explicit)],
+        None => fulu_skills::default_roots(),
+    };
+    let (skills, issues) = fulu_skills::discover_global(&roots);
+    println!("[OK] 符胆 · 全局技能包发现（只读；发现即展示，不复制不安装）");
+    for issue in &issues {
+        println!("  [WARN] {issue}");
+    }
+    if skills.is_empty() {
+        println!("  （未发现技能包；成符时可不引用符胆）");
+        println!(
+            "  扫描根目录：{}",
+            roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("、")
+        );
+        return 0;
+    }
+    for skill in &skills {
+        println!(
+            "  - {:<20} v{}  sha256:{}…  {}",
+            skill.name,
+            if skill.version.is_empty() {
+                "?"
+            } else {
+                &skill.version
+            },
+            &skill.sha256[..8.min(skill.sha256.len())],
+            skill.path.display()
+        );
+    }
+    println!(
+        "[INFO] 引用：符文记录 名字@摘要；两次焚符之间技能内容被改动 → 符印校验失败 → 重新成符。"
+    );
+    0
+}
+
+/// 引符：开箱基础配置。零模型依赖的部分直接完成；需要模型的部分给出下一步指引。
+fn init(args: &[String]) -> i32 {
+    let mut workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--workspace" {
+            if let Some(value) = args.get(index + 1) {
+                workspace = PathBuf::from(value);
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    if let Err(error) = std::fs::create_dir_all(&workspace) {
+        eprintln!("[ERR] 工作区不可创建：{}：{error}", workspace.display());
+        return 1;
+    }
+
+    println!("符箓 · 引符（开箱基础配置）");
+    println!("================================");
+    println!("引符也是一张符：走成符→盖印→dry-run→确认的完整仪轨，本命令只做零模型的部分。");
+
+    println!("\n[1/4] 会话头采集");
+    let snapshot = fulu_context::collect(Some(&workspace), true);
+    for line in snapshot.summary().lines() {
+        println!("  {line}");
+    }
+
+    println!("\n[2/4] 外宗箓与符胆发现（只读）");
+    let (servers, _) = fulu_mcp::discover(&fulu_mcp::default_config_paths());
+    let (skills, _) = fulu_skills::discover_global(&fulu_skills::default_roots());
+    println!(
+        "  MCP server：{}；技能包：{}",
+        if servers.is_empty() {
+            "无".to_owned()
+        } else {
+            servers
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+                .join("、")
+        },
+        if skills.is_empty() {
+            "无".to_owned()
+        } else {
+            skills
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+                .join("、")
+        }
+    );
+
+    println!("\n[3/4] 分层提示词预览");
+    let outer = if servers.is_empty() {
+        "外宗箓未发现 MCP；符胆未发现技能包".to_owned()
+    } else {
+        format!(
+            "外宗箓：{}；符胆：{}",
+            servers
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+                .join("、"),
+            skills
+                .iter()
+                .map(|s| format!("{}@{}", s.name, &s.sha256[..8.min(s.sha256.len())]))
+                .collect::<Vec<_>>()
+                .join("、")
+        )
+    };
+    let draft = fulu_prompt::PromptDraft::new()
+        .set(fulu_prompt::LayerId::Core, fulu_prompt::CORE_TEXT)
+        .set(fulu_prompt::LayerId::SessionHeader, snapshot.summary())
+        .set(fulu_prompt::LayerId::OuterEnv, outer)
+        .set(
+            fulu_prompt::LayerId::TalismanBody,
+            "所请事项：完成引符对话，确认语言、工作区与安全闸门",
+        );
+    let assembled = fulu_prompt::assemble(
+        fulu_prompt::PromptMode::Full,
+        &draft,
+        &fulu_prompt::LayerCaps::default(),
+    );
+    println!(
+        "  {} 层装配完成，共 {} 字符（截断：{}）；详情见 `fulu prompt show`",
+        assembled.sections.len(),
+        assembled.total_chars,
+        if assembled.total_truncated {
+            "是"
+        } else {
+            "否"
+        }
+    );
+
+    println!("\n[4/4] 生成第一张示例符");
+    let sample = match fulu_app::sample_fu_text() {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    let fu_path = workspace.join("引符.fu");
+    match std::fs::write(&fu_path, &sample) {
+        Ok(()) => println!("  已写入：{}", fu_path.display()),
+        Err(error) => {
+            eprintln!("[ERR] 写入失败：{error}");
+            return 1;
+        }
+    }
+    let report = match fulu_app::inspect_fu(&sample) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    println!("  符印：sha256:{}", report.seal);
+
+    println!("\n下一步：");
+    if std::env::var(fulu_app::ENDPOINT_ENV).is_ok() {
+        println!(
+            "  1. 检视这张符：`fulu fu verify \"{}\"`",
+            fu_path.display()
+        );
+        println!(
+            "  2. 零网络 dry-run：`fulu altar dry-run \"{}\"`",
+            fu_path.display()
+        );
+        println!(
+            "  3. 确认后焚化：`fulu altar run \"{}\" --confirm --workspace \"{}\"`",
+            fu_path.display(),
+            workspace.display()
+        );
+    } else {
+        println!("  1. 默认模型权重尚未就绪（MISSING）：`fulu model import <本地 gguf> default`");
+        println!(
+            "  2. 启动 llama-server 并设置 {}=http://127.0.0.1:8080",
+            fulu_app::ENDPOINT_ENV
+        );
+        println!(
+            "  3. 然后：`fulu altar dry-run \"{}\"` → `fulu altar run ... --confirm`",
+            fu_path.display()
+        );
+        println!("[INFO] 无模型也能用：`fulu doctor` 提供同一信息的无模型体检。");
+    }
+    0
 }

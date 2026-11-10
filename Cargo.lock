@@ -627,12 +627,19 @@ name = "fulu-cli"
 version = "0.1.0"
 dependencies = [
  "fulu-app",
+ "fulu-context",
+ "fulu-mcp",
  "fulu-model",
+ "fulu-prompt",
+ "fulu-skills",
 ]
 
 [[package]]
 name = "fulu-context"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "fulu-core"
@@ -646,6 +653,10 @@ dependencies = [
 [[package]]
 name = "fulu-mcp"
 version = "0.1.0"
+dependencies = [
+ "fulu-tools",
+ "serde_json",
+]
 
 [[package]]
 name = "fulu-model"
@@ -708,6 +719,9 @@ dependencies = [
 [[package]]
 name = "fulu-skills"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "fulu-tools"

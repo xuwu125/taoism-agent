@@ -75,6 +75,12 @@ pub enum RegisterError {
         requested: Permission,
         granted: Permission,
     },
+    /// 符的沙箱等级低于工具要求的最低权限（如只读符申请敕行）
+    PermissionTooLow {
+        tool: String,
+        requested: Permission,
+        required: Permission,
+    },
     CredentialNotGranted(String),
     NetworkNotGranted(String),
     QuotaNotPositive(String),
@@ -98,6 +104,16 @@ impl fmt::Display for RegisterError {
                 "工具 {tool} 申请 {} 权限，但名册只授予 {}，越权驳回",
                 requested.label(),
                 granted.label()
+            ),
+            Self::PermissionTooLow {
+                tool,
+                requested,
+                required,
+            } => write!(
+                f,
+                "工具 {tool} 需要 {} 及以上权限，符只申请了 {}，权限不足驳回",
+                required.label(),
+                requested.label()
             ),
             Self::CredentialNotGranted(id) => write!(f, "敕令 {id} 未受箓，拒绝访问"),
             Self::NetworkNotGranted(id) => {
@@ -151,7 +167,9 @@ pub struct Register {
 }
 
 impl Register {
-    /// 出厂名册：本地模型无需密钥；只登记两个只读工具，默认不开放任何网络能力。
+    /// 出厂名册：本地模型无需密钥；登记两个只读工具与「受限执行」级敕行，
+    /// 默认不开放任何网络能力。敕行虽已登记，只读符（Strict）申请它仍会被
+    /// 越权驳回——登记 ≠ 可用，可用上限由符申请的沙箱等级决定。
     pub fn baseline() -> Self {
         let mut register = Self::new();
         register
@@ -159,6 +177,10 @@ impl Register {
             .insert("lu://default/local".into());
         register.grant_tool(ToolGrant::read_only("fs.read", "读取工作区内的文本文件"));
         register.grant_tool(ToolGrant::read_only("echo", "回显参数，无副作用"));
+        let mut shell = ToolGrant::read_only("shell.exec", "分 OS 命令行执行（受限级，工作区内）");
+        shell.permission = Permission::Limited;
+        shell.max_calls = 8;
+        register.grant_tool(shell);
         register
     }
 
@@ -200,11 +222,21 @@ impl Register {
                 .grants
                 .get(tool_id)
                 .ok_or_else(|| RegisterError::ToolNotInRegister(tool_id.clone()))?;
+            // 双向核验：符的沙箱等级必须与工具授予等级匹配——
+            // 高于授予 = 越权（SandboxEscalation）；低于要求 = 权限不足
+            // （PermissionTooLow，例如只读符申请敕行）。
             if requested > grant.permission {
                 return Err(RegisterError::SandboxEscalation {
                     tool: tool_id.clone(),
                     requested,
                     granted: grant.permission,
+                });
+            }
+            if requested < grant.permission {
+                return Err(RegisterError::PermissionTooLow {
+                    tool: tool_id.clone(),
+                    requested,
+                    required: grant.permission,
                 });
             }
             if grant.needs_network && !fu.harness.network {
@@ -242,12 +274,34 @@ mod tests {
     #[test]
     fn unregistered_tool_is_rejected() {
         let mut fu = Talisman::sample();
-        fu.tool_refs = vec!["shell.exec".into()];
-        fu.harness.allow_tools = vec!["shell.exec".into()];
+        fu.tool_refs = vec!["time.travel".into()];
+        fu.harness.allow_tools = vec!["time.travel".into()];
         assert_eq!(
             Register::baseline().authorize(&fu),
-            Err(RegisterError::ToolNotInRegister("shell.exec".into()))
+            Err(RegisterError::ToolNotInRegister("time.travel".into()))
         );
+    }
+
+    #[test]
+    fn shell_is_registered_but_read_only_talisman_lacks_permission() {
+        // 敕行已登记（受限级），但只读符权限不足，双向核验都要拦。
+        let mut fu = Talisman::sample();
+        fu.tool_refs = vec!["shell.exec".into()];
+        fu.harness.allow_tools = vec!["shell.exec".into()];
+        assert!(matches!(
+            Register::baseline().authorize(&fu),
+            Err(RegisterError::PermissionTooLow { .. })
+        ));
+    }
+
+    #[test]
+    fn shell_grants_to_limited_sandbox_talisman() {
+        let mut fu = Talisman::sample();
+        fu.harness.sandbox = Sandbox::Limited;
+        fu.tool_refs = vec!["shell.exec".into()];
+        fu.harness.allow_tools = vec!["shell.exec".into()];
+        let auth = Register::baseline().authorize(&fu).unwrap();
+        assert_eq!(auth.max_calls.get("shell.exec"), Some(&8));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 > **每个提示词就是一张符。** 原创的 Rust Agent 系统：以道教符、箓、篆体系为信息架构与运行流程，把提示词做成可校验、可签名、可回放的「符文」；用「箓」管授权与工具名册，用「篆」管编码与书写，用「法坛」执行，用「太极」编排，用「缴符」归档。UI 与数据同构——界面本身就是一张符。
 
-**当前状态：v0.3 能力面增量已并入架构，M2 协议链路已跑通。** 仓库已有 16 个 crate 的 workspace、CI、符文领域模型、箓层授权、风火轮工具、法坛状态机、缴符事件链、内置模型清单与合规闸门，以及**本地 `llama-server` 的 OpenAI 兼容 HTTP 实现**。v0.3 新增设计（代码待 M2.5）：全局 MCP／技能包**只展示不管理**、内置五件套（moli 浏览器／敕行命令行／召将子智能体／问天搜索／摄行电脑控制）、会话上下文采集、OpenClaw 式分层系统提示词、引符开箱配置。本机已用 mock 服务真实跑通「成符→盖印→dry-run→确认→焚化→工具循环→回执→缴符归档」。**真实 LFM 权重仍未下载、未做真机推理**；中文 IME 人工验收仍是 M0 唯一硬门槛。
+**当前状态：v0.3 能力面增量已落地（M2.5 代码完成）。** 仓库已有 16 个 crate 的 workspace、CI、符文领域模型、箓层授权（含双向权限核验）、风火轮工具（含敕行分 OS 命令行）、法坛状态机、缴符事件链、内置模型清单与合规闸门、本地 `llama-server` 的 OpenAI 兼容 HTTP 实现；**M2.5 新增：会话头采集（硬件 + IP 所在地，真机实测）、分层提示词装配器（快照测试）、全局 MCP 只读发现与 stdio 客户端、全局技能包发现、引符 init**。本机已用 mock 服务真实跑通完整仪轨。**真实 LFM 权重仍未下载、未做真机推理**；中文 IME 人工验收仍是 M0 唯一硬门槛。
 
 ## 文档
 
@@ -32,19 +32,24 @@
 2. **内置模型 ≠ 内嵌推理引擎**：Rust 主进程不链接 C++ 推理库，改为与本地 `llama-server`（仅监听 `127.0.0.1`）通过 OpenAI 兼容 HTTP 对话；换模型架构不需重编 Rust。当前进程拉起仍由用户手动完成（M3 接进程管理）。
 3. **许可隔离**：代码 MIT，权重是 **LFM Open License v1.0**（含年营收 1000 万美元商用门槛），**不是 MIT**；分发 bundle 必须附 LICENSE 全文与第三方声明。商业化前须做法务复核。
 
-## v0.3 能力面（设计已定，M2.5 落地）
+## v0.3 能力面（M2.5 已落地）
 
-- **全局 MCP／技能包：只展示，不管理**——发现、校验、展示、接入由 fulu 做；安装/升级/删除留在用户原有生态。MCP server 是「外宗箓」：默认受限权限 + 逐次确认，输出视为不可信文本。
-- **内置五件套**：moli 浏览器（无头抓取，不嵌 WebView）、敕行命令行（Windows/macOS/Linux 分治）、召将子智能体（minimal 提示词档，禁止环回）、问天搜索（可插拔，优先复用 MCP）、摄行电脑控制（最高权限，默认禁用 + 逐次确认）。
-- **会话上下文采集**：无授权硬件信息 + IP 所在地（粗粒度），只进会话头与缴符事件，全项容错、可关闭。
-- **分层系统提示词**：篆心／会话头／环境外宗／用户画像／灵魂／工作区约定／符文正文七层，full/minimal/none 三档；参考 OpenClaw 的公开设计思想，不复制实现。
-- **引符开箱**：默认 2B 模型对话式完成基础配置与基础运行，引符同样走完整仪轨。
+- **全局 MCP／技能包：只展示，不管理**——发现、校验、展示、接入由 fulu 做；安装/升级/删除留在用户原有生态。MCP server 是「外宗箓」：默认受限权限 + 逐次确认，输出视为不可信文本（`fulu mcp list` / `fulu skills list`）。
+- **内置五件套**：敕行命令行（Windows/macOS/Linux 分治，**已落地**）；moli 浏览器、召将子智能体、问天搜索、摄行电脑控制按 M3/M4 推进。
+- **会话上下文采集**：无授权硬件信息 + IP 所在地（粗粒度，真机实测），只进会话头与缴符事件，全项容错、可关闭（`fulu context show`）。
+- **分层系统提示词**：篆心／会话头／环境外宗／用户画像／灵魂／工作区约定／符文正文七层，full/minimal/none 三档，逐层截断上限（`fulu prompt show`）。
+- **引符开箱**：`fulu init` 对话式基础配置的零模型四步已跑通；完整对话需真机权重。
 
 ## 快速开始
 
 ```bash
-cargo test --workspace                       # 87 个测试（含 3 个真实 HTTP 端到端用例）
+cargo test --workspace                       # 117 个测试（含 3 个真实 HTTP 端到端用例 + MCP 真实子进程冒烟）
 cargo run -p fulu-cli -- doctor              # 环境体检（不联网、不启动推理）
+cargo run -p fulu-cli -- context show        # 会话头：硬件 + IP 所在地（粗粒度，--no-ip 可关）
+cargo run -p fulu-cli -- prompt show         # 分层提示词装配预览
+cargo run -p fulu-cli -- mcp list            # 外宗箓：全局 MCP 只读展示（绝不写配置）
+cargo run -p fulu-cli -- skills list         # 符胆：全局技能包只读展示
+cargo run -p fulu-cli -- init                # 引符：开箱基础配置 + 生成第一张示例符
 cargo run -p fulu-cli -- model list          # 查看内置模型槽位与权重状态
 cargo run -p fulu-cli -- fu sample > sample.fu
 cargo run -p fulu-cli -- fu verify sample.fu # 校验符文并打印符印
@@ -101,10 +106,9 @@ crates/fulu-app             GUI/CLI 共用的仪轨会话门面
 crates/fulu-cli              无头 CLI
 crates/fulu-ui              egui/eframe 原生自绘 GUI（M0 IME 探针）
 crates/fulu-orchestrator    太极：M3 多 agent 编排（占位）
-crates/fulu-skills          符胆：M1 技能包内容寻址（占位，M2.5 扩全局发现）
-crates/fulu-mcp             外宗箓：M2.5 全局 MCP 只读发现与 stdio 客户端（占位）
-crates/fulu-context         会话头：M2.5 硬件与 IP 所在地采集（占位）
-crates/fulu-prompt          篆心：M2.5 分层系统提示词装配器（占位）
+crates/fulu-mcp             外宗箓：全局 MCP 只读发现 + stdio JSON-RPC 客户端
+crates/fulu-context         会话头：硬件与 IP 所在地采集（全项容错）
+crates/fulu-prompt          篆心：分层系统提示词装配器（快照测试）
 ```
 
 ## 技术基线（本机实测，2026-11-10）
@@ -116,11 +120,12 @@ crates/fulu-prompt          篆心：M2.5 分层系统提示词装配器（占�
 | 可行性 | 裁剪版 `eframe(glow)` 依赖链 `cargo check` 通过：223 包 / 40.81 s / 零警告，未引入 wgpu |
 | M0 实测 | `fmt --check` / `clippy -D warnings` / 40 个单测 / `cargo build -p fulu-ui` 全绿 |
 | M2 实测 | `fmt --check` / `clippy -D warnings` / **87 个测试零失败** / CLI 与 GUI 构建全绿；本机 mock `llama-server` 真实 HTTP 端到端：2 次请神 + 1 次 `fs.read` 工具调用 + 10 条缴符事件，回执归档、事件链校验通过（详见 docs/02 第 13 节） |
+| M2.5 实测 | `fmt --check` / `clippy 零告警` / **117 个测试零失败**；真机会话头采集（Windows 10 专业版 / i5-8400 / IP 杭州·联通）；19 个全局技能包真实发现；引符四步 + dry-run 通过；MCP stdio 客户端真实子进程冒烟（详见 docs/02 第 15 节） |
 | 发布 | GitHub Actions 矩阵构建 → 轻量二进制包 + SHA256SUMS；M4 补 MSI / DMG / AppImage / DEB 与签名 |
 
 ## 里程碑
 
-M0 架构冻结（代码完成，IME 人工验收待办）→ M1 符·箓·篆内核（箓/缴符已落地）→ **M2 法坛运行时（协议链路完成，真机权重推理待办）** → M2.5 能力面增量（上下文/提示词/引符/敕行/MCP 展示）→ M3 符箓台 + 太极（含 moli/问天/召将/摄行评估）→ M4 发布流水线。**中文 IME 预编辑是 M0 硬验收门槛**，不达标即切 iced（`fulu-ui` 已隔离）。
+M0 架构冻结（代码完成，IME 人工验收待办）→ M1 符·箓·篆内核（箓/缴符已落地）→ M2 法坛运行时（协议链路完成，真机权重推理待办）→ **M2.5 能力面增量（代码完成）** → M3 符箓台 + 太极（含 moli/问天/召将/摄行评估）→ M4 发布流水线。**中文 IME 预编辑是 M0 硬验收门槛**，不达标即切 iced（`fulu-ui` 已隔离）。
 
 ## 原则
 

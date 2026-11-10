@@ -212,6 +212,7 @@ impl<'a> Altar<'a> {
             Err(error @ RegisterError::CredentialNotGranted(_))
             | Err(error @ RegisterError::ToolNotInRegister(_))
             | Err(error @ RegisterError::SandboxEscalation { .. })
+            | Err(error @ RegisterError::PermissionTooLow { .. })
             | Err(error @ RegisterError::NetworkNotGranted(_))
             | Err(error @ RegisterError::QuotaNotPositive(_)) => {
                 self.audit.append(

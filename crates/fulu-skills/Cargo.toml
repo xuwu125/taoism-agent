@@ -1,9 +1,10 @@
 [package]
 name = "fulu-skills"
-description = "符胆：技能包版本化、sha256 内容寻址与导入导出（M0 占位骨架）"
+description = "符胆：技能包内容寻址、全局只读发现（M2.5）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+sha2.workspace = true

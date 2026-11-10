@@ -1,6 +1,6 @@
 [package]
 name = "fulu-prompt"
-description = "篆心：分层系统提示词装配器：七层来源、full/minimal/none 三档、快照测试（v0.3 占位骨架）"
+description = "篆心：分层系统提示词装配器（七层来源、full/minimal/none 三档，M2.5）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
