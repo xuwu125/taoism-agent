@@ -10,6 +10,8 @@
 //! 2. 焚化在后台线程执行，界面不卡死、也不假装「正在思考」；
 //! 3. 保留 M0 的中文 IME 探针——那是尚未完成的真人验收项，不能因为做了新界面就藏起来。
 
+mod fonts;
+
 use eframe::egui;
 use fulu_app::{AltarSession, DryRunPlan, Fu, Receipt, RiskClass};
 use std::path::{Path, PathBuf};
@@ -44,6 +46,8 @@ struct FuluApp {
     outer_summary: String,
     doctor: String,
     compliance: String,
+    /// 中文字体装配结果，显示在状态栏（egui 内置字体不含 CJK 字形）
+    cjk_note: String,
 
     audit_lines: Vec<String>,
     status: (String, Tone),
@@ -88,6 +92,7 @@ impl FuluApp {
             outer_summary: "外宗：未接入".into(),
             doctor,
             compliance,
+            cjk_note: String::new(),
             audit_lines: Vec::new(),
             status: (
                 "就绪。先「校验」，再「成符盖印」，最后勾选确认后焚符。".into(),
@@ -412,6 +417,9 @@ impl FuluApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(&self.status.0).color(color));
             });
+            if !self.cjk_note.is_empty() {
+                ui.label(egui::RichText::new(&self.cjk_note).small().weak());
+            }
             ui.collapsing(
                 "中文 IME 探针（M0 未完成的人工验收项）",
                 |ui| {
@@ -653,6 +661,11 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "符箓台 · 法坛",
         options,
-        Box::new(|_cc| Ok(Box::new(FuluApp::new()))),
+        Box::new(|cc| {
+            // 字体必须在第一帧之前装好，否则首帧中文会先画成方块。
+            let mut app = FuluApp::new();
+            app.cjk_note = fonts::install_cjk_font(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
     )
 }

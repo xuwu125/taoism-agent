@@ -131,8 +131,9 @@ crates/fulu-prompt          篆心：分层系统提示词装配器（快照测�
 | M0 实测 | `fmt --check` / `clippy -D warnings` / 40 个单测 / `cargo build -p fulu-ui` 全绿 |
 | M2 实测 | `fmt --check` / `clippy -D warnings` / **87 个测试零失败** / CLI 与 GUI 构建全绿；本机 mock `llama-server` 真实 HTTP 端到端：2 次请神 + 1 次 `fs.read` 工具调用 + 10 条缴符事件，回执归档、事件链校验通过（详见 docs/02 第 13 节） |
 | M2.5 实测 | `fmt --check` / `clippy 零告警` / **117 个测试零失败**；真机会话头采集（Windows 10 专业版 / i5-8400 / IP 杭州·联通）；19 个全局技能包真实发现；引符四步 + dry-run 通过；MCP stdio 客户端真实子进程冒烟（详见 docs/02 第 15 节） |
-| M3 实测 | `clippy --workspace --all-targets -D warnings` 零告警 / **126 个测试零失败**（连跑 5 轮稳定）；本机唯一 MCP（`streamable-http`）真实握手成功、列出 9 个工具；外宗工具在真实 HTTP + 真实子进程下端到端走完焚符循环；符箓台窗口实启中文渲染正常（详见 docs/02 第 16 节） |
+| M3 实测 | `clippy --workspace --all-targets -D warnings` 零告警 / **126 个测试零失败**（连跑 5 轮稳定）；本机唯一 MCP（`streamable-http`）真实握手成功、列出 9 个工具；外宗工具在真实 HTTP + 真实子进程下端到端走完焚符循环；符箓台窗口实启正常（中文渲染当时未验证，见下方 CI 修复行）（详见 docs/02 第 16 节） |
 | M3.1 实测 | `clippy --workspace --all-targets -D warnings` 零告警 / **142 个测试零失败**（连跑 3 轮）；本机 cucumber 的 9 个工具全是「未声明 → 破坏性」，加覆盖表后 3 个只读 / 1 个可变更生效、失效条目被点名；破坏性外宗工具在真实 TCP + 真实子进程下「未确认即敕否、预授权后放行」两条路径均验证（详见 docs/02 第 17 节） |
+| CI 修复实测 | `cargo deny check`（advisories / bans / licenses / sources）本地全绿：补 `Ubuntu-font-1.0` 白名单（`epaint_default_fonts` 内嵌 Ubuntu/NotoEmoji 字体）、内部依赖改为 `path + version` 消除 `*` 通配违规；清单闸门脚本自带 UTF-8 输出，Windows 管道下不再 `UnicodeEncodeError`。符箓台启动时装配系统 CJK 字体（本机命中 `C:\Windows\Fonts\msyh.ttc`），145 个测试零失败 |
 | 发布 | GitHub Actions 矩阵构建 → 轻量二进制包 + SHA256SUMS；M4 补 MSI / DMG / AppImage / DEB 与签名 |
 
 ## 里程碑
