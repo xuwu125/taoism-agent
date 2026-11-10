@@ -12,6 +12,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # 清单脚本会打印中文；Windows runner 的管道 stdout 默认不是 UTF-8，会 UnicodeEncodeError。
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
 
 jobs:
   quality:
@@ -37,7 +40,18 @@ jobs:
       # eframe/glow 在 Linux 上需要 X11/Wayland 客户端库用于链接期检查。
       - name: Install Linux GUI system deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          rustfmt --version
+          cargo clippy --version
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -46,6 +60,7 @@ jobs:
         shell: bash
         run: |
           if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
+          "$PY" --version
           "$PY" .github/scripts/check_model_manifest.py
 
       - name: clippy

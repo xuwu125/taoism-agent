@@ -17,21 +17,23 @@ sha2 = "0.10"
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 
 # 内部 crate：依赖方向严格单向，见 docs/02 第 5 节。
-fulu-core = { path = "crates/fulu-core" }
-fulu-script = { path = "crates/fulu-script" }
-fulu-register = { path = "crates/fulu-register" }
-fulu-provider = { path = "crates/fulu-provider" }
-fulu-model = { path = "crates/fulu-model" }
-fulu-runtime = { path = "crates/fulu-runtime" }
-fulu-orchestrator = { path = "crates/fulu-orchestrator" }
-fulu-tools = { path = "crates/fulu-tools" }
-fulu-skills = { path = "crates/fulu-skills" }
-fulu-audit = { path = "crates/fulu-audit" }
-fulu-app = { path = "crates/fulu-app" }
+# 一律写成「path + version」：只写 path 会被 cargo-deny 判成 `*` 通配依赖（bans 规则 deny），
+# 且 version 也让本地路径依赖在打包/发布时仍是合法版本要求。
+fulu-core = { path = "crates/fulu-core", version = "0.1.0" }
+fulu-script = { path = "crates/fulu-script", version = "0.1.0" }
+fulu-register = { path = "crates/fulu-register", version = "0.1.0" }
+fulu-provider = { path = "crates/fulu-provider", version = "0.1.0" }
+fulu-model = { path = "crates/fulu-model", version = "0.1.0" }
+fulu-runtime = { path = "crates/fulu-runtime", version = "0.1.0" }
+fulu-orchestrator = { path = "crates/fulu-orchestrator", version = "0.1.0" }
+fulu-tools = { path = "crates/fulu-tools", version = "0.1.0" }
+fulu-skills = { path = "crates/fulu-skills", version = "0.1.0" }
+fulu-audit = { path = "crates/fulu-audit", version = "0.1.0" }
+fulu-app = { path = "crates/fulu-app", version = "0.1.0" }
 # v0.3 能力面增量（占位，M2.5 落地）
-fulu-mcp = { path = "crates/fulu-mcp" }
-fulu-context = { path = "crates/fulu-context" }
-fulu-prompt = { path = "crates/fulu-prompt" }
+fulu-mcp = { path = "crates/fulu-mcp", version = "0.1.0" }
+fulu-context = { path = "crates/fulu-context", version = "0.1.0" }
+fulu-prompt = { path = "crates/fulu-prompt", version = "0.1.0" }
 
 [profile.release]
 opt-level = "z"

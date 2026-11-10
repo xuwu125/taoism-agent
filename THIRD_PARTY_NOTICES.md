@@ -34,6 +34,7 @@
 | 组件 | 许可 | 用途 |
 |---|---|---|
 | `egui` / `eframe` 0.37 | MIT OR Apache-2.0 | 原生自绘 GUI（glow 后端，非 WebView） |
+| `epaint_default_fonts` 0.37（由 eframe `default_fonts` 特性引入，**字体字节内嵌进二进制**） | (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0 | egui 内置兜底字体 |
 | `serde` / `serde_json` | MIT OR Apache-2.0 | 清单与符文序列化 |
 | `sha2` | MIT OR Apache-2.0 | 符印与权重摘要 |
 | `llama.cpp` / `llama-server`（外部运行时，M2 起按需分发） | MIT | 本地 GGUF 推理服务 |
@@ -42,4 +43,13 @@
 
 ## 4. 字体与素材
 
-符箓台使用 egui 0.37 的系统字体回退渲染中文，不随包分发第三方字体文件；未来若内置 CJK 子集字体，须在此补充其名称、版本与许可（优先 OFL-1.1 / MIT）。视频分析文档属评论性引用，不含原片与第三方源码。
+`epaint_default_fonts` 随 egui 内嵌两份字体，编译后**成为 `fulu` / `符箓台` 二进制的一部分**，因此分发二进制即构成字体分发：
+
+| 字体 | 许可 | 义务 |
+|---|---|---|
+| Ubuntu-Light（Ubuntu Font Family） | Ubuntu Font Licence 1.0 | 随包附许可全文；不得单独以「Ubuntu」名义再分发或售卖；修改后的字体不得使用保留字体名 |
+| NotoEmoji | OFL-1.1 | 随包附许可全文；不得单独售卖；修改版不得使用保留字体名 |
+
+二者的许可全文可从 <https://ubuntu.com/legal/font-licence> 与 <https://scripts.sil.org/OFL> 取得；正式发布安装包时须把全文放进 bundle（M4 打包清单中列为必检项）。
+
+除上述内嵌字体外，符箓台**不随包分发其他字体文件**：中文渲染在启动时按平台探测本机 CJK 字体（Windows `msyh.ttc` / macOS `PingFang.ttc` / Linux Noto CJK），只读取用户系统已有字体，不再分发。未来若内置 CJK 子集字体，须在此补充其名称、版本与许可（优先 OFL-1.1 / MIT）。视频分析文档属评论性引用，不含原片与第三方源码。

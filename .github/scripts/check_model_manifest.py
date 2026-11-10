@@ -34,8 +34,20 @@ REQUIRED = (
 
 
 def main() -> int:
+    # Windows 上 stdout 被重定向（CI、管道）时默认编码可能是 cp936/cp1252，
+    # 直接 print 中文会抛 UnicodeEncodeError 把闸门判成失败。统一按 UTF-8 输出。
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
     issues: list[str] = []
-    data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    try:
+        raw = MANIFEST.read_text(encoding="utf-8")
+    except OSError as error:
+        print(f"[ERR] 读不到模型清单 {MANIFEST}：{error}", file=sys.stderr)
+        return 1
+    data = json.loads(raw)
 
     if data.get("schema_version") != 1:
         issues.append("schema_version 必须为 1")

@@ -8,6 +8,8 @@ ignore = []
 [licenses]
 version = 2
 confidence-threshold = 0.8
+# 白名单通常比当前依赖树宽一点（为后续换依赖留余量），未命中的条目不算问题。
+unused-allowed-license = "allow"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -19,6 +21,10 @@ allow = [
     "CC0-1.0",
     "Unicode-3.0",
     "OFL-1.1",
+    # eframe 的 default_fonts 特性内嵌 epaint_default_fonts，其中含 Ubuntu 字体：
+    # "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0"。分发二进制须随附该许可全文，
+    # 见 THIRD_PARTY_NOTICES.md 第 3 节。
+    "Ubuntu-font-1.0",
     "MPL-2.0",
 ]
 
