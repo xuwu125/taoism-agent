@@ -1,10 +1,20 @@
 //! 模型供应商抽象层（docs/02 第 5、8.5 节）。
 //!
-//! 符文与 Harness **不得依赖具体供应商**：流式、工具调用格式、模板差异全部
-//! 收敛到 `Provider` trait + `Capabilities` 能力协商。
+//! 符文与 Harness **不得依赖具体供应商**：流式、工具调用格式、ChatML 模板差异
+//! 全部收敛到 `Provider` trait + `Capabilities` 能力协商。
 //!
-//! M0 只定义契约。`LocalLfmProvider::invoke` 明确返回 `NotImplemented`（M2 落地
-//! 本地 `llama-server` 的 OpenAI 兼容 HTTP 调用），**不伪装成已可推理**。
+//! M2 状态：`LocalLfmProvider` 已实现真实的 OpenAI 兼容 HTTP 调用（`/health`、
+//! `/v1/models`、`/v1/chat/completions`），并把 LFM2 的 Pythonic 工具调用与
+//! LFM3 的原生工具调用归一为统一 `ToolCall`。Rust 主进程仍不链接任何推理库：
+//! `llama-server` 是独立进程，仅绑定 `127.0.0.1`。
+
+pub mod http;
+pub mod local;
+pub mod stub;
+
+pub use http::{Endpoint, HttpError, HttpResponse, MAX_RESPONSE_BYTES};
+pub use local::{Health, LocalLfmProvider, build_request_body, normalize_tool_calls, parse_reply};
+pub use stub::{StubProvider, text_reply};
 
 use fulu_core::Sampling;
 use serde::{Deserialize, Serialize};
@@ -42,6 +52,14 @@ pub struct ToolCall {
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// 服务端未返回 usage 时按字符数保守估算，并**明确标注**，不伪称精确值。
+    pub estimated: bool,
+}
+
+impl Usage {
+    pub fn total(&self) -> u32 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +70,7 @@ pub struct InvocationRequest {
     /// 已由「箓」核验过的工具定义（JSON 数组字符串）
     pub tools_json: String,
     pub sampling: Sampling,
+    /// 本轮剩余预算，直接作为 `max_tokens` 上限
     pub budget_tokens: u32,
     pub context_tokens: u32,
 }
@@ -59,7 +78,7 @@ pub struct InvocationRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvocationReply {
     pub text: String,
-    /// 归一后的工具调用；执行前仍须经 `fulu-tools` 白名单复核
+    /// 归一后的工具调用；执行前仍须经「箓」+「风火轮」白名单复核
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
 }
@@ -67,8 +86,12 @@ pub struct InvocationReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderError {
     NotImplemented(&'static str),
+    /// 本地推理服务尚未拉起 / 端点缺失：属于配置问题，不是推理失败。
+    NotConfigured(String),
     ModelUnavailable(String),
     Transport(String),
+    /// 响应协议不符合 OpenAI 兼容约定
+    Protocol(String),
     BudgetExceeded,
     Timeout,
 }
@@ -77,8 +100,10 @@ impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotImplemented(stage) => write!(f, "该 provider 尚未实现（计划阶段：{stage}）"),
+            Self::NotConfigured(msg) => write!(f, "本地推理运行时未就绪：{msg}"),
             Self::ModelUnavailable(msg) => write!(f, "内置模型不可用：{msg}"),
             Self::Transport(msg) => write!(f, "本地推理服务通信失败：{msg}"),
+            Self::Protocol(msg) => write!(f, "推理服务响应协议错误：{msg}"),
             Self::BudgetExceeded => write!(f, "token 预算耗尽"),
             Self::Timeout => write!(f, "推理超时（过坛）"),
         }
@@ -94,93 +119,36 @@ pub trait Provider: Send + Sync {
     fn invoke(&self, request: &InvocationRequest) -> Result<InvocationReply, ProviderError>;
 }
 
-/// 内置 2B 级 LFM：只记录端点与模型标识，实际 HTTP 调用留到 M2。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalLfmProvider {
-    /// 例如 `http://127.0.0.1:随机端口`，由 `fulu-model` 的进程管理提供
-    pub endpoint: String,
-    pub model_id: String,
-    /// 清单 `min_runtime`，启动时断言，避免静默加载不支持的架构
-    pub min_runtime: String,
-    pub context_tokens: u32,
-}
-
-impl LocalLfmProvider {
-    pub fn from_model(model_id: &str, context_tokens: u32, min_runtime: &str) -> Self {
-        Self {
-            endpoint: String::new(),
-            model_id: model_id.to_owned(),
-            min_runtime: min_runtime.to_owned(),
-            context_tokens,
-        }
-    }
-
-    /// 本地服务只允许回环地址，避免把推理端口暴露到网络。
-    pub fn set_endpoint(&mut self, endpoint: &str) -> Result<(), ProviderError> {
-        if !(endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://localhost:"))
-        {
-            return Err(ProviderError::Transport(
-                "本地推理服务必须绑定回环地址".into(),
-            ));
-        }
-        self.endpoint = endpoint.to_owned();
-        Ok(())
-    }
-}
-
-impl Provider for LocalLfmProvider {
-    fn id(&self) -> &str {
-        "lu://local/llama-server"
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::local_lfm(self.context_tokens)
-    }
-
-    fn invoke(&self, _request: &InvocationRequest) -> Result<InvocationReply, ProviderError> {
-        // 故意不实现：M0 是架构冻结，不写推理业务代码。
-        Err(ProviderError::NotImplemented("M2 · 法坛运行时"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn provider() -> LocalLfmProvider {
-        LocalLfmProvider::from_model("lfm3-1.7b-q4km", 8192, "llama.cpp >= b11960 (v0.8.0)")
-    }
-
     #[test]
     fn capabilities_are_local_and_offline() {
-        let caps = provider().capabilities();
+        let caps = LocalLfmProvider::from_model("lfm3-1.7b-q4km", 8192, "llama.cpp >= b11960")
+            .capabilities();
         assert!(caps.local_only);
         assert!(caps.tool_calls);
         assert_eq!(caps.max_context_tokens, 8192);
     }
 
     #[test]
-    fn invoke_explicitly_reports_not_implemented() {
-        let request = InvocationRequest {
-            model_id: "lfm3-1.7b-q4km".into(),
-            system: String::new(),
-            user: "你好".into(),
-            tools_json: "[]".into(),
-            sampling: Sampling::default(),
-            budget_tokens: 100,
-            context_tokens: 8192,
-        };
-        assert_eq!(
-            provider().invoke(&request),
-            Err(ProviderError::NotImplemented("M2 · 法坛运行时"))
-        );
+    fn endpoint_must_be_loopback() {
+        let mut provider =
+            LocalLfmProvider::from_model("lfm3-1.7b-q4km", 8192, "llama.cpp >= b11960");
+        assert!(provider.set_endpoint("http://127.0.0.1:8080").is_ok());
+        assert!(provider.set_endpoint("http://localhost:9000/v1").is_ok());
+        assert!(provider.set_endpoint("http://0.0.0.0:8080").is_err());
+        assert!(provider.set_endpoint("https://api.example.com").is_err());
     }
 
     #[test]
-    fn endpoint_must_be_loopback() {
-        let mut p = provider();
-        assert!(p.set_endpoint("http://127.0.0.1:8080").is_ok());
-        assert!(p.set_endpoint("http://0.0.0.0:8080").is_err());
-        assert!(p.set_endpoint("https://api.example.com").is_err());
+    fn usage_total_saturates_instead_of_overflowing() {
+        let usage = Usage {
+            prompt_tokens: u32::MAX,
+            completion_tokens: 10,
+            estimated: false,
+        };
+        assert_eq!(usage.total(), u32::MAX);
     }
 }

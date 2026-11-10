@@ -1,9 +1,14 @@
 [package]
 name = "fulu-audit"
-description = "缴符：append-only 事件日志、脱敏、回放与导出（M0 占位骨架）"
+description = "缴符：append-only 事件日志、脱敏、可校验链与回放（M2）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+fulu-core.workspace = true
+fulu-script.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "fulu-app"
-description = "用例门面：GUI 与 CLI 共用的只读门面（M0：doctor / 符文检查）"
+description = "用例门面：GUI 与 CLI 共用的仪轨会话（M2：dry-run / 焚化 / 探活 / 缴符）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,3 +11,7 @@ fulu-core.workspace = true
 fulu-script.workspace = true
 fulu-model.workspace = true
 fulu-provider.workspace = true
+fulu-register.workspace = true
+fulu-tools.workspace = true
+fulu-audit.workspace = true
+fulu-runtime.workspace = true

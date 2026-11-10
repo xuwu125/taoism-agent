@@ -17,8 +17,8 @@
 
 ## 权重在哪里
 
-- **不进 Git**：`*.gguf` / `*.safetensors` 已在 `.gitignore` 中排除。本轮（M0）**没有下载、没有打包任何权重**。
-- **轻量包（默认）**：安装包不含权重。首次运行 `fulu model fetch` 按清单下载；离线环境用 `fulu model import <本地文件>` 导入。缺权重时明确报错，不静默联网。
+- **不进 Git**：`*.gguf` / `*.safetensors` 已在 `.gitignore` 中排除。截至 M2（2026-11-10）**没有下载、没有打包任何权重**。
+- **轻量包（默认）**：安装包不含权重。离线导入用 `fulu model import <本地文件>`；`fulu model fetch` 目前只是**显式许可 + 校验闸门**（需 `--i-understand-license`，且清单 `bytes`/`sha256` 固化后才可能放行）。公网 HTTPS 下载需要 TLS 依赖，列为 **M2.1 待办**，本轮不发起任何网络请求。缺权重时明确报错，不静默联网。
 - **离线 bundle（Release 可选资产）**：包含权重 + `THIRD_PARTY_NOTICES.md` + LFM LICENSE 原文，供完全离线部署；由 `workflow_dispatch` 手动触发，不随每次 tag 自动上传 1.1 GB。
 - 缓存位置：Windows `%LOCALAPPDATA%\taoism-agent\models\<slot>\`，macOS `~/Library/Application Support/taoism-agent/models/<slot>/`，Linux `$XDG_DATA_HOME/taoism-agent/models/<slot>/`（回退 `~/.local/share`）。
 
@@ -27,7 +27,7 @@
 清单里的 `bytes` 与 `sha256` 目前均为 `null`：官方只公布标称体积，精确字节数与实际摘要要在下载 / Release 固化后才能确定，**本轮不编造**。
 
 - `fulu model verify <file>`：文件存在时计算真实 SHA256 与字节数；若清单已登记摘要则逐项比对；若未登记，结果明确标记 `UNVERIFIED`（只报告实测值），**绝不输出「校验通过」**。
-- `fulu model import <file>`：离线复制到缓存目录，同样把 unverified 状态写入结果，供 M2 运行时决定是否拒绝加载。
+- `fulu model import <file>`：离线复制到缓存目录，同样把 unverified 状态写入结果。Rust 侧**不加载权重**，只校验文件并登记状态；实际推理由用户启动的外部 `llama-server` 负责（M3 接进程生命周期管理）。
 - CI 的 `check_model_manifest.py` 会断言：每个条目都有 `license` / `license_url` / `source_url` / `min_runtime`，`is_default` 恰好一个，且 `git ls-files '*.gguf'` 为空。
 
 ## 许可隔离（阻断性合规项，务必阅读）

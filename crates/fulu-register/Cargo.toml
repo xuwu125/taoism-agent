@@ -1,9 +1,11 @@
 [package]
 name = "fulu-register"
-description = "箓层：箓牒、系统凭据库、工具注册表、权限与配额核验（M0 占位骨架）"
+description = "箓层：授箓名册、工具注册表、权限等级与配额核验（M2）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde.workspace = true
+fulu-core.workspace = true

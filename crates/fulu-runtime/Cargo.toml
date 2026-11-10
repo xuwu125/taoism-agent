@@ -1,9 +1,16 @@
 [package]
 name = "fulu-runtime"
-description = "法坛：tokio 调度、Harness 强制、沙箱边界、事件产生（M0 占位骨架）"
+description = "法坛：仪轨状态机、Harness 强制、agent loop、dry-run 与缴符（M2）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde_json.workspace = true
+fulu-core.workspace = true
+fulu-script.workspace = true
+fulu-register.workspace = true
+fulu-provider.workspace = true
+fulu-tools.workspace = true
+fulu-audit.workspace = true
