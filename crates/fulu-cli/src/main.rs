@@ -1315,7 +1315,13 @@ fn init(args: &[String]) -> i32 {
 
     println!("符箓 · 引符（开箱基础配置）");
     println!("================================");
-    println!("引符也是一张符：走成符→盖印→dry-run→确认的完整仪轨，本命令只做零模型的部分。");
+    // T12：如实标注。本命令是「零模型准备」不是仪轨：不请神、不焚符、不写缴符。
+    // 示例符落盘后，由用户显式走 dry-run → --confirm 才进入完整仪轨。
+    println!(
+        "引符也是一张符；但本命令只是零模型准备（预览），**不焚符**。\
+         落盘的示例符要等你显式执行 `altar dry-run` 与 `altar run --confirm` 才走完整仪轨。\
+         对话式引符（模型驱动）需真机权重，当前未实现。"
+    );
 
     println!("\n[1/4] 会话头采集");
     let snapshot = fulu_context::collect(Some(&workspace), true);
