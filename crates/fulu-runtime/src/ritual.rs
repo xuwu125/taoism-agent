@@ -11,16 +11,23 @@
 use fulu_audit::{AuditEvent, AuditLog, EventKind};
 use fulu_core::{Talisman, TalismanState, can_transition};
 use fulu_provider::{InvocationRequest, Provider, ProviderError};
-use fulu_register::{Authorization, Register, RegisterError};
+use fulu_register::{Authorization, Confirmation, Register, RegisterError, RiskClass};
 use fulu_script::seal_hex;
 use fulu_tools::{ToolArguments, ToolRegistry};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::converge::{Convergence, evaluate, parse};
+use crate::gate::{ConfirmRequest, ConfirmVerdict, Confirmer};
+
+/// 同一工具连续被拒到这个次数就停止焚化。
+///
+/// 模型很容易「换个说法再试一次」，而每次拒绝都会消耗 token 预算。与其让它
+/// 撞到预算耗尽，不如在第二次被拒后明确停下——这不是惩罚，是省下无意义开销。
+pub const MAX_DENIALS_PER_TOOL: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RitualError {
@@ -161,6 +168,12 @@ pub struct Altar<'a> {
     pub register: &'a Register,
     pub audit: &'a mut AuditLog,
     pub config: RitualConfig,
+    /// 未装确认器时一切需要确认的召将都被敕否（fail closed）。
+    confirmer: Option<&'a mut dyn Confirmer>,
+    /// 本符内已确认过的工具（对应 `Confirmation::OncePerTalisman`）
+    confirmed_once: BTreeSet<String>,
+    /// 每个工具被拒的次数，用于及时止损
+    denials: BTreeMap<String, u32>,
 }
 
 impl<'a> Altar<'a> {
@@ -177,7 +190,18 @@ impl<'a> Altar<'a> {
             register,
             audit,
             config,
+            confirmer: None,
+            confirmed_once: BTreeSet::new(),
+            denials: BTreeMap::new(),
         }
+    }
+
+    /// 装上确认器。**不装就是拒绝**：需要确认的召将一律敕否并记账。
+    ///
+    /// 借而不是拿走，是为了让会话层（CLI / GUI）持有确认器并在多次仪轨间复用；
+    /// 反过来若法坛持有 `Box`，每次焚符都得重新造一个，交互状态就断了。
+    pub fn set_confirmer(&mut self, confirmer: &'a mut dyn Confirmer) {
+        self.confirmer = Some(confirmer);
     }
 
     fn transition(&self, from: TalismanState, to: TalismanState) -> Result<(), RitualError> {
@@ -260,6 +284,24 @@ impl<'a> Altar<'a> {
         ];
         if auth.network {
             notes.push("符申请了网络能力，请复核域名白名单".into());
+        }
+        // 确认门必须在待焚前说清楚：哪些召将会停下来等人点头。
+        let gated = auth.tools_needing_confirmation();
+        if gated.is_empty() {
+            notes.push("确认门无拦截：本次授权的工具均为只读观察，焚化不会中途停下来问人".into());
+        } else {
+            notes.push(format!(
+                "确认门：{}——焚化时逐个请示；无人值守（未装确认器）一律敕否",
+                gated
+                    .iter()
+                    .map(|(id, risk)| format!(
+                        "{id}（{}·{}）",
+                        risk.label(),
+                        risk.confirmation().label()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ));
         }
 
         let plan = DryRunPlan {
@@ -447,6 +489,87 @@ impl<'a> Altar<'a> {
                         EventKind::ToolCall,
                         &format!("召将 name={} id={}", call.name, call.id),
                     )?;
+                    // 敕门：先问人，再动手。风险等级来自箓牒；外宗工具的那一维
+                    // 来自 server 自述，只用于收紧确认，从不放宽权限。
+                    let (risk, description) = match self.register.tool(&call.name) {
+                        Some(grant) => (grant.risk, grant.description.clone()),
+                        // 能走到这里说明箓层已放行；查不到仍按最严处理。
+                        None => (RiskClass::Destructive, String::new()),
+                    };
+                    let confirmation = risk.confirmation();
+                    let needs_confirm = match confirmation {
+                        Confirmation::None => false,
+                        Confirmation::OncePerTalisman => !self.confirmed_once.contains(&call.name),
+                        Confirmation::EveryCall => true,
+                    };
+                    if needs_confirm {
+                        let request = ConfirmRequest {
+                            seal: seal.clone(),
+                            tool: call.name.clone(),
+                            risk,
+                            confirmation,
+                            description,
+                            arguments_json: call.arguments_json.clone(),
+                            attempt: used_tools.get(&call.name).copied().unwrap_or(0) + 1,
+                        };
+                        let verdict = match self.confirmer.as_mut() {
+                            Some(confirmer) => confirmer.confirm(&request),
+                            None => ConfirmVerdict::Deny,
+                        };
+                        if verdict == ConfirmVerdict::Allow {
+                            self.audit.append(
+                                &seal,
+                                TalismanState::Igniting,
+                                EventKind::Confirmed,
+                                &format!(
+                                    "敕可 {} 参数={}",
+                                    request.summary(),
+                                    clip(&request.arguments_json, 240)
+                                ),
+                            )?;
+                            if confirmation == Confirmation::OncePerTalisman {
+                                self.confirmed_once.insert(call.name.clone());
+                            }
+                        } else {
+                            let count = {
+                                let entry = self.denials.entry(call.name.clone()).or_insert(0);
+                                *entry += 1;
+                                *entry
+                            };
+                            let why = if self.confirmer.is_none() {
+                                "无人值守：未装确认器，需要确认的召将一律敕否"
+                            } else {
+                                "确认被拒"
+                            };
+                            self.audit.append(
+                                &seal,
+                                TalismanState::Igniting,
+                                EventKind::Denied,
+                                &format!("敕否 {} 原因={why} 累计={count}", request.summary()),
+                            )?;
+                            if count > MAX_DENIALS_PER_TOOL {
+                                let message =
+                                    format!("{} 连续 {count} 次未获确认，停止焚化", call.name);
+                                return self.abort(
+                                    &seal,
+                                    TalismanState::Exploded,
+                                    EventKind::Exploded,
+                                    &message,
+                                    RitualError::ToolRejected(message.clone()),
+                                );
+                            }
+                            // 不把拒绝当炸炉：把理由交回模型，让它换一条路。
+                            user_input.push_str(&format!(
+                                "\n\n[召将未获确认 {}]\n{why}。风险等级：{}。\n\
+                                 不要重复请求该工具；改用不需要确认的路径，\
+                                 或在回答中说明你需要它做什么。",
+                                call.name,
+                                risk.label()
+                            ));
+                            continue;
+                        }
+                    }
+
                     let arguments = ToolArguments {
                         json: call.arguments_json.clone(),
                     };
@@ -559,8 +682,17 @@ impl<'a> Altar<'a> {
     }
 }
 
+/// 截断过长文本用于事件详情，避免一条缴符事件被整段参数撑爆。
+fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(limit).collect();
+    clipped.push('…');
+    clipped
+}
+
 /// 把「箓」中已受箓的工具定义转成 OpenAI 兼容 tools 数组。
-/// 把受箓工具渲染成 OpenAI 兼容的 `tools` 数组。
 ///
 /// 参数 schema 一律取自箓牒（`ToolGrant::parameters_json`）：内置工具在
 /// baseline 里写好，外宗（MCP）工具用 server 声明的真实 `inputSchema`。
@@ -593,6 +725,7 @@ mod tests {
     use super::*;
     use fulu_provider::{InvocationReply, StubProvider, ToolCall, Usage, text_reply};
     use fulu_register::ToolGrant;
+    use std::sync::{Arc, Mutex};
 
     fn fixture() -> (Talisman, Register, ToolRegistry, AuditLog) {
         (
@@ -712,6 +845,198 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| event.kind == EventKind::ToolResult)
+        );
+    }
+
+    /// 把 echo 的风险改成指定等级：echo 本身已注册在默认 registry 里，
+    /// 这样可以在不引入假工具的情况下验证确认门的三种策略。
+    fn register_with_echo_risk(risk: RiskClass) -> Register {
+        let mut register = Register::baseline();
+        let mut grant = register.tool("echo").unwrap().clone();
+        grant.risk = risk;
+        register.grant_tool(grant);
+        register
+    }
+
+    fn fu_with_echo() -> Talisman {
+        let mut fu = Talisman::sample();
+        fu.tool_refs = vec!["echo".into()];
+        fu.harness.allow_tools = vec!["echo".into()];
+        fu
+    }
+
+    fn call_echo() -> InvocationReply {
+        InvocationReply {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c-echo".into(),
+                name: "echo".into(),
+                arguments_json: r#"{"text":"急急如律令"}"#.into(),
+            }],
+            usage: Usage {
+                prompt_tokens: 5,
+                completion_tokens: 5,
+                estimated: false,
+            },
+        }
+    }
+
+    struct RecordingGate {
+        allow: RiskClass,
+        seen: Arc<Mutex<Vec<ConfirmRequest>>>,
+    }
+
+    impl RecordingGate {
+        fn new(allow: RiskClass) -> (Self, Arc<Mutex<Vec<ConfirmRequest>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    allow,
+                    seen: Arc::clone(&seen),
+                },
+                seen,
+            )
+        }
+    }
+
+    impl Confirmer for RecordingGate {
+        fn confirm(&mut self, request: &ConfirmRequest) -> ConfirmVerdict {
+            self.seen.lock().unwrap().push(request.clone());
+            if request.risk <= self.allow {
+                ConfirmVerdict::Allow
+            } else {
+                ConfirmVerdict::Deny
+            }
+        }
+    }
+
+    #[test]
+    fn destructive_tool_is_denied_when_nobody_is_watching() {
+        let register = register_with_echo_risk(RiskClass::Destructive);
+        let tools = ToolRegistry::default();
+        let fu = fu_with_echo();
+        let provider = StubProvider::default();
+        provider.push_reply(call_echo());
+        provider.push_reply(text_reply("改用文字作答", 5, 5));
+        let mut audit = AuditLog::new();
+        let mut altar = altar(&provider, &tools, &register, &mut audit);
+        let plan = altar.prepare(&fu).unwrap();
+        // 待焚计划必须先说清楚有门，且门是默认关着的。
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("确认门") && note.contains("无人值守"))
+        );
+
+        let receipt = altar.ignite(&fu, &plan, true).unwrap();
+        assert!(receipt.converged);
+        assert!(
+            receipt
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::Denied),
+            "未装确认器时必须留下敕否事件"
+        );
+        assert!(
+            !receipt
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::ToolResult),
+            "被敕否的工具绝不能被真的执行"
+        );
+        assert!(
+            provider
+                .last_request()
+                .unwrap()
+                .user
+                .contains("召将未获确认 echo"),
+            "模型必须知道为什么没召成，才能换一条路"
+        );
+        audit.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn destructive_tool_runs_only_under_an_explicit_ceiling() {
+        let register = register_with_echo_risk(RiskClass::Destructive);
+        let tools = ToolRegistry::default();
+        let fu = fu_with_echo();
+        let provider = StubProvider::default();
+        provider.push_reply(call_echo());
+        provider.push_reply(text_reply("完成", 5, 5));
+        let mut audit = AuditLog::new();
+        let (mut gate, seen) = RecordingGate::new(RiskClass::Destructive);
+        let mut altar = altar(&provider, &tools, &register, &mut audit);
+        altar.set_confirmer(&mut gate);
+        let plan = altar.prepare(&fu).unwrap();
+        let receipt = altar.ignite(&fu, &plan, true).unwrap();
+
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(
+            receipt
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::Confirmed)
+        );
+        assert!(
+            receipt
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::ToolResult)
+        );
+    }
+
+    #[test]
+    fn mutating_tool_asks_once_per_talisman() {
+        let register = register_with_echo_risk(RiskClass::Mutate);
+        let tools = ToolRegistry::default();
+        let fu = fu_with_echo();
+        let provider = StubProvider::default();
+        provider.push_reply(call_echo());
+        provider.push_reply(call_echo());
+        provider.push_reply(text_reply("完成", 5, 5));
+        let mut audit = AuditLog::new();
+        let (mut gate, seen) = RecordingGate::new(RiskClass::Mutate);
+        let mut altar = altar(&provider, &tools, &register, &mut audit);
+        altar.set_confirmer(&mut gate);
+        let plan = altar.prepare(&fu).unwrap();
+        let receipt = altar.ignite(&fu, &plan, true).unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "可变更工具同一张符只该问一次"
+        );
+        let tool_results = receipt
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::ToolResult)
+            .count();
+        assert_eq!(tool_results, 2, "确认过了就该真的执行两次");
+    }
+
+    #[test]
+    fn repeated_denials_stop_the_ritual_instead_of_burning_budget() {
+        let register = register_with_echo_risk(RiskClass::Destructive);
+        let tools = ToolRegistry::default();
+        let fu = fu_with_echo();
+        let provider = StubProvider::default();
+        for _ in 0..3 {
+            provider.push_reply(call_echo());
+        }
+        let mut audit = AuditLog::new();
+        let mut altar = altar(&provider, &tools, &register, &mut audit);
+        let plan = altar.prepare(&fu).unwrap();
+        assert!(matches!(
+            altar.ignite(&fu, &plan, true),
+            Err(RitualError::ToolRejected(_))
+        ));
+        assert_eq!(
+            audit
+                .events()
+                .iter()
+                .filter(|event| event.kind == EventKind::Denied)
+                .count(),
+            (MAX_DENIALS_PER_TOOL + 1) as usize
         );
     }
 

@@ -4,8 +4,9 @@
 //! 刻意不引入 clap 等依赖，保持最小可编译面。**任何联网动作都必须显式**：
 //! `altar run` 需要 `--confirm`，`model fetch` 需要 `--i-understand-license`。
 
-use fulu_app::{AltarSession, ENDPOINT_ENV};
+use fulu_app::{AltarSession, ENDPOINT_ENV, RiskClass};
 use fulu_model::{ModelManifest, VerifyStatus, cache_dir, import_file, verify_file};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -67,6 +68,10 @@ fn help() {
          \n\
          可选参数（altar）：--confirm --endpoint <回环URL> --workspace <目录> --export <日志.jsonl>\n\
          \x20                 --mcp [配置路径]  焚化时接入外宗（受限级，需沙箱 ≥ limited）\n\
+         \x20                 --allow-risk <observe|mutate|destructive>  预授权高危召将\n\
+         \x20                 --ask            高危召将逐次在终端里问人\n\
+         \x20                 --strict-outer-sect  不采信 server 只读自述，一概按破坏性处理\n\
+         \x20                 --risk-overrides <文件>  指定 fulu 风险覆盖表（默认 ~/.fulu/outer-sect-risk.json）\n\
          环境变量：{ENDPOINT_ENV}=http://127.0.0.1:8080\n\
          槽位默认 default；可用：default / lowmem / fallback / finetune_base"
     );
@@ -316,6 +321,14 @@ struct AltarOptions {
     export: Option<PathBuf>,
     /// `--mcp`：焚化时接入本机全局 MCP（外宗），`--mcp <配置>` 可指定单份配置。
     mcp: Option<Option<PathBuf>>,
+    /// `--allow-risk <等级>`：把高危召将预授权到该等级为止
+    allow_risk: Option<RiskClass>,
+    /// `--ask`：每次高危召将都在终端里问人
+    ask: bool,
+    /// `--strict-outer-sect`：不信 server 的只读自述，外宗工具一律按破坏性处理
+    strict_outer_sect: bool,
+    /// `--risk-overrides <文件>`：指定 fulu 的风险覆盖表（默认读 ~/.fulu/）
+    risk_overrides: Option<PathBuf>,
 }
 
 fn parse_altar_options(args: &[String]) -> AltarOptions {
@@ -342,6 +355,27 @@ fn parse_altar_options(args: &[String]) -> AltarOptions {
                     index += 1;
                 }
             }
+            "--allow-risk" => {
+                if let Some(value) = args.get(index + 1) {
+                    match value.as_str() {
+                        "observe" => options.allow_risk = Some(RiskClass::Observe),
+                        "mutate" => options.allow_risk = Some(RiskClass::Mutate),
+                        "destructive" => options.allow_risk = Some(RiskClass::Destructive),
+                        other => eprintln!(
+                            "[WARN] 未知风险等级：{other}（可用 observe / mutate / destructive）"
+                        ),
+                    }
+                    index += 1;
+                }
+            }
+            "--ask" => options.ask = true,
+            "--risk-overrides" => {
+                if let Some(value) = args.get(index + 1) {
+                    options.risk_overrides = Some(PathBuf::from(value));
+                    index += 1;
+                }
+            }
+            "--strict-outer-sect" => options.strict_outer_sect = true,
             "--mcp" => {
                 // 裸 `--mcp` 走系统默认路径；`--mcp <path>` 只读那一份配置。
                 let explicit = args
@@ -358,6 +392,61 @@ fn parse_altar_options(args: &[String]) -> AltarOptions {
         index += 1;
     }
     options
+}
+
+/// 终端确认器：`--allow-risk` 预授权，`--ask` 逐次问人。
+///
+/// 默认（两样都没给）就是拒绝——法坛在没装确认器时也会 fail closed，
+/// 这里显式实现一份，是为了在拒绝时能告诉用户**该加哪个参数**。
+struct CliGate {
+    ask: bool,
+    ceiling: Option<RiskClass>,
+}
+
+impl fulu_app::Gatekeeper for CliGate {
+    fn confirm(&mut self, request: &fulu_app::ConfirmRequest) -> fulu_app::ConfirmVerdict {
+        use fulu_app::ConfirmVerdict;
+        if let Some(ceiling) = self.ceiling
+            && request.risk <= ceiling
+        {
+            println!(
+                "[敕可] {} —— 已按 --allow-risk {} 预授权",
+                request.summary(),
+                ceiling.label()
+            );
+            return ConfirmVerdict::Allow;
+        }
+        if !self.ask {
+            eprintln!(
+                "[敕否] {} —— 无人确认。确需放行请加 --allow-risk <等级> 或 --ask",
+                request.summary()
+            );
+            return ConfirmVerdict::Deny;
+        }
+        println!();
+        println!("[请敕] {}", request.summary());
+        if !request.description.is_empty() {
+            println!("  说明 : {}", request.description);
+        }
+        println!("  参数 : {}", request.arguments_json);
+        print!("  允许本次调用？[y/N] ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                println!("（没有读到输入，按拒绝处理）");
+                ConfirmVerdict::Deny
+            }
+            Ok(_) => {
+                let answer = line.trim().to_ascii_lowercase();
+                if answer == "y" || answer == "yes" || answer == "是" {
+                    ConfirmVerdict::Allow
+                } else {
+                    ConfirmVerdict::Deny
+                }
+            }
+        }
+    }
 }
 
 fn altar(args: &[String]) -> i32 {
@@ -397,6 +486,13 @@ fn altar(args: &[String]) -> i32 {
     if let Some(root) = &options.workspace {
         session.set_workspace(root.clone());
     }
+    // 确认门：默认一律敕否。--allow-risk 预授权到某等级，--ask 逐次问人。
+    if options.ask || options.allow_risk.is_some() {
+        session.set_confirmer(Box::new(CliGate {
+            ask: options.ask,
+            ceiling: options.allow_risk,
+        }));
+    }
     if let Some(explicit) = &options.mcp {
         // 外宗接入发生在 dry-run 之前：工具面必须出现在待焚计划里，
         // 否则用户是在「不知道这张符能召哪些外宗将」的情况下按下确认。
@@ -408,16 +504,40 @@ fn altar(args: &[String]) -> i32 {
         for issue in &issues {
             eprintln!("[WARN] 外宗配置：{issue}");
         }
-        let report = session.attach_mcp(&servers);
+        // 默认采信 server 的只读自述；加 --strict-outer-sect 则一概按破坏性处理。
+        let risk_floor = if options.strict_outer_sect {
+            RiskClass::Destructive
+        } else {
+            RiskClass::Observe
+        };
+        let (overrides, override_issues) =
+            load_risk_overrides(options.risk_overrides.as_ref().and_then(|p| p.to_str()));
+        if !override_issues.is_empty() {
+            for issue in &override_issues {
+                eprintln!("[WARN] 风险覆盖表：{issue}");
+            }
+        }
+        let report = session.attach_mcp_full(&servers, risk_floor, &overrides);
         println!("[OK] {}", report.summary());
+        if options.strict_outer_sect {
+            println!("  （--strict-outer-sect：不采信 annotations，全部按破坏性处理）");
+        }
         for server in &report.servers {
             if server.connected {
-                println!(
-                    "  - {:<16} {} 个工具：{}",
-                    server.name,
-                    server.tools.len(),
-                    server.tools.join(", ")
-                );
+                println!("  - {:<16} {} 个工具：", server.name, server.tools.len());
+                for tool in &server.tools {
+                    println!(
+                        "      {:<40} {}（{}）{}",
+                        tool.id,
+                        tool.risk.label(),
+                        tool.risk_source.label(),
+                        if tool.declared_read_only {
+                            " · server 自述只读"
+                        } else {
+                            ""
+                        }
+                    );
+                }
             } else {
                 println!(
                     "  - {:<16} [ERR] {}",
@@ -684,6 +804,15 @@ fn prompt_show() -> i32 {
     0
 }
 
+/// 读取风险覆盖表：给了显式路径就只读那一份，否则读 fulu 的默认位置。
+fn load_risk_overrides(explicit: Option<&str>) -> (fulu_mcp::RiskOverrides, Vec<String>) {
+    let paths = match explicit {
+        Some(path) => vec![PathBuf::from(path)],
+        None => fulu_mcp::risk_override_paths(),
+    };
+    fulu_mcp::RiskOverrides::load(&paths)
+}
+
 fn mcp(args: &[String]) -> i32 {
     let Some(command) = args.first().map(String::as_str) else {
         eprintln!("[ERR] 缺少 mcp 子命令：list");
@@ -694,11 +823,22 @@ fn mcp(args: &[String]) -> i32 {
         return 2;
     }
     let attach = args.iter().any(|arg| arg == "--attach");
-    let paths: Vec<PathBuf> = match args.iter().skip(1).find(|arg| !arg.starts_with("--")) {
+    let override_arg = args
+        .iter()
+        .position(|arg| arg == "--risk-overrides")
+        .and_then(|index| args.get(index + 1))
+        .map(String::as_str);
+    let (overrides, override_issues) = load_risk_overrides(override_arg);
+    let paths: Vec<PathBuf> = match args
+        .iter()
+        .skip(1)
+        .find(|arg| !arg.starts_with("--") && Some(arg.as_str()) != override_arg)
+    {
         Some(explicit) => vec![PathBuf::from(explicit)],
         None => fulu_mcp::default_config_paths(),
     };
-    let (servers, issues) = fulu_mcp::discover(&paths);
+    let (servers, mut issues) = fulu_mcp::discover(&paths);
+    issues.extend(override_issues);
     println!("[OK] 外宗箓 · 全局 MCP 发现（只读；安装/升级/删除请在原生态完成）");
     for issue in &issues {
         println!("  [WARN] {issue}");
@@ -739,8 +879,9 @@ fn mcp(args: &[String]) -> i32 {
     println!("\n[RUN] 握手（每台 server 一个子进程，全部工具共享该进程）");
     let mut total = 0_usize;
     let mut failed = 0_usize;
+    let mut seen_ids: Vec<String> = Vec::new();
     for server in &servers {
-        match fulu_mcp::connect(server) {
+        match fulu_mcp::connect_with(server, &overrides, RiskClass::Observe) {
             Ok(session) => {
                 println!(
                     "  [OK] {:<16} {} 个工具  protocol={}",
@@ -753,9 +894,12 @@ fn mcp(args: &[String]) -> i32 {
                         .unwrap_or("?")
                 );
                 for tool in &session.tools {
+                    seen_ids.push(tool.tool_id().to_owned());
                     println!(
-                        "       - {:<40} {}",
+                        "       - {:<40} [{} · {}] {}",
                         tool.tool_id(),
+                        tool.risk().label(),
+                        tool.risk_source().label(),
                         if tool.description().is_empty() {
                             "（无描述）"
                         } else {
@@ -773,6 +917,14 @@ fn mcp(args: &[String]) -> i32 {
                 println!("  [ERR] {:<16} 接入失败：{error}", server.name);
             }
         }
+    }
+    let stale = overrides.stale_entries(&seen_ids);
+    if !stale.is_empty() {
+        println!(
+            "  [WARN] 风险覆盖表中有 {} 条指向不存在的工具（多半是 server 改名了）：{}",
+            stale.len(),
+            stale.join("、")
+        );
     }
     println!(
         "[INFO] 共 {} 个外宗工具可用（受限级，需符的沙箱 ≥ limited 才能召）；{} 台接入失败。",

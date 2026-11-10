@@ -28,6 +28,10 @@ pub enum EventKind {
     Invoked,
     ToolCall,
     ToolResult,
+    /// 高危召将获得人确认（「敕可」）
+    Confirmed,
+    /// 高危召将被拒（「敕否」）——不是符被驳回，是这一次召将没被放行
+    Denied,
     Answered,
     Archived,
     Broken,
@@ -46,6 +50,8 @@ impl EventKind {
             Self::Invoked => "请神",
             Self::ToolCall => "召将",
             Self::ToolResult => "将回",
+            Self::Confirmed => "敕可",
+            Self::Denied => "敕否",
             Self::Answered => "回执",
             Self::Archived => "缴符归档",
             Self::Broken => "破符",

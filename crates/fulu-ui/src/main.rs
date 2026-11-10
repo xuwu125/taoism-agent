@@ -11,7 +11,7 @@
 //! 3. 保留 M0 的中文 IME 探针——那是尚未完成的真人验收项，不能因为做了新界面就藏起来。
 
 use eframe::egui;
-use fulu_app::{AltarSession, DryRunPlan, Fu, Receipt};
+use fulu_app::{AltarSession, DryRunPlan, Fu, Receipt, RiskClass};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -35,6 +35,8 @@ struct FuluApp {
     plan: Option<DryRunPlan>,
     receipt: Option<Receipt>,
     confirm_checked: bool,
+    /// 本次焚符是否放行需要确认的高危召将（默认否：法坛 fail closed）
+    allow_high_risk: bool,
 
     endpoint: String,
     workspace: String,
@@ -79,6 +81,7 @@ impl FuluApp {
             plan: None,
             receipt: None,
             confirm_checked: false,
+            allow_high_risk: false,
             endpoint,
             workspace: workspace.to_string_lossy().into_owned(),
             fu_files: Vec::new(),
@@ -194,6 +197,12 @@ impl FuluApp {
             self.say("法坛正忙", Tone::Bad);
             return;
         };
+        // 确认门先于焚化装好：没勾就等于无人值守，需要确认的召将一律敕否。
+        session.set_risk_ceiling(if self.allow_high_risk {
+            Some(RiskClass::Destructive)
+        } else {
+            None
+        });
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let outcome = session
@@ -553,6 +562,13 @@ impl FuluApp {
                     }
                 });
                 ui.checkbox(&mut self.confirm_checked, "我确认焚化不可撤销");
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.allow_high_risk, "本次焚符放行高危召将（破坏性）")
+                    .on_hover_text(
+                        "不勾选时：只读工具照常，需确认的工具（可变更/破坏性，含外宗）\
+                     在召将时一律被敕否，并记入缴符。勾选等于对自己预授权。",
+                    );
             });
 
             ui.separator();

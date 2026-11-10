@@ -10,6 +10,7 @@
 //! - MCP 工具经 `McpToolAdapter` 归一为 `fulu-tools::Tool`，走与内置工具完全相同
 //!   的「箓」白名单/配额/边界核验，不因来源是第三方而绕过闸门。
 
+use fulu_register::RiskClass;
 use fulu_tools::{Tool, ToolArguments, ToolError, ToolOutput, ToolPolicy};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -133,6 +134,119 @@ pub fn default_config_paths() -> Vec<PathBuf> {
     paths
 }
 
+/// fulu 自己的外宗风险覆盖表文件名。
+///
+/// 这是 **fulu 的**配置，不是 MCP 生态的配置：它不修改 server 的任何声明，
+/// 只是让用户对「server 压根没声明」的工具表态。系统里没有这个文件时
+/// 一切照缺省走，不存在也不影响运行。
+pub const RISK_OVERRIDE_FILE: &str = "outer-sect-risk.json";
+
+/// 覆盖表的位置。与全局 MCP 配置的 `~/.fulu/mcp.json` 同目录，便于一起备份。
+pub fn risk_override_paths() -> Vec<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|home| vec![PathBuf::from(home).join(".fulu").join(RISK_OVERRIDE_FILE)])
+        .unwrap_or_default()
+}
+
+/// 工具风险的来源，用于在界面上交代「这个等级是谁说的」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskSource {
+    /// server 在 annotations 里声明的
+    Declared,
+    /// 用户在 fulu 覆盖表里显式写的
+    Override,
+    /// server 没说，按缺省（破坏性）处理
+    Undeclared,
+    /// 被策略下限抬上来的（`--strict-outer-sect` 等）
+    Floor,
+}
+
+impl RiskSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Declared => "server 自述",
+            Self::Override => "fulu 覆盖表",
+            Self::Undeclared => "未声明（按破坏性）",
+            Self::Floor => "策略下限",
+        }
+    }
+}
+
+/// 用户自定的工具风险表。
+///
+/// 只能按**工具全名**逐条声明，不做任何模糊匹配：猜错的代价是放行一个
+/// 破坏性操作，比多按一次确认贵得多。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RiskOverrides {
+    map: BTreeMap<String, RiskClass>,
+}
+
+impl RiskOverrides {
+    /// 读取并合并多份覆盖表；坏条目逐条报 issue，不影响其它条目。
+    pub fn load(paths: &[PathBuf]) -> (Self, Vec<String>) {
+        let mut overrides = Self::default();
+        let mut issues = Vec::new();
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue; // 没有覆盖表是常态
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                issues.push(format!(
+                    "{}：不是合法 JSON，整份覆盖表已忽略",
+                    path.display()
+                ));
+                continue;
+            };
+            let Some(table) = value.get("tools").and_then(Value::as_object) else {
+                issues.push(format!(
+                    "{}：缺少 tools 表，整份覆盖表已忽略",
+                    path.display()
+                ));
+                continue;
+            };
+            for (id, raw) in table {
+                let level = raw.as_str().map(str::to_ascii_lowercase);
+                let risk = match level.as_deref() {
+                    Some("observe") => RiskClass::Observe,
+                    Some("mutate") => RiskClass::Mutate,
+                    Some("destructive") => RiskClass::Destructive,
+                    _ => {
+                        issues.push(format!(
+                            "{id}：风险等级「{}」不合法，须为 observe / mutate / destructive，已忽略",
+                            raw.as_str().unwrap_or("非字符串")
+                        ));
+                        continue;
+                    }
+                };
+                overrides.map.insert(id.clone(), risk);
+            }
+        }
+        (overrides, issues)
+    }
+
+    pub fn get(&self, tool_id: &str) -> Option<RiskClass> {
+        self.map.get(tool_id).copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// 覆盖表里指向不存在工具的条目（多半是 server 升级后改了工具名）。
+    pub fn stale_entries(&self, tool_ids: &[String]) -> Vec<String> {
+        self.map
+            .keys()
+            .filter(|id| !tool_ids.iter().any(|known| known == *id))
+            .cloned()
+            .collect()
+    }
+}
+
 /// 只读发现：解析每个配置文件的 `mcpServers` 表。文件缺失/损坏跳过并返回错误说明，
 /// 绝不创建或修改文件。
 pub fn discover(paths: &[PathBuf]) -> (Vec<McpServerInfo>, Vec<String>) {
@@ -228,6 +342,59 @@ pub struct McpToolDesc {
     pub name: String,
     pub description: String,
     pub schema_json: String,
+    /// 由 `annotations` 折出的副作用等级；缺失或自相矛盾时取最严。
+    /// 接入时会再经覆盖表与策略下限修正，来源见 `risk_source`。
+    pub risk: RiskClass,
+    /// 最终等级的来源（自述 / 覆盖表 / 缺省 / 策略下限）。
+    pub risk_source: RiskSource,
+    /// 原始 annotations，原样留存以便追溯「这个等级是谁说的」。
+    pub annotations: Value,
+}
+
+impl McpToolDesc {
+    /// 应用覆盖表与策略下限，并记下最终等级的来源。
+    fn apply_policy(&mut self, override_risk: Option<RiskClass>, floor: RiskClass) {
+        if !self.has_annotations() {
+            self.risk = RiskClass::Destructive;
+            self.risk_source = RiskSource::Undeclared;
+        }
+        if let Some(risk) = override_risk {
+            self.risk = risk;
+            self.risk_source = RiskSource::Override;
+        }
+        if floor > self.risk {
+            self.risk = floor;
+            self.risk_source = RiskSource::Floor;
+        }
+    }
+
+    /// server 是否就这个工具说了点什么（说了才有资格被称作「自述」）。
+    pub fn has_annotations(&self) -> bool {
+        let Some(object) = self.annotations.as_object() else {
+            return false;
+        };
+        [
+            "readOnlyHint",
+            "destructiveHint",
+            "idempotentHint",
+            "openWorldHint",
+        ]
+        .iter()
+        .any(|key| object.contains_key(*key))
+    }
+
+    /// 箓登记名：`mcp.<server>.<tool>`。
+    pub fn id(&self) -> String {
+        format!("mcp.{}.{}", self.server, self.name)
+    }
+
+    /// server 是否显式声明了只读（用于展示，不用来放宽权限）。
+    pub fn declared_read_only(&self) -> bool {
+        self.annotations
+            .get("readOnlyHint")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
 }
 
 /// 传输无关的 MCP 调用面：stdio 子进程与回环 HTTP 都实现它。
@@ -277,6 +444,10 @@ fn render_tool_result(
 }
 
 /// 把 `tools/list` 的结果转成工具描述。
+///
+/// MCP 的 `annotations` 是 **server 自述**，本客户端只在「收紧」方向上采信：
+/// 自述只读的工具可以免确认，但权限永远停在 `Limited`；自述不清楚、或
+/// 自相矛盾（既说只读又说破坏性）一律按 `Destructive` 处理。
 fn collect_tool_descs(server: &str, result: &Value) -> Vec<McpToolDesc> {
     let Some(list) = result.get("tools").and_then(Value::as_array) else {
         return Vec::new();
@@ -284,7 +455,8 @@ fn collect_tool_descs(server: &str, result: &Value) -> Vec<McpToolDesc> {
     list.iter()
         .filter_map(|tool| {
             let name = tool.get("name").and_then(Value::as_str)?.to_owned();
-            Some(McpToolDesc {
+            let annotations = tool.get("annotations");
+            let mut desc = McpToolDesc {
                 server: server.to_owned(),
                 name,
                 description: tool
@@ -296,9 +468,40 @@ fn collect_tool_descs(server: &str, result: &Value) -> Vec<McpToolDesc> {
                     .get("inputSchema")
                     .map(|schema| schema.to_string())
                     .unwrap_or_default(),
-            })
+                risk: risk_from_annotations(annotations),
+                risk_source: RiskSource::Declared,
+                annotations: annotations.cloned().unwrap_or(Value::Null),
+            };
+            // 统一走一次策略计算，避免「构造处」与「接入处」对来源的判断不一致。
+            desc.apply_policy(None, RiskClass::Observe);
+            Some(desc)
         })
         .collect()
+}
+
+/// 把 MCP 的 `annotations` 折成风险等级。
+///
+/// 规范里 `destructiveHint` 的缺省值是 true（即「没声明就按破坏性算」），
+/// 这里照此执行，并且额外加一条：`readOnlyHint: true` 与 `destructiveHint: true`
+/// 同时出现属自相矛盾，取更严的一方。
+pub fn risk_from_annotations(annotations: Option<&Value>) -> RiskClass {
+    let flag = |key: &str| {
+        annotations
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_bool)
+    };
+    let read_only = flag("readOnlyHint").unwrap_or(false);
+    let destructive = flag("destructiveHint");
+    match (read_only, destructive) {
+        // 显式说「破坏性」就按破坏性算，不管别的字段怎么写。
+        (_, Some(true)) => RiskClass::Destructive,
+        // 显式说「只读」且没说破坏性 → 免确认（权限仍是 Limited）。
+        (true, _) => RiskClass::Observe,
+        // 显式说「非破坏」→ 可变更，每符确认一次。
+        (false, Some(false)) => RiskClass::Mutate,
+        // 什么都没说：按规范缺省（破坏性）处理。
+        (false, None) => RiskClass::Destructive,
+    }
 }
 
 #[derive(Debug)]
@@ -744,6 +947,21 @@ impl McpToolAdapter {
         &self.tool.description
     }
 
+    /// 最终生效的副作用等级（已并入覆盖表与策略下限）。
+    pub fn risk(&self) -> RiskClass {
+        self.tool.risk
+    }
+
+    /// 该等级的来源（自述 / 覆盖表 / 未声明 / 策略下限）。
+    pub fn risk_source(&self) -> RiskSource {
+        self.tool.risk_source
+    }
+
+    /// server 是否显式声明只读——展示用，绝不用于放宽权限。
+    pub fn declared_read_only(&self) -> bool {
+        self.tool.declared_read_only()
+    }
+
     /// server 声明的参数 schema（可能为空对象，调用方需容错）。
     pub fn schema_json(&self) -> &str {
         &self.tool.schema_json
@@ -762,6 +980,19 @@ pub struct McpSession {
 
 /// 握手并收集工具。**唯一**的接入入口：stdio 一个 server 一个进程，HTTP 一个 server 一个会话。
 pub fn connect(info: &McpServerInfo) -> Result<McpSession, McpError> {
+    connect_with(info, &RiskOverrides::default(), RiskClass::Observe)
+}
+
+/// 带风险策略的接入：`overrides` 是用户自定的逐工具等级，`floor` 是策略下限。
+///
+/// 两者的作用方向相反且都只向上：覆盖表可以改等级（也可能下调，因为那是
+/// 用户自己的判断），下限只能抬高。**权限不受二者影响**——外宗工具永远是
+/// `Limited`，这两样只决定「召将前要不要人点头」。
+pub fn connect_with(
+    info: &McpServerInfo,
+    overrides: &RiskOverrides,
+    floor: RiskClass,
+) -> Result<McpSession, McpError> {
     let mut warnings = Vec::new();
     let shared: Arc<Mutex<dyn McpCaller>> = match &info.transport {
         Transport::Stdio { command, args } => Arc::new(Mutex::new(McpStdioClient::spawn(
@@ -794,6 +1025,9 @@ pub fn connect(info: &McpServerInfo) -> Result<McpSession, McpError> {
         (handshake, descs)
     };
     descs.sort_by(|a, b| a.name.cmp(&b.name));
+    for desc in &mut descs {
+        desc.apply_policy(overrides.get(&desc.id()), floor);
+    }
 
     if !info.env_keys.is_empty() {
         warnings.push(format!(
@@ -1060,9 +1294,142 @@ for line in sys.stdin:
             name: "shout".into(),
             description: String::new(),
             schema_json: "{}".into(),
+            risk: RiskClass::Destructive,
+            risk_source: RiskSource::Undeclared,
+            annotations: Value::Null,
         };
         let adapter_id = format!("mcp.{}.{}", tool.server, tool.name);
         assert_eq!(adapter_id, "mcp.fake.shout");
+        // 未声明注解的工具按最严处理，且 `id()` 与适配器命名保持一致。
+        assert_eq!(tool.id(), adapter_id);
+        assert_eq!(tool.risk, RiskClass::Destructive);
+        assert!(!tool.declared_read_only());
+    }
+
+    #[test]
+    fn risk_overrides_load_valid_entries_and_report_the_rest() {
+        let dir = std::env::temp_dir().join("fulu_mcp_risk_override");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("outer-sect-risk.json");
+        std::fs::write(
+            &path,
+            r#"{"tools": {
+                "mcp.cucumber.get_dashboard": "observe",
+                "mcp.cucumber.start_process": "mutate",
+                "mcp.cucumber.bogus_level": "harmless",
+                "mcp.cucumber.numeric": 3
+            }}"#,
+        )
+        .unwrap();
+        let (overrides, issues) = RiskOverrides::load(std::slice::from_ref(&path));
+        assert_eq!(overrides.len(), 2, "坏条目必须被丢弃而不是猜测");
+        assert_eq!(
+            overrides.get("mcp.cucumber.get_dashboard"),
+            Some(RiskClass::Observe)
+        );
+        assert_eq!(
+            overrides.get("mcp.cucumber.start_process"),
+            Some(RiskClass::Mutate)
+        );
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues.iter().any(|issue| issue.contains("harmless")));
+
+        // 指向已不存在工具的条目要单独点出来，避免用户以为覆盖生效了。
+        let stale = overrides.stale_entries(&["mcp.cucumber.get_dashboard".to_owned()]);
+        assert_eq!(stale, vec!["mcp.cucumber.start_process".to_owned()]);
+
+        // 缺文件是常态，不该报错。
+        let (empty, issues) = RiskOverrides::load(&[dir.join("nope.json")]);
+        assert!(empty.is_empty());
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn policy_applies_override_and_floor_without_touching_permission() {
+        let annotated = json!({"tools": [{
+            "name": "read",
+            "description": "",
+            "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": true, "destructiveHint": false}
+        }, {
+            "name": "silent",
+            "description": "",
+            "inputSchema": {"type": "object"}
+        }]});
+        let mut descs = collect_tool_descs("s", &annotated);
+        let silent = descs.pop().unwrap();
+        assert_eq!(silent.risk, RiskClass::Destructive);
+        assert_eq!(silent.risk_source, RiskSource::Undeclared);
+
+        // 覆盖表可以把「server 没说」的工具降为只读，并标明等级来源。
+        let mut overrides = RiskOverrides::default();
+        overrides
+            .map
+            .insert("mcp.s.silent".into(), RiskClass::Observe);
+        let mut silent = silent;
+        silent.apply_policy(overrides.get("mcp.s.silent"), RiskClass::Observe);
+        assert_eq!(silent.risk, RiskClass::Observe);
+        assert_eq!(silent.risk_source, RiskSource::Override);
+
+        // 策略下限只能往上抬，不能把覆盖表里的破坏性降下来。
+        let mut read = descs.pop().unwrap();
+        read.apply_policy(None, RiskClass::Destructive);
+        assert_eq!(read.risk, RiskClass::Destructive);
+        assert_eq!(read.risk_source, RiskSource::Floor);
+    }
+
+    #[test]
+    fn annotations_map_to_risk_without_ever_loosening_permission() {
+        // 显式只读：免确认（权限层仍是 Limited，与这里无关）。
+        assert_eq!(
+            risk_from_annotations(Some(
+                &json!({"readOnlyHint": true, "destructiveHint": false})
+            )),
+            RiskClass::Observe
+        );
+        // 只读但没写 destructiveHint：仍按只读算（缺省不是「矛盾」）。
+        assert_eq!(
+            risk_from_annotations(Some(&json!({"readOnlyHint": true}))),
+            RiskClass::Observe
+        );
+        // 显式非破坏：可变更，每符确认一次。
+        assert_eq!(
+            risk_from_annotations(Some(&json!({"destructiveHint": false}))),
+            RiskClass::Mutate
+        );
+        // 显式破坏：最严。
+        assert_eq!(
+            risk_from_annotations(Some(&json!({"destructiveHint": true}))),
+            RiskClass::Destructive
+        );
+        // 自相矛盾：取更严的一方，不给「只读」当挡箭牌。
+        assert_eq!(
+            risk_from_annotations(Some(
+                &json!({"readOnlyHint": true, "destructiveHint": true})
+            )),
+            RiskClass::Destructive
+        );
+        // 什么都没写：规范缺省是破坏性。
+        assert_eq!(risk_from_annotations(None), RiskClass::Destructive);
+        assert_eq!(
+            risk_from_annotations(Some(&json!({}))),
+            RiskClass::Destructive
+        );
+    }
+
+    #[test]
+    fn tool_list_annotations_reach_the_description() {
+        let result = json!({"tools": [{
+            "name": "check_process",
+            "description": "查进程状态",
+            "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": true, "destructiveHint": false}
+        }]});
+        let descs = collect_tool_descs("cucumber", &result);
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].id(), "mcp.cucumber.check_process");
+        assert_eq!(descs[0].risk, RiskClass::Observe);
+        assert!(descs[0].declared_read_only());
     }
 
     #[test]

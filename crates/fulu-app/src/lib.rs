@@ -6,11 +6,14 @@
 
 use fulu_audit::AuditLog;
 use fulu_core::Talisman;
-use fulu_mcp::McpServerInfo;
+use fulu_mcp::{McpServerInfo, RiskOverrides, RiskSource};
 use fulu_model::{ModelManifest, VerifyStatus, model_path, status, verify_file};
 use fulu_provider::{Health, LocalLfmProvider};
-use fulu_register::{Permission, Register, ToolGrant};
-use fulu_runtime::{Altar, RitualConfig, RitualError};
+use fulu_register::{Register, ToolGrant};
+
+/// 风险等级对外暴露：CLI/GUI 需要它来解析 `--allow-risk` 与渲染勾选项。
+pub use fulu_register::RiskClass;
+use fulu_runtime::{AllowUpTo, Altar, Confirmer, RitualConfig, RitualError};
 use fulu_script::{decode_fu, encode_fu, seal_hex};
 use fulu_tools::{Tool, ToolPolicy, ToolRegistry};
 use std::fmt;
@@ -20,7 +23,9 @@ use std::sync::Arc;
 /// 门面重导出：UI 只依赖 `fulu-app`，不直连 `fulu-core` / `fulu-runtime`。
 /// 契约是「UI 不构造运行时对象」，持有门面返回的值是允许的。
 pub use fulu_core::Talisman as Fu;
-pub use fulu_runtime::{DryRunPlan, Receipt};
+pub use fulu_runtime::{
+    ConfirmRequest, ConfirmVerdict, Confirmer as Gatekeeper, DryRunPlan, Receipt,
+};
 
 /// 本地推理服务端点环境变量；未设置时 provider 处于「未就绪」，不会静默联网。
 pub const ENDPOINT_ENV: &str = "FULU_LLAMA_ENDPOINT";
@@ -191,10 +196,24 @@ pub struct OuterSectServer {
     /// 传输描述（`stdio: node x.js` / `http: http://...`），不含认证头值。
     pub transport: String,
     pub connected: bool,
-    /// 箓登记名：`mcp.<server>.<tool>`
-    pub tools: Vec<String>,
+    pub tools: Vec<OuterSectTool>,
     pub error: Option<String>,
     pub warnings: Vec<String>,
+}
+
+/// 一个外宗工具在箓里的登记结果：名字 + 风险等级。
+///
+/// 风险等级单独带出来，是因为它是**唯一**能让用户判断「这台 server 接进来
+/// 会给我带来什么后果」的信息——只报工具数量等于什么都没说。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OuterSectTool {
+    /// 箓登记名：`mcp.<server>.<tool>`
+    pub id: String,
+    pub risk: RiskClass,
+    /// 这个等级是谁定的：server 自述 / fulu 覆盖表 / 未声明 / 策略下限
+    pub risk_source: RiskSource,
+    /// server 自述只读（仅供展示，不构成授权依据）
+    pub declared_read_only: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -208,8 +227,21 @@ impl OuterSectReport {
     pub fn tool_ids(&self) -> Vec<String> {
         self.servers
             .iter()
-            .flat_map(|server| server.tools.iter().cloned())
+            .flat_map(|server| server.tools.iter().map(|tool| tool.id.clone()))
             .collect()
+    }
+
+    /// 需要人确认的外宗工具（破坏性 / 可变更），按危险程度降序。
+    pub fn gated_tools(&self) -> Vec<OuterSectTool> {
+        let mut gated: Vec<OuterSectTool> = self
+            .servers
+            .iter()
+            .flat_map(|server| server.tools.iter())
+            .filter(|tool| tool.risk != RiskClass::Observe)
+            .cloned()
+            .collect();
+        gated.sort_by(|a, b| b.risk.cmp(&a.risk).then_with(|| a.id.cmp(&b.id)));
+        gated
     }
 
     pub fn connected_count(&self) -> usize {
@@ -223,11 +255,13 @@ impl OuterSectReport {
         if self.servers.is_empty() {
             return "外宗：未发现可接入的 MCP server".into();
         }
+        let gated = self.gated_tools().len();
         format!(
-            "外宗：{}/{} 台已接入，共 {} 个工具",
+            "外宗：{}/{} 台已接入，共 {} 个工具（其中 {} 个需人确认）",
             self.connected_count(),
             self.servers.len(),
-            self.tool_ids().len()
+            self.tool_ids().len(),
+            gated
         )
     }
 }
@@ -240,6 +274,8 @@ pub struct AltarSession {
     tools: ToolRegistry,
     audit: AuditLog,
     outer_sect: OuterSectReport,
+    /// 本次会话的确认器；`None` = 一律敕否（fail closed）
+    confirmer: Option<Box<dyn Confirmer>>,
 }
 
 impl Default for AltarSession {
@@ -266,6 +302,7 @@ impl AltarSession {
             tools: ToolRegistry::default(),
             audit: AuditLog::new(),
             outer_sect: OuterSectReport::default(),
+            confirmer: None,
         }
     }
 
@@ -304,27 +341,61 @@ impl AltarSession {
     /// 权限档位固定为「受限执行」：MCP 工具的副作用 fulu 无法判断，
     /// 因此只读符（`Strict`）申请它会被 `PermissionTooLow` 驳回——
     /// 用户必须显式把符的沙箱提到 `limited` 才能召这些将。
+    ///
+    /// 风险等级取 server 自述（`annotations`），并抬到 `risk_floor` 以上：
+    /// `risk_floor = Destructive` 即「一概不信任注解」，用于强管控场景。
     pub fn attach_mcp(&mut self, servers: &[McpServerInfo]) -> OuterSectReport {
+        self.attach_mcp_full(servers, RiskClass::Observe, &RiskOverrides::default())
+    }
+
+    /// 带风险下限的接入。下限只能**抬高**等级，不能压低。
+    pub fn attach_mcp_with(
+        &mut self,
+        servers: &[McpServerInfo],
+        risk_floor: RiskClass,
+    ) -> OuterSectReport {
+        self.attach_mcp_full(servers, risk_floor, &RiskOverrides::default())
+    }
+
+    /// 完整接入：策略下限 + 用户自定的逐工具风险覆盖表。
+    ///
+    /// 覆盖表是**用户显式声明**，可以下调 server 未声明工具的风险；
+    /// 下限是策略，只能上调。二者都不影响权限（外宗固定 `Limited`）。
+    pub fn attach_mcp_full(
+        &mut self,
+        servers: &[McpServerInfo],
+        risk_floor: RiskClass,
+        overrides: &RiskOverrides,
+    ) -> OuterSectReport {
         for info in servers {
-            match fulu_mcp::connect(info) {
+            match fulu_mcp::connect_with(info, overrides, risk_floor) {
                 Ok(session) => {
-                    let mut ids = Vec::new();
+                    let mut registered = Vec::new();
                     for tool in &session.tools {
                         let id = tool.tool_id().to_owned();
-                        let grant = ToolGrant::read_only(&id, tool.description())
-                            .with_parameters_json(tool.schema_json());
-                        let mut grant = grant;
-                        grant.permission = Permission::Limited;
+                        let risk = tool.risk().max(risk_floor);
+                        let mut grant = ToolGrant::limited(
+                            &id,
+                            &format!("{}（外宗 {}）", tool.description(), session.server),
+                        )
+                        .with_risk(risk)
+                        .with_parameters_json(tool.schema_json());
+                        // 外宗一次对话里常要连查多次状态，配额比内置工具宽一些。
                         grant.max_calls = 16;
                         self.register.grant_tool(grant);
                         self.tools.register(tool.clone() as Arc<dyn Tool>);
-                        ids.push(id);
+                        registered.push(OuterSectTool {
+                            id,
+                            risk,
+                            risk_source: tool.risk_source(),
+                            declared_read_only: tool.declared_read_only(),
+                        });
                     }
                     self.outer_sect.servers.push(OuterSectServer {
                         name: session.server.clone(),
                         transport: info.transport.label(),
                         connected: true,
-                        tools: ids,
+                        tools: registered,
                         error: None,
                         warnings: session.warnings,
                     });
@@ -343,10 +414,44 @@ impl AltarSession {
     }
 
     /// 按系统约定路径发现并接入（只读配置文件，绝不写回）。
+    ///
+    /// 同时读取 fulu 自己的风险覆盖表 `~/.fulu/outer-sect-risk.json`：
+    /// 那份文件是**用户对 server 缺失声明的补充**，不是对 MCP 生态的修改。
     pub fn attach_mcp_from_defaults(&mut self) -> OuterSectReport {
-        let (servers, issues) = fulu_mcp::discover(&fulu_mcp::default_config_paths());
+        let (servers, mut issues) = fulu_mcp::discover(&fulu_mcp::default_config_paths());
+        let (overrides, override_issues) = RiskOverrides::load(&fulu_mcp::risk_override_paths());
+        issues.extend(override_issues);
         self.outer_sect.issues = issues;
-        self.attach_mcp(&servers)
+        let report = self.attach_mcp_full(&servers, RiskClass::Observe, &overrides);
+
+        // 覆盖表里指向已消失工具的条目：说明它没生效，必须说出来。
+        let known = report.tool_ids();
+        let stale = overrides.stale_entries(&known);
+        if !stale.is_empty() {
+            self.outer_sect.issues.push(format!(
+                "风险覆盖表中 {} 条指向不存在的工具（已失效）：{}",
+                stale.len(),
+                stale.join("、")
+            ));
+        }
+        self.outer_sect.clone()
+    }
+
+    /// 设定本次会话的风险放行上限。
+    ///
+    /// `None`（默认）= fail closed：需要确认的召将一律敕否。
+    /// CLI 的 `--allow-risk` 与 GUI 的勾选框都落到这里，并且只影响**本次**会话。
+    pub fn set_risk_ceiling(&mut self, ceiling: Option<RiskClass>) {
+        self.confirmer = ceiling.map(|ceiling| Box::new(AllowUpTo(ceiling)) as Box<dyn Confirmer>);
+    }
+
+    /// 装上自定义确认器（CLI 的终端提问、GUI 的回主线程询问都走这里）。
+    pub fn set_confirmer(&mut self, confirmer: Box<dyn Confirmer>) {
+        self.confirmer = Some(confirmer);
+    }
+
+    pub fn has_confirmer(&self) -> bool {
+        self.confirmer.is_some()
     }
 
     pub fn endpoint(&self) -> &str {
@@ -392,7 +497,16 @@ impl AltarSession {
             plan.notes.push(self.outer_sect.summary());
             for server in &self.outer_sect.servers {
                 let state = if server.connected {
-                    format!("{} 个工具", server.tools.len())
+                    let gated = server
+                        .tools
+                        .iter()
+                        .filter(|tool| tool.risk != RiskClass::Observe)
+                        .count();
+                    if gated == 0 {
+                        format!("{} 个工具（自述全只读）", server.tools.len())
+                    } else {
+                        format!("{} 个工具，其中 {} 个需人确认", server.tools.len(), gated)
+                    }
                 } else {
                     format!(
                         "连接失败：{}",
@@ -403,6 +517,13 @@ impl AltarSession {
                     "  外宗 {:<16} {}（{}）",
                     server.name, state, server.transport
                 ));
+            }
+            // 只列这张符真的会召的外宗将，避免把整份名册刷到确认页上。
+            for id in plan.tools.iter().filter(|id| id.starts_with("mcp.")) {
+                if let Some(grant) = self.register.tool(id) {
+                    plan.notes
+                        .push(format!("  召将 {id}：{}", grant.risk.label()));
+                }
             }
         }
         Ok(plan)
@@ -427,13 +548,27 @@ impl AltarSession {
     }
 
     fn altar(&mut self, fu: &Talisman) -> Altar<'_> {
-        Altar::new(
-            &self.provider,
-            &self.tools,
-            &self.register,
-            &mut self.audit,
+        // 逐字段借用：确认器要借给法坛，缴符日志同时要可变借用。
+        let Self {
+            provider,
+            tools,
+            register,
+            audit,
+            confirmer,
+            ..
+        } = self;
+        let mut altar = Altar::new(
+            provider,
+            tools,
+            register,
+            audit,
             RitualConfig::from_talisman(fu),
-        )
+        );
+        // 未装确认器时不装 —— 法坛自己会 fail closed，needless 不替它兜底。
+        if let Some(confirmer) = confirmer.as_mut() {
+            altar.set_confirmer(confirmer.as_mut());
+        }
+        altar
     }
 }
 

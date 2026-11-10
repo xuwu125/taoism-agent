@@ -659,6 +659,7 @@ name = "fulu-mcp"
 version = "0.1.0"
 dependencies = [
  "fulu-provider",
+ "fulu-register",
  "fulu-tools",
  "serde_json",
 ]
@@ -696,6 +697,7 @@ version = "0.1.0"
 dependencies = [
  "fulu-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

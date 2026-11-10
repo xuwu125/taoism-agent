@@ -4,7 +4,7 @@
 
 > **每个提示词就是一张符。** 原创的 Rust Agent 系统：以道教符、箓、篆体系为信息架构与运行流程，把提示词做成可校验、可签名、可回放的「符文」；用「箓」管授权与工具名册，用「篆」管编码与书写，用「法坛」执行，用「太极」编排，用「缴符」归档。UI 与数据同构——界面本身就是一张符。
 
-**当前状态：M3 进行中（外宗接法坛 + 符箓台已完成）。** 仓库已有 16 个 crate 的 workspace、CI、符文领域模型、箓层授权（含双向权限核验）、风火轮工具（含敕行分 OS 命令行）、法坛状态机、缴符事件链、内置模型清单与合规闸门、本地 `llama-server` 的 OpenAI 兼容 HTTP 实现、会话头采集、分层提示词装配、全局 MCP 与技能包发现。**M3 本轮新增：外宗工具真正进入焚符循环（stdio 与回环 HTTP 双传输，真实子进程 + 真实 TCP 端到端测试）、符箓台三栏 GUI（符箓／法坛／缴符，焚符走后台线程）**。本机真实接上了本机唯一的 `streamable-http` MCP server 并列出 9 个工具。**真实 LFM 权重仍未下载、未做真机推理**；中文 IME 人工验收仍是 M0 唯一硬门槛。
+**当前状态：M3 进行中（外宗接法坛 + 符箓台 + 外宗逐工具分级已完成）。** 仓库已有 16 个 crate 的 workspace、CI、符文领域模型、箓层授权（含双向权限核验）、风火轮工具（含敕行分 OS 命令行）、法坛状态机、缴符事件链、内置模型清单与合规闸门、本地 `llama-server` 的 OpenAI 兼容 HTTP 实现、会话头采集、分层提示词装配、全局 MCP 与技能包发现。**M3 本轮新增：外宗工具真正进入焚符循环（stdio 与回环 HTTP 双传输，真实子进程 + 真实 TCP 端到端测试）、符箓台三栏 GUI（符箓／法坛／缴符，焚符走后台线程）、外宗逐工具分级与「敕门」（破坏性召将未获确认一律敕否，可 `--allow-risk` 预授权或 `--ask` 逐次问人）**。本机真实接上了本机唯一的 `streamable-http` MCP server 并列出 9 个工具。**真实 LFM 权重仍未下载、未做真机推理**；中文 IME 人工验收仍是 M0 唯一硬门槛。
 
 ## 文档
 
@@ -43,12 +43,13 @@
 ## 快速开始
 
 ```bash
-cargo test --workspace                       # 126 个测试（含真实 HTTP 端到端、真实 MCP 子进程、外宗进仪轨循环）
+cargo test --workspace                       # 142 个测试（含真实 HTTP 端到端、真实 MCP 子进程、外宗进仪轨循环、敕门放行/拒绝）
 cargo run -p fulu-cli -- doctor              # 环境体检（不联网、不启动推理）
 cargo run -p fulu-cli -- context show        # 会话头：硬件 + IP 所在地（粗粒度，--no-ip 可关）
 cargo run -p fulu-cli -- prompt show         # 分层提示词装配预览
 cargo run -p fulu-cli -- mcp list            # 外宗箓：全局 MCP 只读展示（绝不写配置）
-cargo run -p fulu-cli -- mcp list --attach   # 真正握手并列出外宗工具（stdio 起子进程 / http 建会话）
+cargo run -p fulu-cli -- mcp list --attach   # 真正握手并列出外宗工具（带风险等级与来源）
+cargo run -p fulu-cli -- mcp list --attach --risk-overrides ./outer-sect-risk.json   # 叠加 fulu 风险覆盖表
 cargo run -p fulu-cli -- skills list         # 符胆：全局技能包只读展示
 cargo run -p fulu-cli -- init                # 引符：开箱基础配置 + 生成第一张示例符
 cargo run -p fulu-cli -- model list          # 查看内置模型槽位与权重状态
@@ -75,13 +76,18 @@ cargo run -p fulu-cli -- altar run sample.fu --confirm \
     --workspace ./workspace --export audit.jsonl
 
 # 4. 让符能召外宗（外宗工具固定受限级，符的沙箱需 ≥ limited）
-cargo run -p fulu-cli -- altar dry-run sample.fu --mcp    # 待焚计划里会列出外宗影响面
+cargo run -p fulu-cli -- altar dry-run sample.fu --mcp    # 待焚计划里会列出外宗影响面与确认门
+
+# 5. 高危召将的确认门（默认一律敕否）
+cargo run -p fulu-cli -- altar run sample.fu --confirm --mcp --ask
+cargo run -p fulu-cli -- altar run sample.fu --confirm --mcp --allow-risk destructive
 ```
 
 `fulu model verify` 在清单未固化 sha256 时明确输出 `UNVERIFIED`，**不会伪称校验通过**；`model fetch` 需 `--i-understand-license` 且清单摘要固化后才可能放行（本轮仍拒绝，见 `docs/02` 第 13.4 节）。
 
 ## M2 实现要点
 
+- **敕门（M3.1）**：权限回答「能不能碰」，风险等级回答「碰之前要不要人点头」。`Observe` 免确认、`Mutate` 每符一次、`Destructive` 每次确认；未装确认器时**一律敕否**（fail closed），被拒的召将把理由交回模型而不是炸炉，同一工具连续被拒 2 次才停止焚化。外宗等级取自 server 的 `annotations`（只用于收紧，从不放宽权限）；server 未声明时用 fulu 自己的 `~/.fulu/outer-sect-risk.json` 逐条覆盖，绝不改 MCP 配置。
 - **符**：符内绝不写密钥；dry-run 后符文被改动即「破符」，必须重新盖印。
 - **箓**：权限等级、工具名册、配额与「是否受箓」在盖印前核验；越权直接「驳回」。
 - **篆**：canonical 序列化（无浮点、字段顺序固定）保证三平台同一符印。
@@ -102,7 +108,7 @@ crates/fulu-core            符层：符文模型、结构校验、状态机（�
 crates/fulu-script          篆层：canonical 序列化、符印哈希、.fu 编解码
 crates/fulu-model           内置模型清单、SHA256 校验、离线导入
 crates/fulu-provider        供应商 trait、最小 HTTP 客户端、本地 LFM provider、工具调用归一化
-crates/fulu-register        箓层：授箓名册、权限等级与配额
+crates/fulu-register        箓层：授箓名册、权限等级与配额、副作用等级
 crates/fulu-tools           风火轮：只读工具、白名单与路径边界
 crates/fulu-runtime         法坛：仪轨状态机、Harness、agent loop、符脚判定
 crates/fulu-audit           缴符：append-only 事件日志、脱敏、链式校验与回放
@@ -110,7 +116,7 @@ crates/fulu-app             GUI/CLI 共用的仪轨会话门面
 crates/fulu-cli              无头 CLI
 crates/fulu-ui              egui/eframe 原生自绘符箓台（符箓／法坛／缴符三栏）
 crates/fulu-orchestrator    太极：M3 多 agent 编排（占位）
-crates/fulu-mcp             外宗箓：全局 MCP 只读发现 + stdio/回环 HTTP 双传输
+crates/fulu-mcp             外宗箓：全局 MCP 只读发现 + stdio/回环 HTTP 双传输 + 风险注解与覆盖表
 crates/fulu-context         会话头：硬件与 IP 所在地采集（全项容错）
 crates/fulu-prompt          篆心：分层系统提示词装配器（快照测试）
 ```
@@ -126,11 +132,12 @@ crates/fulu-prompt          篆心：分层系统提示词装配器（快照测�
 | M2 实测 | `fmt --check` / `clippy -D warnings` / **87 个测试零失败** / CLI 与 GUI 构建全绿；本机 mock `llama-server` 真实 HTTP 端到端：2 次请神 + 1 次 `fs.read` 工具调用 + 10 条缴符事件，回执归档、事件链校验通过（详见 docs/02 第 13 节） |
 | M2.5 实测 | `fmt --check` / `clippy 零告警` / **117 个测试零失败**；真机会话头采集（Windows 10 专业版 / i5-8400 / IP 杭州·联通）；19 个全局技能包真实发现；引符四步 + dry-run 通过；MCP stdio 客户端真实子进程冒烟（详见 docs/02 第 15 节） |
 | M3 实测 | `clippy --workspace --all-targets -D warnings` 零告警 / **126 个测试零失败**（连跑 5 轮稳定）；本机唯一 MCP（`streamable-http`）真实握手成功、列出 9 个工具；外宗工具在真实 HTTP + 真实子进程下端到端走完焚符循环；符箓台窗口实启中文渲染正常（详见 docs/02 第 16 节） |
+| M3.1 实测 | `clippy --workspace --all-targets -D warnings` 零告警 / **142 个测试零失败**（连跑 3 轮）；本机 cucumber 的 9 个工具全是「未声明 → 破坏性」，加覆盖表后 3 个只读 / 1 个可变更生效、失效条目被点名；破坏性外宗工具在真实 TCP + 真实子进程下「未确认即敕否、预授权后放行」两条路径均验证（详见 docs/02 第 17 节） |
 | 发布 | GitHub Actions 矩阵构建 → 轻量二进制包 + SHA256SUMS；M4 补 MSI / DMG / AppImage / DEB 与签名 |
 
 ## 里程碑
 
-M0 架构冻结（代码完成，IME 人工验收待办）→ M1 符·箓·篆内核（箓/缴符已落地）→ M2 法坛运行时（协议链路完成，真机权重推理待办）→ M2.5 能力面增量（代码完成）→ **M3 外宗接法坛 + 符箓台（已完成）→ 太极/moli/问天/召将/摄行（未开始）** → M4 发布流水线。**中文 IME 预编辑是 M0 硬验收门槛**，不达标即切 iced（`fulu-ui` 已隔离）。
+M0 架构冻结（代码完成，IME 人工验收待办）→ M1 符·箓·篆内核（箓/缴符已落地）→ M2 法坛运行时（协议链路完成，真机权重推理待办）→ M2.5 能力面增量（代码完成）→ M3 外宗接法坛 + 符箓台（已完成）→ **M3.1 外宗逐工具分级与敕门（已完成）→ M3.2 GUI 逐次弹窗确认 / 太极编排 / moli·问天·召将·摄行（未开始）** → M4 发布流水线。**中文 IME 预编辑是 M0 硬验收门槛**，不达标即切 iced（`fulu-ui` 已隔离）。
 
 ## 原则
 

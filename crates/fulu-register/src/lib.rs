@@ -38,6 +38,66 @@ impl Permission {
     }
 }
 
+/// 工具的副作用等级。
+///
+/// 这一维与 [`Permission`] **正交**：`Permission` 决定「这张符最多能碰到什么」，
+/// `RiskClass` 决定「碰到之前要不要人点头」。两者都校验，缺一不可——
+/// 一个已受箓的 `stop_process` 在权限上完全合法，但仍然不该在无人复核时静默执行。
+///
+/// 外宗（MCP）工具的这一维来自 server 自述的 annotations，因此只用于**收紧**
+/// 确认要求，绝不用来放宽权限：外宗工具永远停在 `Permission::Limited`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskClass {
+    /// 只读观察，无副作用
+    Observe,
+    /// 会改变状态，但可重放/可回滚（起进程、写文件、调接口）
+    Mutate,
+    /// 破坏性且不可逆（删数据、杀进程、改系统配置）
+    Destructive,
+}
+
+impl RiskClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Observe => "只读观察",
+            Self::Mutate => "可变更",
+            Self::Destructive => "破坏性",
+        }
+    }
+
+    /// 该等级要求的确认方式。
+    pub fn confirmation(self) -> Confirmation {
+        match self {
+            Self::Observe => Confirmation::None,
+            Self::Mutate => Confirmation::OncePerTalisman,
+            Self::Destructive => Confirmation::EveryCall,
+        }
+    }
+}
+
+/// 一次召将需要多少次人的点头。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confirmation {
+    /// 无需确认
+    None,
+    /// 同一张符里该工具只需确认一次
+    OncePerTalisman,
+    /// 每次调用都要确认
+    EveryCall,
+}
+
+impl Confirmation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "免确认",
+            Self::OncePerTalisman => "每符确认一次",
+            Self::EveryCall => "每次确认",
+        }
+    }
+}
+
 /// 无参工具的参数描述：合法 JSON Schema，模型据此知道「不需要参数」。
 pub const EMPTY_PARAMETERS_JSON: &str = r#"{"type":"object","properties":{}}"#;
 
@@ -60,9 +120,18 @@ pub struct ToolGrant {
     /// 真实 `inputSchema`，否则模型只能瞎猜参数名。
     #[serde(default = "empty_parameters_json")]
     pub parameters_json: String,
+    /// 副作用等级：决定召将前是否需要人确认。缺省取最严的 `Destructive`
+    /// ——没写清楚的工具按「高危」处理，不按「无害」处理。
+    #[serde(default = "destructive_risk")]
+    pub risk: RiskClass,
+}
+
+fn destructive_risk() -> RiskClass {
+    RiskClass::Destructive
 }
 
 impl ToolGrant {
+    /// 只读工具：权限 `ReadOnly`、风险 `Observe`。
     pub fn read_only(id: &str, description: &str) -> Self {
         Self {
             id: id.to_owned(),
@@ -73,7 +142,23 @@ impl ToolGrant {
             needs_network: false,
             max_calls: 8,
             parameters_json: empty_parameters_json(),
+            risk: RiskClass::Observe,
         }
+    }
+
+    /// 受限级工具的基础模板：权限 `Limited`，风险留待调用方声明。
+    /// 用途是外宗（MCP）工具登记——它们一律受限，风险由 annotations 决定。
+    pub fn limited(id: &str, description: &str) -> Self {
+        let mut grant = Self::read_only(id, description);
+        grant.permission = Permission::Limited;
+        grant
+    }
+
+    /// 带上副作用等级（builder 风格）。
+    #[must_use]
+    pub fn with_risk(mut self, risk: RiskClass) -> Self {
+        self.risk = risk;
+        self
     }
 
     /// 带上参数 schema（builder 风格，便于外宗工具登记时链式书写）。
@@ -162,6 +247,9 @@ pub struct Authorization {
     pub sandbox: Sandbox,
     pub allowed_tools: Vec<String>,
     pub max_calls: BTreeMap<String, u32>,
+    /// 每个已受箓工具的副作用等级，供法坛在召将前决定是否请人确认。
+    /// 随授权一起下发，避免执行层「忘记查名册」而静默执行高危工具。
+    pub risks: BTreeMap<String, RiskClass>,
     pub network: bool,
 }
 
@@ -183,6 +271,33 @@ impl Authorization {
             });
         }
         Ok(())
+    }
+
+    /// 该工具需要哪种确认。查不到就按最严处理（每次确认），不按免确认处理。
+    pub fn confirmation_for(&self, tool: &str) -> Confirmation {
+        self.risks
+            .get(tool)
+            .copied()
+            .unwrap_or(RiskClass::Destructive)
+            .confirmation()
+    }
+
+    /// 本次授权里需要人确认的工具（按危险程度降序），供 dry-run 展示。
+    pub fn tools_needing_confirmation(&self) -> Vec<(String, RiskClass)> {
+        let mut list: Vec<(String, RiskClass)> = self
+            .allowed_tools
+            .iter()
+            .filter_map(|id| {
+                let risk = self
+                    .risks
+                    .get(id)
+                    .copied()
+                    .unwrap_or(RiskClass::Destructive);
+                (risk.confirmation() != Confirmation::None).then(|| (id.clone(), risk))
+            })
+            .collect();
+        list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        list
     }
 }
 
@@ -211,12 +326,11 @@ impl Register {
                 r#"{"type":"object","properties":{"text":{"type":"string"}}}"#,
             ),
         );
-        let mut shell = ToolGrant::read_only("shell.exec", "分 OS 命令行执行（受限级，工作区内）")
+        let shell = ToolGrant::limited("shell.exec", "分 OS 命令行执行（受限级，工作区内）")
+            .with_risk(RiskClass::Destructive)
             .with_parameters_json(
                 r#"{"type":"object","properties":{"command":{"type":"string","description":"单条命令，工作区内执行"}},"required":["command"]}"#,
             );
-        shell.permission = Permission::Limited;
-        shell.max_calls = 8;
         register.grant_tool(shell);
         register
     }
@@ -254,6 +368,7 @@ impl Register {
 
         let requested = Permission::from_sandbox(fu.harness.sandbox);
         let mut max_calls = BTreeMap::new();
+        let mut risks = BTreeMap::new();
         for tool_id in &fu.tool_refs {
             let grant = self
                 .grants
@@ -283,6 +398,7 @@ impl Register {
                 return Err(RegisterError::QuotaNotPositive(tool_id.clone()));
             }
             max_calls.insert(tool_id.clone(), grant.max_calls);
+            risks.insert(tool_id.clone(), grant.risk);
         }
 
         Ok(Authorization {
@@ -290,6 +406,7 @@ impl Register {
             sandbox: fu.harness.sandbox,
             allowed_tools: fu.tool_refs.clone(),
             max_calls,
+            risks,
             network: fu.harness.network,
         })
     }
@@ -411,5 +528,55 @@ mod tests {
         assert_eq!(kept.parameters_json, EMPTY_PARAMETERS_JSON);
         let adopted = plain.with_parameters_json(r#"{"type":"object"}"#);
         assert_eq!(adopted.parameters_json, r#"{"type":"object"}"#);
+    }
+
+    #[test]
+    fn baseline_declares_risk_per_tool() {
+        let register = Register::baseline();
+        // 只读工具免确认；敕行能删文件，必须按破坏性处理。
+        assert_eq!(register.tool("fs.read").unwrap().risk, RiskClass::Observe);
+        assert_eq!(register.tool("echo").unwrap().risk, RiskClass::Observe);
+        assert_eq!(
+            register.tool("shell.exec").unwrap().risk,
+            RiskClass::Destructive
+        );
+    }
+
+    #[test]
+    fn grants_without_declared_risk_fall_back_to_destructive() {
+        // 老配置 / 外部写入的箓牒没有 risk 字段，必须按最严处理，
+        // 而不是「没写就当无害」。
+        let grant: ToolGrant = serde_json::from_str(
+            r#"{"id":"legacy","description":"老箓牒","permission":"limited",
+                "allowed_paths":[],"allowed_domains":[],"needs_network":false,"max_calls":4}"#,
+        )
+        .unwrap();
+        assert_eq!(grant.risk, RiskClass::Destructive);
+        assert_eq!(grant.parameters_json, EMPTY_PARAMETERS_JSON);
+    }
+
+    #[test]
+    fn authorization_carries_confirmation_requirements() {
+        let mut limited = Talisman::sample();
+        limited.harness.sandbox = Sandbox::Limited;
+        limited.tool_refs = vec!["shell.exec".into()];
+        limited.harness.allow_tools = limited.tool_refs.clone();
+        let auth = Register::baseline().authorize(&limited).unwrap();
+        assert_eq!(auth.confirmation_for("shell.exec"), Confirmation::EveryCall);
+        assert_eq!(
+            auth.tools_needing_confirmation(),
+            vec![("shell.exec".to_owned(), RiskClass::Destructive)]
+        );
+
+        // 只读符：fs.read 免确认，待焚计划里不该出现「需确认」噪音。
+        let strict = Register::baseline().authorize(&Talisman::sample()).unwrap();
+        assert_eq!(strict.confirmation_for("fs.read"), Confirmation::None);
+        assert!(strict.tools_needing_confirmation().is_empty());
+
+        // 查不到的工具按最严处理，不给「漏登记 = 免确认」留口子。
+        assert_eq!(
+            strict.confirmation_for("no.such.tool"),
+            Confirmation::EveryCall
+        );
     }
 }

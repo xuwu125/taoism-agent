@@ -9,4 +9,5 @@ repository.workspace = true
 [dependencies]
 serde_json.workspace = true
 fulu-tools.workspace = true
+fulu-register.workspace = true
 fulu-provider.workspace = true
