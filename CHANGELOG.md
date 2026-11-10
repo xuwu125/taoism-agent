@@ -7,6 +7,10 @@
 ### 新增
 - **太极符图编排（T09）**：`fulu-orchestrator` 从占位骨架变为可用 DAG 编排器；`fulu taiji run <符图.json> --confirm` 每节点走完整仪轨；`system_digest` 破符语义（dry-run 后提示词被换即破符）。
 - **召将子符（T10）**：`summon.fu` 把「分派子符」做成可受箓、可敕门的工具（受限级 + Mutate + 配额 4）；子符独立 `AltarSession`（minimal 档、独立预算、步数裁剪到 8、禁环回双防线、不继承父符高危授权）、全程记账进父符缴符事件链；CLI `altar run --summon`。
+- **fs.write 受控写入（T17）**：工作区锁定 + 覆盖前强制备份（`.fulu-bak`，重名编号退避）+ 单次 256 KiB 上限 + 追加模式；受限级 + Mutate。
+- **问天搜索（T15）**：`ask.search` 可插拔后端（`SearchBackend` trait）；fulu-app 自动从已接入外宗挑选搜索类 MCP 工具，无后端明确报错、绝不静默联网；受限级 + Destructive（逐次确认）+ 配额 8；CLI `--search`。
+- **moli 浏览器（T14）**：`moli.open` 用外部 Edge/Chrome 无头 `--dump-dom` 抽取正文文本——进程内零 TLS、零 WebView；URL 仅 http/https + 拒绝 userinfo + 域名白名单；`wait_ms` 虚拟时间预算（JS 真实执行）；受限级 + Destructive；真机集成测试（mock HTTP + Edge + JS 断言）。
+- **外宗多模态块告警（T18）**：非文本内容块逐类型统计，输出末尾显式告警（不被截断吞掉），不再静默丢弃。
 
 ## v0.3.0（2026-11-11）
 
@@ -29,4 +33,4 @@
 
 ### 明确未完成（不伪装）
 - 真实 LFM 权重仍未下载 / 未导入 / 未打包；所有推理验证均为本机 mock `llama-server`。
-- 太极编排、moli / 问天 / 召将子智能体 / 摄行、HTTPS 下载与远程 MCP、多模态内容块、M4 安装包与签名、中文 IME 真人验收——见 `TODO.md`。其中太极编排与召将子符已在 v0.3.1 落地（见上）。
+- 摄行电脑控制、HTTPS 下载与远程 MCP、moli 点击/截图扩展、M4 安装包与签名、中文 IME 真人验收——见 `TODO.md`。其中太极编排、召将子符、fs.write、问天、moli 与多模态告警已在 v0.3.1 落地（见上）。

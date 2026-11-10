@@ -96,7 +96,7 @@ flowchart TB
 ## v0.3 能力面（M2.5 已落地）
 
 - **全局 MCP／技能包：只展示，不管理**——发现、校验、展示、接入由 fulu 做；安装/升级/删除留在用户原有生态。MCP server 是「外宗箓」：**支持 stdio 子进程与回环 streamable-http 两种传输**，工具统一登记为受限级（符须 `sandbox: limited` 且逐个点名），输出视为不可信文本（`fulu mcp list [--attach]` / `fulu skills list`）。
-- **内置五件套**：敕行命令行（Windows/macOS/Linux 分治，**已落地**）；moli 浏览器、召将子智能体、问天搜索、摄行电脑控制按 M3/M4 推进。
+- **内置五件套**：敕行命令行（已落地）、**fs.write 受控写入（已落地：工作区锁定 + 覆盖前强制备份）**、**问天搜索（已落地：可插拔后端，优先复用已接入的搜索类 MCP，无后端明确报错）**、**moli 浏览器（已落地：外部 Edge/Chrome 无头，进程内零 TLS/零 WebView，URL 仅 http/https）**；召将子智能体（已落地，见 S2）、摄行电脑控制按 M4 评估。
 - **会话上下文采集**：无授权硬件信息 + IP 所在地（粗粒度，真机实测），只进会话头与缴符事件，全项容错、可关闭（`fulu context show`）。
 - **分层系统提示词**：篆心／会话头／环境外宗／用户画像／灵魂／工作区约定／符文正文七层，full/minimal/none 三档，逐层截断上限（`fulu prompt show`）。
 - **引符开箱**：`fulu init` 对话式基础配置的零模型四步已跑通；完整对话需真机权重。
@@ -104,7 +104,7 @@ flowchart TB
 ## 快速开始
 
 ```bash
-cargo test --workspace                       # 182 个测试（含真实 HTTP 端到端、真实 MCP 子进程、外宗进仪轨循环、敕门、太极编排、召将子符）
+cargo test --workspace                       # 208 个测试（含真实 HTTP 端到端、真实 MCP 子进程、外宗进仪轨循环、敕门、太极编排、召将子符、fs.write、问天、moli 真机无头浏览器）
 cargo run -p fulu-cli -- doctor              # 环境体检（不联网、不启动推理）
 cargo run -p fulu-cli -- context show        # 会话头：硬件 + IP 所在地（粗粒度，--no-ip 可关）
 cargo run -p fulu-cli -- prompt show         # 分层提示词装配预览
@@ -147,6 +147,10 @@ cargo run -p fulu-cli -- altar run sample.fu --confirm --mcp --allow-risk destru
 # 6. 召将子符（T10）：分派一张子符到独立法坛（minimal 档、禁环回、
 #    不继承父符高危授权）；分派本身是 Mutate 级召将，需敕可
 cargo run -p fulu-cli -- altar run sample.fu --confirm --summon --allow-risk mutate
+
+# 7. 问天搜索（T15）：从已接入外宗自动挑选搜索类后端；
+#    ask.search 是 Destructive 级，每次查天需敕可
+cargo run -p fulu-cli -- altar run sample.fu --confirm --mcp --search --ask
 ```
 
 `fulu model verify` 在清单未固化 sha256 时明确输出 `UNVERIFIED`，**不会伪称校验通过**；`model fetch` 需 `--i-understand-license` 且清单摘要固化后才可能放行（本轮仍拒绝，见 `docs/02` 第 13.4 节）。
@@ -250,10 +254,11 @@ crates/fulu-prompt          篆心：分层系统提示词装配器（快照测�
 | S1 断链补齐实测 | 会话头 + 七层提示词真正进焚符循环（装配摘要进 dry-run 并复核）、会话头落缴符事件、符胆 sha256 摘要重校验、`mcp risk set/unset/list`、`--ask` 7 项自动化测试、字体许可随包；`fmt --check` / `clippy --all-targets -D warnings` / `cargo deny check` 全绿，**167 个测试零失败**（详见 docs/02 第 19 节与 TODO.md） |
 | S2 太极编排实测（2026-11-11） | `fulu-orchestrator` 从占位骨架变为可用符图编排器：DAG 拓扑校验（环/重名/未知依赖/规模上限）、按层串行执行、失败跳过下游而独立分支照跑、预算上限、确定性回执与收敛判据；`fulu taiji run <符图.json> --confirm` 每节点走完整仪轨。**174 个测试零失败**（详见 docs/02 第 20 节） |
 | S2 召将子符实测（2026-11-11） | `summon.fu` 把「分派子符」做成可受箓、可敕门的工具：子符独立 `AltarSession`（minimal 档、独立预算、步数裁剪到 8）、禁环回双防线（子符无召将工具 + 深度守卫）、不继承确认器（fail closed）、全程记账进父符缴符；受限级 + Mutate + 配额 4。**182 个测试零失败**（详见 docs/02 第 21 节） |
+| S3 工具扩展实测（2026-11-11） | `fs.write`（工作区锁定 + 覆盖前强制备份）、问天 `ask.search`（可插拔后端 + 无后端明确报错 + Destructive）、moli `moli.open`（外部 Edge/Chrome 无头，进程内零 TLS/零 WebView，URL 白名单，JS 真实执行）、外宗多模态块不静默丢弃。**208 个测试零失败**（详见 docs/02 第 23 节） |
 
 ## 里程碑
 
-M0 架构冻结（代码完成，IME 人工验收待办）→ M1 符·箓·篆内核（箓/缴符已落地）→ M2 法坛运行时（协议链路完成，真机权重推理待办）→ M2.5 能力面增量（代码完成）→ M3 外宗接法坛 + 符箓台（已完成）→ M3.1 外宗逐工具分级与敕门（已完成）→ **M3.2 GUI 逐次弹窗敕门 + 内嵌中文字体（已完成）** → **S1 断链补齐（会话头/七层提示词/符胆接线、覆盖表写入、字体许可随包，已完成）** → **S2 太极符图编排最小可用版 + 召将子符（已完成）** → moli·问天·摄行（未开始）→ M4 发布流水线。全量缺口与逐项进度见 `TODO.md`。**中文 IME 预编辑是 M0 硬验收门槛**，不达标即切 iced（`fulu-ui` 已隔离）。
+M0 架构冻结（代码完成，IME 人工验收待办）→ M1 符·箓·篆内核（箓/缴符已落地）→ M2 法坛运行时（协议链路完成，真机权重推理待办）→ M2.5 能力面增量（代码完成）→ M3 外宗接法坛 + 符箓台（已完成）→ M3.1 外宗逐工具分级与敕门（已完成）→ **M3.2 GUI 逐次弹窗敕门 + 内嵌中文字体（已完成）** → **S1 断链补齐（会话头/七层提示词/符胆接线、覆盖表写入、字体许可随包，已完成）** → **S2 太极符图编排最小可用版 + 召将子符（已完成）** → **S3 五件套扩展：fs.write·问天·moli·多模态告警（已完成）** → 摄行评估 / T19 远程 MCP（待拍板）→ M4 发布流水线。全量缺口与逐项进度见 `TODO.md`。**中文 IME 预编辑是 M0 硬验收门槛**，不达标即切 iced（`fulu-ui` 已隔离）。
 
 ## 原则
 

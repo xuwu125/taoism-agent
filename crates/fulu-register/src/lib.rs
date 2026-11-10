@@ -332,6 +332,37 @@ impl Register {
                 r#"{"type":"object","properties":{"command":{"type":"string","description":"单条命令，工作区内执行"}},"required":["command"]}"#,
             );
         register.grant_tool(shell);
+        // T17：受控写入。能力弱于敕行（单次 256 KiB、覆盖前自动备份），
+        // 定级 Mutate（每符确认一次）；Strict 符申请仍会被双向核验驳回。
+        register.grant_tool(
+            ToolGrant::limited("fs.write", "写工作区内文件（覆盖前自动备份 .fulu-bak）")
+                .with_risk(RiskClass::Mutate)
+                .with_parameters_json(
+                    r#"{"type":"object","properties":{"path":{"type":"string","description":"相对工作区根目录的路径"},"content":{"type":"string","description":"要写入的文本（≤256KiB）"},"append":{"type":"boolean","description":"true 时追加而非覆盖"}},"required":["path","content"]}"#,
+                ),
+        );
+        // T15：问天。工具本体不联网（无后端时明确报错）；后端是搜索类外宗
+        // MCP 工具，代调网络能力 → 风险定级 Destructive（每次确认）：
+        // 出网 + 外宗内容不可信，比敕行更严。
+        let mut ask = ToolGrant::limited("ask.search", "问天搜索（可插拔后端，默认外宗 MCP）")
+            .with_risk(RiskClass::Destructive)
+            .with_parameters_json(
+                r#"{"type":"object","properties":{"query":{"type":"string","description":"搜索关键词"},"limit":{"type":"integer","description":"返回条数（1-20，默认 5）"}},"required":["query"]}"#,
+            );
+        ask.max_calls = 8;
+        register.grant_tool(ask);
+        // T14：moli。网络发生在外部无头浏览器进程里，fulu 自身不链接 TLS；
+        // 出网 + 模型选 URL（可携带数据外泄）→ Destructive 逐次确认。
+        let mut moli = ToolGrant::limited(
+            "moli.open",
+            "moli 浏览器：无头打开网页并抽取正文文本（外部 Edge/Chrome，不嵌 WebView）",
+        )
+        .with_risk(RiskClass::Destructive)
+        .with_parameters_json(
+            r#"{"type":"object","properties":{"url":{"type":"string","description":"要打开的 http(s) 网址"},"wait_ms":{"type":"integer","description":"JS 渲染等待毫秒（0-15000，默认 3000）"}},"required":["url"]}"#,
+        );
+        moli.max_calls = 8;
+        register.grant_tool(moli);
         register
     }
 

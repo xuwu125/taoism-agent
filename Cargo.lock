@@ -614,6 +614,7 @@ dependencies = [
  "fulu-script",
  "fulu-skills",
  "fulu-tools",
+ "serde_json",
 ]
 
 [[package]]

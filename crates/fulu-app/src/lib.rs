@@ -34,7 +34,9 @@ use fulu_runtime::{AllowUpTo, Altar, Confirmer, RitualConfig, RitualError, Skill
 /// 内容摘要对外暴露：CLI 的装配预览要展示与 dry-run 计划一致的 sha256。
 pub use fulu_script::digest_hex;
 use fulu_script::{decode_fu, encode_fu, seal_hex};
-use fulu_tools::{Tool, ToolPolicy, ToolRegistry};
+use fulu_tools::{
+    AskSearchTool, SearchBackend, Tool, ToolArguments, ToolError, ToolPolicy, ToolRegistry,
+};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -313,6 +315,70 @@ impl OuterSectReport {
     }
 }
 
+/// 问天（T15）的后端挑选与 MCP 适配。
+///
+/// 候选规则（宁缺勿滥，命中才算）：工具全名或描述含 `search` / `搜索`；
+/// 查询参数名优先从 server 自述的 `inputSchema` 里认（query/q/search/
+/// keyword/keywords/text），认不出时回退 `query`——错参数名会被外宗
+/// 如实报错回喂，不会炸炉。
+pub fn pick_search_candidates(listed: &[(String, String, String)]) -> Vec<(String, String)> {
+    const QUERY_KEYS: &[&str] = &["query", "q", "search", "keyword", "keywords", "text"];
+    const NAME_HINTS: &[&str] = &["search", "搜索"];
+    let mut picked = Vec::new();
+    for (id, description, schema_json) in listed {
+        let lowered_id = id.to_lowercase();
+        let lowered_desc = description.to_lowercase();
+        let hit = NAME_HINTS
+            .iter()
+            .any(|hint| lowered_id.contains(hint) || lowered_desc.contains(hint));
+        if !hit {
+            continue;
+        }
+        let query_key = serde_json::from_str::<serde_json::Value>(schema_json)
+            .ok()
+            .and_then(|schema| {
+                let props = schema.get("properties")?.as_object()?.clone();
+                QUERY_KEYS
+                    .iter()
+                    .find(|key| props.contains_key(**key))
+                    .map(|key| (*key).to_string())
+            })
+            .unwrap_or_else(|| "query".into());
+        picked.push((id.clone(), query_key));
+    }
+    picked
+}
+
+/// 把一个已登记的外宗工具包成问天后端：直接调它的 `Tool::invoke`。
+/// 安全闸门在 `ask.search` 自身（limited + Destructive，逐次确认）；
+/// 本适配器不做二次核验，也不放宽任何边界。
+struct McpToolSearchBackend {
+    id: String,
+    tool: Arc<dyn Tool>,
+    query_key: String,
+}
+
+impl SearchBackend for McpToolSearchBackend {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn search(&self, query: &str, _limit: usize) -> Result<String, ToolError> {
+        // limit 仅作提示：外宗 schema 各异，不强塞未声明参数。
+        let mut object = serde_json::Map::new();
+        object.insert(
+            self.query_key.clone(),
+            serde_json::Value::String(query.to_owned()),
+        );
+        let args = ToolArguments {
+            json: serde_json::Value::Object(object).to_string(),
+        };
+        self.tool
+            .invoke(&args, &ToolPolicy::default())
+            .map(|out| out.content)
+    }
+}
+
 /// 符胆校验器：扫描用户全局技能目录（**只读**），按符文里的 `sha256:` 引用重校验。
 ///
 /// T03：符只引用不内嵌；两次焚符之间技能文件被改动 / 被删除 → 破符。
@@ -420,6 +486,8 @@ pub struct AltarSession {
     skills: GlobalSkillVerifier,
     /// 召将子符工具（T10）；`None` = 未启用分派。
     summon: Option<Arc<SummonTool>>,
+    /// 问天后端（T15）；空 = 未启用搜索（工具本体仍登记，调用时明确报错）。
+    search_backends: Vec<String>,
 }
 
 impl Default for AltarSession {
@@ -456,6 +524,7 @@ impl AltarSession {
             context_logged: false,
             skills: GlobalSkillVerifier::from_defaults(),
             summon: None,
+            search_backends: Vec::new(),
         }
     }
 
@@ -550,6 +619,72 @@ impl AltarSession {
 
     pub fn summoning_enabled(&self) -> bool {
         self.summon.is_some()
+    }
+
+    /// 启用问天（T15）：从**已接入**的外宗工具里挑搜索类后端，绑给
+    /// `ask.search`。没有候选时明确报错——绝不静默联网、绝不写全局配置。
+    ///
+    /// 安全语义：`ask.search` 是门面，代调外宗搜索工具。它自己的授权是
+    /// `limited + Destructive`（每次召将都要人点头，见 `fulu-register`
+    /// baseline），被代调的外宗工具自身的登记不受影响（模型直调仍走
+    /// 它自己的箓核验与敕门）。
+    pub fn enable_ask_search(&mut self) -> Result<Vec<String>, AppError> {
+        // (id, description, schema_json) 三元组来自已接入的外宗登记。
+        let mut listed: Vec<(String, String, String)> = Vec::new();
+        for server in &self.outer_sect.servers {
+            if !server.connected {
+                continue;
+            }
+            for tool in &server.tools {
+                if let Some(grant) = self.register.tool(&tool.id) {
+                    listed.push((
+                        tool.id.clone(),
+                        grant.description.clone(),
+                        grant.parameters_json.clone(),
+                    ));
+                }
+            }
+        }
+        let picked = pick_search_candidates(&listed);
+        if picked.is_empty() {
+            return Err(AppError::Probe(
+                "问天未启用：已接入的外宗里没有搜索类工具（名字或描述含 search/搜索）。\
+                 可用 `fulu mcp list --attach` 核对外宗清单；本端不会静默联网"
+                    .into(),
+            ));
+        }
+        let mut backends: Vec<Arc<dyn SearchBackend>> = Vec::new();
+        for (id, query_key) in picked {
+            let Some(tool) = self.tools.get(&id) else {
+                continue;
+            };
+            backends.push(Arc::new(McpToolSearchBackend {
+                id: id.clone(),
+                tool,
+                query_key,
+            }));
+        }
+        let ids = backends.iter().map(|b| b.id().to_owned()).collect();
+        self.bind_ask_search_backends(backends);
+        self.note_search_backends(ids);
+        Ok(self.search_backend_ids())
+    }
+
+    /// 显式绑定问天后端（GUI/测试/自定义后端入口；绕过自动挑选）。
+    /// 后端清单由 `note_search_backends` 单独记录，工具本体只认 trait。
+    pub fn bind_ask_search_backends(&mut self, backends: Vec<Arc<dyn SearchBackend>>) {
+        self.tools
+            .register(Arc::new(AskSearchTool::new(backends)) as Arc<dyn Tool>);
+    }
+
+    /// 已绑定的问天后端标识（供展示；未启用时为空）。
+    pub fn search_backend_ids(&self) -> Vec<String> {
+        self.search_backends.clone()
+    }
+
+    /// 记录后端清单（bind 前调用；与 `bind_ask_search_backends` 配对）。
+    fn note_search_backends(&mut self, ids: Vec<String>) {
+        self.search_backends = ids;
     }
 
     /// 会话头摘要（供 CLI/GUI 展示；未采集时返回 None）。
@@ -892,6 +1027,15 @@ impl AltarSession {
                 "召将子符：summon.fu 已启用（minimal 档、独立预算、步数上限 {SUB_MAX_STEPS}、禁环回、不继承父符高危授权；每次分派需敕可，配额 4 次）"
             ));
         }
+        // T15：问天已绑后端时，确认页列出真实出网路径（Destructive 逐次确认）。
+        let backends = self.search_backend_ids();
+        if !backends.is_empty() {
+            plan.notes.push(format!(
+                "问天：ask.search 已绑定 {} 个外宗搜索后端（{}）；每次查天需敕可（Destructive）",
+                backends.len(),
+                backends.join("、")
+            ));
+        }
         self.log_session_context(&plan.seal)?;
         Ok(plan)
     }
@@ -1214,6 +1358,84 @@ mod tests {
         let mut strict = Talisman::sample();
         strict.tool_refs = vec![SUMMON_TOOL_ID.into()];
         strict.harness.allow_tools = vec![SUMMON_TOOL_ID.into()];
+        assert!(matches!(
+            session.register.authorize(&strict),
+            Err(fulu_register::RegisterError::PermissionTooLow { .. })
+        ));
+    }
+
+    /// T15：外宗里挑搜索类工具——只认名字/描述命中，query 键名优先采信 schema。
+    #[test]
+    fn pick_search_candidates_matches_names_and_schema_keys() {
+        let listed = vec![
+            (
+                "mcp.cucumber.web_search".into(),
+                "网页搜索".into(),
+                r#"{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}"#.into(),
+            ),
+            (
+                "mcp.zzz.fetch".into(),
+                "抓取页面内容".into(),
+                r#"{"type":"object","properties":{"url":{"type":"string"}}}"#.into(),
+            ),
+            (
+                "mcp.plain.search".into(),
+                "search things".into(),
+                "not-json".into(),
+            ),
+        ];
+        let picked = pick_search_candidates(&listed);
+        assert_eq!(
+            picked,
+            vec![
+                ("mcp.cucumber.web_search".into(), "q".into()),
+                // schema 解析失败 → 回退默认 query 键。
+                ("mcp.plain.search".into(), "query".into()),
+            ]
+        );
+    }
+
+    /// T15：外宗没接 / 接了但没有搜索工具时，问天必须明确报错。
+    #[test]
+    fn ask_search_without_backend_fails_explicitly() {
+        let mut session = AltarSession::new();
+        let error = session.enable_ask_search().unwrap_err();
+        assert!(error.to_string().contains("没有搜索类工具"), "{error}");
+    }
+
+    /// T15：显式绑定后端后，ask.search 可用且登记档位正确（limited + Destructive）。
+    #[test]
+    fn ask_search_binding_registers_limited_destructive_grant() {
+        struct PongBackend;
+        impl fulu_tools::SearchBackend for PongBackend {
+            fn id(&self) -> &str {
+                "test.pong"
+            }
+            fn search(&self, query: &str, _limit: usize) -> Result<String, fulu_tools::ToolError> {
+                Ok(format!("pong: {query}"))
+            }
+        }
+        let mut session = AltarSession::new();
+        session.bind_ask_search_backends(vec![
+            Arc::new(PongBackend) as Arc<dyn fulu_tools::SearchBackend>
+        ]);
+        session.note_search_backends(vec!["test.pong".into()]);
+        assert_eq!(session.search_backend_ids(), vec!["test.pong".to_owned()]);
+        let grant = session
+            .register
+            .tool("ask.search")
+            .expect("baseline 已登记问天");
+        assert_eq!(grant.permission, fulu_register::Permission::Limited);
+        assert_eq!(
+            grant.risk,
+            RiskClass::Destructive,
+            "代调外宗网络工具，逐次确认"
+        );
+        assert_eq!(grant.max_calls, 8);
+        // 只读符申请问天在箓层被双向核验驳回。
+        let mut strict = Talisman::sample();
+        strict.tool_refs = vec!["ask.search".into()];
+        strict.harness.allow_tools = vec!["ask.search".into()];
         assert!(matches!(
             session.register.authorize(&strict),
             Err(fulu_register::RegisterError::PermissionTooLow { .. })

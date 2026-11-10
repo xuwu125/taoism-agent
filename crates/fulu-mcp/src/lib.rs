@@ -520,6 +520,10 @@ pub trait McpCaller: Send {
 
 /// 把 `tools/call` 的 `content` 块拼成纯文本，并做上限截断。
 /// 外宗输出一律视为**不可信文本**，只能作为工具结果进入当轮对话。
+///
+/// 非（text）块（图片 / 资源 / 音频 / 未声明类型）**绝不静默丢弃**：
+/// 逐类型计数后在末尾追加显式告警行（追加发生在截断之后，告警
+/// 本身不会被 64 KiB 上限吞掉），模型至少知道「有东西被丢了」。
 fn render_tool_result(
     server: &str,
     tool: &str,
@@ -530,15 +534,27 @@ fn render_tool_result(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut content = String::new();
+    // 非 text 块计数：按类型首次出现顺序聚合，未声明类型单列。
+    let mut dropped: Vec<(String, usize)> = Vec::new();
     if let Some(blocks) = result.get("content").and_then(Value::as_array) {
         for block in blocks {
-            if block.get("type").and_then(Value::as_str) == Some("text")
-                && let Some(text) = block.get("text").and_then(Value::as_str)
-            {
-                if !content.is_empty() {
-                    content.push('\n');
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(text);
+                    }
                 }
-                content.push_str(text);
+                Some(kind) => match dropped.iter_mut().find(|(k, _)| k == kind) {
+                    Some((_, n)) => *n += 1,
+                    None => dropped.push((kind.to_owned(), 1)),
+                },
+                None => match dropped.iter_mut().find(|(k, _)| k == "<未声明>") {
+                    Some((_, n)) => *n += 1,
+                    None => dropped.push(("<未声明>".to_owned(), 1)),
+                },
             }
         }
     }
@@ -549,6 +565,25 @@ fn render_tool_result(
     if truncated {
         let cut: String = content.chars().take(TOOL_OUTPUT_CHARS).collect();
         content = format!("{cut}\n[TRUNCATED：外宗输出超过 64 KiB 上限]");
+    }
+    if !dropped.is_empty() {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        let detail: Vec<String> = dropped
+            .iter()
+            .map(|(kind, n)| {
+                if *n == 1 {
+                    kind.clone()
+                } else {
+                    format!("{kind}×{n}")
+                }
+            })
+            .collect();
+        content.push_str(&format!(
+            "[告警：外宗返回了非文本内容块，本端只支持文本，以下块已丢弃且未解析：{}；如需这些内容请改用能返回文本的工具或参数]",
+            detail.join("、")
+        ));
     }
     Ok((content, truncated))
 }
@@ -1187,6 +1222,74 @@ impl Tool for McpToolAdapter {
 mod tests {
     use super::*;
     use fulu_tools::{Tool, ToolArguments};
+
+    // ---- T18：非文本内容块不静默丢弃 ----
+
+    fn call_result(content: Value) -> Value {
+        serde_json::json!({ "content": content })
+    }
+
+    #[test]
+    fn non_text_blocks_are_reported_not_dropped_silently() {
+        let result = call_result(serde_json::json!([
+            { "type": "text", "text": "正文" },
+            { "type": "image", "data": "AAAA", "mimeType": "image/png" },
+            { "type": "resource", "uri": "file:///x.txt" }
+        ]));
+        let (content, truncated) = render_tool_result("srv", "t", &result).unwrap();
+        assert!(!truncated);
+        assert!(content.starts_with("正文"));
+        assert!(content.contains("[告警：外宗返回了非文本内容块"));
+        assert!(content.contains("image"));
+        assert!(content.contains("resource"));
+        assert!(content.contains("已丢弃且未解析"));
+    }
+
+    #[test]
+    fn non_text_only_result_is_pure_warning() {
+        let result = call_result(serde_json::json!([
+            { "type": "audio", "data": "BBB" }
+        ]));
+        let (content, _) = render_tool_result("srv", "t", &result).unwrap();
+        assert!(content.contains("audio"));
+        assert!(!content.contains("正文"));
+    }
+
+    #[test]
+    fn missing_type_is_called_out_and_duplicates_aggregate() {
+        let result = call_result(serde_json::json!([
+            { "type": "image", "data": "A" },
+            { "type": "image", "data": "B" },
+            { "foo": "no type at all" }
+        ]));
+        let (content, _) = render_tool_result("srv", "t", &result).unwrap();
+        assert!(content.contains("image×2"));
+        assert!(content.contains("<未声明>"));
+    }
+
+    #[test]
+    fn warning_survives_output_truncation() {
+        let long_text = "字".repeat(TOOL_OUTPUT_CHARS + 100);
+        let result = call_result(serde_json::json!([
+            { "type": "text", "text": long_text },
+            { "type": "image", "data": "A" }
+        ]));
+        let (content, truncated) = render_tool_result("srv", "t", &result).unwrap();
+        assert!(truncated);
+        assert!(content.contains("[TRUNCATED：外宗输出超过 64 KiB 上限]"));
+        // 告警追加在截断之后，绝不被上限吞掉。
+        assert!(content.contains("以下块已丢弃且未解析：image；"));
+    }
+
+    #[test]
+    fn error_result_still_reaches_caller_as_error() {
+        let result = call_result(serde_json::json!([
+            { "type": "text", "text": "坏消息" }
+        ]));
+        let result = serde_json::json!({ "isError": true, "content": result["content"] });
+        let err = render_tool_result("srv", "t", &result).unwrap_err();
+        assert!(err.0.contains("坏消息"));
+    }
 
     /// 一台最小的 MCP stdio server：list 两个工具，call 时回显大写 / 故意报错。
     const FAKE_SERVER_SCRIPT: &str = r#"

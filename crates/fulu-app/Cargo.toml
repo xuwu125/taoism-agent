@@ -13,6 +13,7 @@ fulu-model.workspace = true
 fulu-provider.workspace = true
 fulu-register.workspace = true
 fulu-tools.workspace = true
+serde_json.workspace = true
 fulu-audit.workspace = true
 fulu-runtime.workspace = true
 fulu-mcp.workspace = true

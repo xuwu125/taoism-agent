@@ -348,6 +348,8 @@ struct AltarOptions {
     no_context: bool,
     /// T10：启用召将子符（summon.fu，minimal 档、禁环回）
     summon: bool,
+    /// T15：启用问天（从已接入外宗自动挑选搜索类后端）
+    search: bool,
 }
 
 fn parse_altar_options(args: &[String]) -> AltarOptions {
@@ -389,6 +391,7 @@ fn parse_altar_options(args: &[String]) -> AltarOptions {
             }
             "--ask" => options.ask = true,
             "--summon" => options.summon = true,
+            "--search" => options.search = true,
             "--context-ip" => options.context_ip = true,
             "--no-context" => options.no_context = true,
             "--prompt-mode" => {
@@ -639,6 +642,19 @@ fn altar(args: &[String]) -> i32 {
             for warning in &server.warnings {
                 println!("    [WARN] {warning}");
             }
+        }
+    }
+
+    // T15：问天在外宗接入之后绑定（后端只能来自已接入的外宗工具）。
+    // ask.search 是 Destructive 级：每次查天都要人点头，需 --allow-risk 或 --ask。
+    if options.search {
+        match session.enable_ask_search() {
+            Ok(backends) => println!(
+                "[OK] 问天已启用：ask.search（外宗搜索后端 {} 个：{}；每次查天需敕可）",
+                backends.len(),
+                backends.join("、")
+            ),
+            Err(error) => eprintln!("[WARN] 问天未启用：{error}"),
         }
     }
 
