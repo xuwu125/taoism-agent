@@ -43,13 +43,13 @@
 
 ## 4. 字体与素材
 
-`epaint_default_fonts` 随 egui 内嵌两份字体，编译后**成为 `fulu` / `符箓台` 二进制的一部分**，因此分发二进制即构成字体分发：
+符箓台二进制内嵌两批字体，分发二进制即构成字体分发：
 
 | 字体 | 许可 | 义务 |
 |---|---|---|
-| Ubuntu-Light（Ubuntu Font Family） | Ubuntu Font Licence 1.0 | 随包附许可全文；不得单独以「Ubuntu」名义再分发或售卖；修改后的字体不得使用保留字体名 |
-| NotoEmoji | OFL-1.1 | 随包附许可全文；不得单独售卖；修改版不得使用保留字体名 |
+| Ubuntu-Light + NotoEmoji（`epaint_default_fonts`，eframe `default_fonts` 特性带入） | (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0 | 随包附许可全文；不得单独以「Ubuntu」名义再分发或售卖；修改后的字体不得使用保留字体名 |
+| 思源黑体简中子集 `NotoSansSC-Regular-gui.otf`（源字体 Noto Sans CJK SC，经子集化截取 U+4E00–9FFF 全部汉字与常用符号，约 6 MB） | SIL Open Font License 1.1 | 许可全文随源码放在 `crates/fulu-ui/assets/fonts/LICENSE-NotoSansSC.txt`，正式发布安装包时必须把它放进 bundle；不得单独售卖字体；修改版不得使用保留字体名 |
 
-二者的许可全文可从 <https://ubuntu.com/legal/font-licence> 与 <https://scripts.sil.org/OFL> 取得；正式发布安装包时须把全文放进 bundle（M4 打包清单中列为必检项）。
+两者的许可全文可从 <https://ubuntu.com/legal/font-licence> 与 <https://scripts.sil.org/OFL> 取得；M4 打包清单中把「随包附字体许可全文」列为必检项。
 
-除上述内嵌字体外，符箓台**不随包分发其他字体文件**：中文渲染在启动时按平台探测本机 CJK 字体（Windows `msyh.ttc` / macOS `PingFang.ttc` / Linux Noto CJK），只读取用户系统已有字体，不再分发。未来若内置 CJK 子集字体，须在此补充其名称、版本与许可（优先 OFL-1.1 / MIT）。视频分析文档属评论性引用，不含原片与第三方源码。
+思源黑体子集只覆盖常用区段；扩展 A 区等生僻字在运行时回退到**用户系统已有**的 CJK 字体（Windows `msyh.ttc` / macOS `PingFang.ttc` / Linux Noto CJK 等，见 `fulu-ui/src/fonts.rs` 的固定候选列表）——只读取，不分发。未来若引入其他素材，须在此补充其名称、版本与许可。视频分析文档属评论性引用，不含原片与第三方源码。
