@@ -30,6 +30,7 @@ fn run(args: &[String]) -> i32 {
         },
         Some("mcp") => mcp(&args[1..]),
         Some("skills") => skills(&args[1..]),
+        Some("taiji") => taiji(&args[1..]),
         Some("init") => init(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             help();
@@ -66,6 +67,7 @@ fn help() {
          \x20 fulu mcp risk set <工具全名> <observe|mutate|destructive>   写入覆盖（只按全名）\n\
          \x20 fulu mcp risk unset <工具全名>      撤销一条覆盖（均可用 --risk-overrides 指定文件）\n\
          \x20 fulu skills list [根目录]            符胆：全局技能包只读展示\n\
+         \x20 fulu taiji run <符图.json> --confirm  太极：按 DAG 拓扑序逐张符走完整仪轨\n\
          \x20 fulu init [--workspace <目录>]       引符：开箱基础配置（生成第一张示例符）\n\
          \x20 fulu help                          本帮助\n\
          \n\
@@ -81,6 +83,9 @@ fn help() {
          环境变量：{ENDPOINT_ENV}=http://127.0.0.1:8080\n\
          槽位默认 default；可用：default / lowmem / fallback / finetune_base"
     );
+    // 单独打印，避免 JSON 的花括号被 println! 当成格式占位符。
+    let example: &str = r#"符图格式：{"nodes":[{"id":"a","fu_path":"a.fu"},{"id":"b","fu_path":"b.fu","depends_on":["a"]}],"max_steps":64}"#;
+    println!("{example}");
 }
 
 fn doctor() -> i32 {
@@ -1128,6 +1133,106 @@ fn mcp(args: &[String]) -> i32 {
         total, failed
     );
     if failed > 0 { 1 } else { 0 }
+}
+
+/// 太极：`fulu taiji run <符图.json> --confirm`
+///
+/// 每个节点都走完整仪轨；确认是整张符图一次性的、由 --confirm 显式给出，
+/// 编排器不会替用户点头，也不会因为某个节点失败而静默跳过后续依赖。
+fn taiji(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) != Some("run") {
+        eprintln!("[ERR] 用法：fulu taiji run <符图.json> --confirm");
+        return 2;
+    }
+    let Some(graph_path) = args.get(1) else {
+        eprintln!("[ERR] 缺少符图 JSON 路径");
+        return 2;
+    };
+    let options = parse_altar_options(&args[2..]);
+    if !options.confirm {
+        eprintln!("[ERR] 焚化整张符图必须显式 --confirm（与单符仪轨一致）");
+        return 2;
+    }
+    let graph = match fulu_app::load_taiji_graph(Path::new(graph_path)) {
+        Ok(graph) => graph,
+        Err(error) => {
+            eprintln!("[ERR] 符图载入失败：{error}");
+            return 2;
+        }
+    };
+    let mut session = match AltarSession::from_env() {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    if let Some(endpoint) = &options.endpoint
+        && let Err(error) = session.set_endpoint(endpoint)
+    {
+        eprintln!("[ERR] {error}");
+        return 1;
+    }
+    if let Some(root) = &options.workspace {
+        session.set_workspace(root.clone());
+    }
+    if let Some(mode) = options.prompt_mode {
+        session.set_prompt_mode(mode);
+    }
+    if options.context_ip {
+        session.set_context_ip(true);
+    }
+    if options.no_context {
+        session.set_context_enabled(false);
+    }
+    println!(
+        "[OK] 太极符图：{} 个节点；拓扑校验后按层串行焚化（不为任何节点偷偷点头）",
+        graph.nodes.len()
+    );
+    let receipt = match session.run_taiji(&graph, true) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            eprintln!("[ERR] 符图编排失败：{error}");
+            return 1;
+        }
+    };
+    println!("  执行顺序：{}", receipt.order.join(" → "));
+    for result in &receipt.results {
+        let detail = result.reason.as_deref().unwrap_or_else(|| {
+            result
+                .receipt
+                .as_ref()
+                .map(|r| r.text.as_str())
+                .unwrap_or("")
+        });
+        println!(
+            "  [{:<4}] {:<20} {}",
+            result.status.label(),
+            result.id,
+            truncate_line(detail, 120)
+        );
+    }
+    println!("[INFO] {}", receipt.summary());
+    if let Some(path) = &options.export {
+        match session.export_audit(path) {
+            Ok(count) => println!("[OK] 缴符导出 {} 条 → {}", count, path.display()),
+            Err(error) => eprintln!("[WARN] 缴符导出失败：{error}"),
+        }
+    }
+    if receipt.failed > 0 || receipt.skipped > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn truncate_line(text: &str, limit: usize) -> String {
+    let one_line = text.lines().next().unwrap_or("").trim();
+    if one_line.chars().count() <= limit {
+        return one_line.to_owned();
+    }
+    let head: String = one_line.chars().take(limit).collect();
+    format!("{head}…")
 }
 
 fn skills(args: &[String]) -> i32 {

@@ -9,11 +9,17 @@ use fulu_context::{SessionContext, collect as collect_context};
 use fulu_core::{Talisman, TalismanState};
 use fulu_mcp::{McpServerInfo, RiskOverrides, RiskSource};
 use fulu_model::{ModelManifest, VerifyStatus, model_path, status, verify_file};
+use fulu_orchestrator::NodeExecutor;
 use fulu_prompt::{CORE_TEXT, LayerCaps, LayerId, PromptDraft, assemble};
 use fulu_provider::{Health, LocalLfmProvider};
 use fulu_register::{Register, ToolGrant};
 use fulu_skills::{default_roots, digest_matches, discover_global};
 
+/// 太极符图对外暴露：CLI 只依赖门面，不直接构造编排器对象。
+pub use fulu_orchestrator::{
+    GraphError, GraphNode, NodeReceipt, NodeResult, NodeStatus, OrchestrationReceipt, TaijiGraph,
+    parse_graph,
+};
 /// 提示词档位对外暴露：CLI `--prompt-mode` 与未来的子符分派都要用它。
 pub use fulu_prompt::{AssembledPrompt, PromptMode};
 /// 风险等级与确认档位对外暴露：CLI/GUI 需要它们解析 `--allow-risk` 与渲染敕门卡片。
@@ -25,7 +31,7 @@ use fulu_script::{decode_fu, encode_fu, seal_hex};
 use fulu_tools::{Tool, ToolPolicy, ToolRegistry};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// 门面重导出：UI 只依赖 `fulu-app`，不直连 `fulu-core` / `fulu-runtime`。
 /// 契约是「UI 不构造运行时对象」，持有门面返回的值是允许的。
@@ -183,6 +189,34 @@ pub fn load_fu(path: &Path) -> Result<Talisman, AppError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| AppError::Io(format!("{}：{e}", path.display())))?;
     decode_fu(&text).map_err(|e| AppError::Script(e.to_string()))
+}
+
+/// 解析太极符图 JSON（纯文本，不读磁盘）。
+pub fn parse_taiji_graph(text: &str) -> Result<TaijiGraph, AppError> {
+    parse_graph(text).map_err(|error| AppError::Ritual(error.to_string()))
+}
+
+/// 从文件读取符图，并把 `fu_path`（相对符图文件）解析成 `fu_text`。
+///
+/// 只读符文文件，不写任何配置；符图与符文都必须是用户显式给的路径。
+pub fn load_taiji_graph(path: &Path) -> Result<TaijiGraph, AppError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AppError::Io(format!("{}：{e}", path.display())))?;
+    let mut graph = parse_taiji_graph(&text)?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    for node in &mut graph.nodes {
+        if let Some(relative) = &node.fu_path {
+            let full = if Path::new(relative).is_absolute() {
+                PathBuf::from(relative)
+            } else {
+                base.join(relative)
+            };
+            node.fu_text = std::fs::read_to_string(&full).map_err(|e| {
+                AppError::Io(format!("节点 {} 的符文 {}：{e}", node.id, full.display()))
+            })?;
+        }
+    }
+    Ok(graph)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +382,9 @@ fn truncate_chars(text: &str, limit: usize) -> String {
     let head: String = text.chars().take(limit).collect();
     format!("{head}…[TRUNCATED]")
 }
+
+/// 默认硬件快照的进程级缓存；只对「无工作区 + 关闭 IP」这一默认配置生效。
+static DEFAULT_CONTEXT: OnceLock<SessionContext> = OnceLock::new();
 
 /// 一场仪轨的完整会话。provider / 箓 / 风火轮 / 缴符都在这里组装，
 /// GUI 与 CLI 各自只负责展示与收集「确认」。
@@ -646,12 +683,23 @@ impl AltarSession {
         })
     }
 
-    /// 每会话采集一次；IP 查询默认关闭，开启才发起一次外部请求。
+    /// 默认硬件快照（无工作区、关闭 IP）在同一进程内只采一次。
+    ///
+    /// 平台采集脚本（PowerShell / sysctl 等）不便宜，GUI 与 CI 里频繁新建会话时
+    /// 反复启动进程会拖慢启动，甚至拖累并行的外宗子进程。带自定义工作区或显式
+    /// 开 IP 的会话仍各自采集，绝不复用别人的配置结果。
     fn ensure_context(&mut self) {
-        if self.session_context.is_none() && self.context_enabled {
-            self.session_context =
-                Some(collect_context(self.workspace.as_deref(), self.context_ip));
+        if self.session_context.is_some() || !self.context_enabled {
+            return;
         }
+        let snapshot = if self.workspace.is_none() && !self.context_ip {
+            DEFAULT_CONTEXT
+                .get_or_init(|| collect_context(None, false))
+                .clone()
+        } else {
+            collect_context(self.workspace.as_deref(), self.context_ip)
+        };
+        self.session_context = Some(snapshot);
     }
 
     /// 七层装配（T01/T02）：静态层每会话一次，动态层（外宗 / 符文正文）按符装配。
@@ -811,6 +859,51 @@ impl AltarSession {
         let assembled = self.ensure_prompt(fu);
         let mut altar = self.altar(fu, &assembled);
         Ok(altar.ignite(fu, plan, confirmed)?)
+    }
+
+    /// 太极：按符图的拓扑序串行焚化一组符（T09）。
+    ///
+    /// 每个节点都走完整仪轨（成符 → 盖印 → dry-run → 确认 → 焚化），共用一个
+    /// 会话与一本缴符。依赖失败/跳过的节点不执行；`confirmed` 由用户显式给出，
+    /// 编排器绝不替用户点头。符图的校验（环 / 未知依赖 / 规模）由编排器负责。
+    pub fn run_taiji(
+        &mut self,
+        graph: &TaijiGraph,
+        confirmed: bool,
+    ) -> Result<OrchestrationReceipt, AppError> {
+        struct SessionRunner<'a> {
+            session: &'a mut AltarSession,
+            confirmed: bool,
+        }
+
+        impl NodeExecutor for SessionRunner<'_> {
+            fn execute(&mut self, node: &GraphNode) -> Result<NodeReceipt, String> {
+                let fu = parse_fu(&node.fu_text).map_err(|error| error.to_string())?;
+                let plan = self
+                    .session
+                    .dry_run(&fu)
+                    .map_err(|error| error.to_string())?;
+                let receipt = self
+                    .session
+                    .ignite(&fu, &plan, self.confirmed)
+                    .map_err(|error| error.to_string())?;
+                Ok(NodeReceipt {
+                    id: node.id.clone(),
+                    steps: receipt.steps,
+                    text: receipt.text,
+                    converged: receipt.converged,
+                    events: receipt.events.len(),
+                })
+            }
+        }
+
+        let mut runner = SessionRunner {
+            session: self,
+            confirmed,
+        };
+        graph
+            .execute(&mut runner)
+            .map_err(|error| AppError::Ritual(error.to_string()))
     }
 
     /// 缴符导出为 JSONL。
@@ -999,6 +1092,36 @@ mod tests {
             "失配必须留下破符事件"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T09：符图经门面读盘、跑完整仪轨；未确认的节点失败且下游跳过，不伪装成功。
+    #[test]
+    fn taiji_graph_loads_fu_paths_and_respects_confirmation() {
+        let dir = std::env::temp_dir().join(format!("fulu_taiji_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sample = sample_fu_text().unwrap();
+        std::fs::write(dir.join("a.fu"), &sample).unwrap();
+        std::fs::write(dir.join("b.fu"), &sample).unwrap();
+        let graph_path = dir.join("graph.json");
+        std::fs::write(
+            &graph_path,
+            r#"{"nodes":[{"id":"a","fu_path":"a.fu"},{"id":"b","fu_path":"b.fu","depends_on":["a"]}],"max_steps":0}"#,
+        )
+        .unwrap();
+
+        let graph = load_taiji_graph(&graph_path).unwrap();
+        assert_eq!(graph.nodes.len(), 2);
+        assert!(graph.nodes[0].fu_text.contains("credential_ref"));
+
+        let mut session = AltarSession::new();
+        let receipt = session.run_taiji(&graph, false).unwrap();
+        assert_eq!(receipt.order, vec!["a", "b"]);
+        assert_eq!(receipt.failed, 1, "未确认的第一个节点必须失败");
+        assert_eq!(receipt.skipped, 1, "依赖失败的第二个节点必须跳过");
+        assert!(!receipt.converged);
+        assert!(parse_taiji_graph("{").is_err(), "坏 JSON 必须明确报错");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

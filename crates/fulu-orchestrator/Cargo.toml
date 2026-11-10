@@ -1,9 +1,11 @@
 [package]
 name = "fulu-orchestrator"
-description = "太极：多 agent 编排、DAG、模型路由与回执汇总（M0 占位骨架）"
+description = "太极：符图 DAG 拓扑校验、串行编排与回执汇总（T09 最小可用版）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true

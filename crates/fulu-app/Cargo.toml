@@ -16,6 +16,7 @@ fulu-tools.workspace = true
 fulu-audit.workspace = true
 fulu-runtime.workspace = true
 fulu-mcp.workspace = true
+fulu-orchestrator.workspace = true
 fulu-skills.workspace = true
 fulu-context.workspace = true
 fulu-prompt.workspace = true

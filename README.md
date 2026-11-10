@@ -4,14 +4,14 @@
 
 > **每个提示词就是一张符。** 原创的 Rust Agent 系统：以道教符、箓、篆体系为信息架构与运行流程，把提示词做成可校验、可签名、可回放的「符文」；用「箓」管授权与工具名册，用「篆」管编码与书写，用「法坛」执行，用「太极」编排，用「缴符」归档。UI 与数据同构——界面本身就是一张符。
 
-**当前状态：M3 进行中（外宗接法坛 + 符箓台 + 外宗逐工具分级已完成）。** 仓库已有 16 个 crate 的 workspace、CI、符文领域模型、箓层授权（含双向权限核验）、风火轮工具（含敕行分 OS 命令行）、法坛状态机、缴符事件链、内置模型清单与合规闸门、本地 `llama-server` 的 OpenAI 兼容 HTTP 实现、会话头采集、分层提示词装配、全局 MCP 与技能包发现。**M3 本轮新增：外宗工具真正进入焚符循环（stdio 与回环 HTTP 双传输，真实子进程 + 真实 TCP 端到端测试）、符箓台三栏 GUI（符箓／法坛／缴符，焚符走后台线程）、外宗逐工具分级与「敕门」（破坏性召将未获确认一律敕否，可 `--allow-risk` 预授权或 `--ask` 逐次问人）**。本机真实接上了本机唯一的 `streamable-http` MCP server 并列出 9 个工具。**真实 LFM 权重仍未下载、未做真机推理**；中文 IME 人工验收仍是 M0 唯一硬门槛。
+**当前状态：M3 进行中（外宗接法坛 + 符箓台 + 外宗逐工具分级已完成）。** 仓库已有 16 个 crate 的 workspace、CI、符文领域模型、箓层授权（含双向权限核验）、风火轮工具（含敕行分 OS 命令行）、法坛状态机、缴符事件链、内置模型清单与合规闸门、本地 `llama-server` 的 OpenAI 兼容 HTTP 实现、会话头采集、分层提示词装配、全局 MCP 与技能包发现。**M3 本轮新增：外宗工具真正进入焚符循环（stdio 与回环 HTTP 双传输，真实子进程 + 真实 TCP 端到端测试）、符箓台三栏 GUI（符箓／法坛／缴符，焚符走后台线程）、外宗逐工具分级与「敕门」（破坏性召将未获确认一律敕否，可 `--allow-risk` 预授权或 `--ask` 逐次问人）**。**S1 补齐断链（会话头与七层提示词真正进焚符循环、符胆摘要重校验、覆盖表写入）；S2 太极符图编排最小可用版（DAG 拓扑校验 + 按层串行执行 + `fulu taiji run`）**。本机真实接上了本机唯一的 `streamable-http` MCP server 并列出 9 个工具。**真实 LFM 权重仍未下载、未做真机推理**；中文 IME 人工验收仍是 M0 唯一硬门槛。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
 | [视频深度分析：符即 Prompt](docs/01-视频深度分析-符即Prompt.md) | 原片元数据、逐段转写、十项部件映射、符箓文化底本、三处工程反模式修正 |
-| [系统架构设计与评估](docs/02-系统架构设计与评估.md) | 设计公理、分层与状态机、模块划分、GUI 选型评分、**内置模型设计（8.5）**、**能力面增量（8.6–8.10）**、各阶段实施补记（13–19）、发布设计、风险与里程碑 |
+| [系统架构设计与评估](docs/02-系统架构设计与评估.md) | 设计公理、分层与状态机、模块划分、GUI 选型评分、**内置模型设计（8.5）**、**能力面增量（8.6–8.10）**、各阶段实施补记（13–20）、发布设计、风险与里程碑 |
 | [内置模型清单与合规说明](models/README.md) | 型号矩阵、权重获取与校验、lfm1.0 许可义务、切换型号方法 |
 | [第三方声明](THIRD_PARTY_NOTICES.md) | 代码 MIT 与模型 lfm1.0 的许可边界、内嵌字体分发义务 |
 | [全系统待办清单](TODO.md) | 43 项缺口：证据位置、验收标准、阻塞类型与逐项开发进度 |
@@ -59,6 +59,7 @@ cargo run -p fulu-cli -- fu sample > sample.fu
 cargo run -p fulu-cli -- fu verify sample.fu # 校验符文并打印符印
 cargo run -p fulu-cli -- altar dry-run sample.fu   # 成符→盖印→待焚，零网络请求
 cargo run -p fulu-ui                         # 符箓台：符箓／法坛／缴符三栏（含 M0 中文 IME 探针）
+cargo run -p fulu-cli -- taiji run taiji-graph.json --confirm   # 太极：符图 DAG 编排焚符
 python .github/scripts/check_model_manifest.py
 ```
 
@@ -117,7 +118,7 @@ crates/fulu-audit           缴符：append-only 事件日志、脱敏、链式�
 crates/fulu-app             GUI/CLI 共用的仪轨会话门面
 crates/fulu-cli              无头 CLI
 crates/fulu-ui              egui/eframe 原生自绘符箓台（符箓／法坛／缴符三栏）
-crates/fulu-orchestrator    太极：M3 多 agent 编排（占位）
+crates/fulu-orchestrator    太极：符图 DAG 编排（拓扑校验 + 按层执行）
 crates/fulu-mcp             外宗箓：全局 MCP 只读发现 + stdio/回环 HTTP 双传输 + 风险注解与覆盖表
 crates/fulu-context         会话头：硬件与 IP 所在地采集（全项容错）
 crates/fulu-prompt          篆心：分层系统提示词装配器（快照测试）
@@ -137,11 +138,12 @@ crates/fulu-prompt          篆心：分层系统提示词装配器（快照测�
 | M3.1 实测 | `clippy --workspace --all-targets -D warnings` 零告警 / **142 个测试零失败**（连跑 3 轮）；本机 cucumber 的 9 个工具全是「未声明 → 破坏性」，加覆盖表后 3 个只读 / 1 个可变更生效、失效条目被点名；破坏性外宗工具在真实 TCP + 真实子进程下「未确认即敕否、预授权后放行」两条路径均验证（详见 docs/02 第 17 节） |
 | CI 修复实测 | `cargo deny check`（advisories / bans / licenses / sources）本地全绿：补 `Ubuntu-font-1.0` 白名单（`epaint_default_fonts` 内嵌 Ubuntu/NotoEmoji 字体）、内部依赖改为 `path + version` 消除 `*` 通配违规；清单闸门脚本自带 UTF-8 输出，Windows 管道下不再 `UnicodeEncodeError`。**字体策略定为「内嵌」**：拉丁字母用 egui 自带的 Ubuntu 字体，汉字内嵌思源黑体简中子集（Noto Sans CJK SC，OFL-1.1，U+4E00–9FFF 全覆盖，约 6 MB，编译进二进制，不依赖用户机器装了什么；许可全文随 `crates/fulu-ui/assets/fonts/` 入库），生僻字回退系统字体（只读不分发）；关键汉字字形覆盖有测试锁定。147 个测试零失败 |
 | 发布 | GitHub Actions 矩阵构建 → 轻量二进制包 + SHA256SUMS（**T07 起四平台发布包均随附 6 份字体许可全文并有 CI 断言**）；M4 补 MSI / DMG / AppImage / DEB 与签名 |
-| S1 断链补齐实测（2026-11-11） | 会话头 + 七层提示词真正进焚符循环（装配摘要进 dry-run 并复核）、会话头落缴符事件、符胆 sha256 摘要重校验、`mcp risk set/unset/list`、`--ask` 7 项自动化测试、字体许可随包；`fmt --check` / `clippy --all-targets -D warnings` / `cargo deny check` 全绿，**167 个测试零失败**（详见 docs/02 第 19 节与 TODO.md） |
+| S1 断链补齐实测 | 会话头 + 七层提示词真正进焚符循环（装配摘要进 dry-run 并复核）、会话头落缴符事件、符胆 sha256 摘要重校验、`mcp risk set/unset/list`、`--ask` 7 项自动化测试、字体许可随包；`fmt --check` / `clippy --all-targets -D warnings` / `cargo deny check` 全绿，**167 个测试零失败**（详见 docs/02 第 19 节与 TODO.md） |
+| S2 太极编排实测（2026-11-11） | `fulu-orchestrator` 从占位骨架变为可用符图编排器：DAG 拓扑校验（环/重名/未知依赖/规模上限）、按层串行执行、失败跳过下游而独立分支照跑、预算上限、确定性回执与收敛判据；`fulu taiji run <符图.json> --confirm` 每节点走完整仪轨。**174 个测试零失败**（详见 docs/02 第 20 节） |
 
 ## 里程碑
 
-M0 架构冻结（代码完成，IME 人工验收待办）→ M1 符·箓·篆内核（箓/缴符已落地）→ M2 法坛运行时（协议链路完成，真机权重推理待办）→ M2.5 能力面增量（代码完成）→ M3 外宗接法坛 + 符箓台（已完成）→ M3.1 外宗逐工具分级与敕门（已完成）→ **M3.2 GUI 逐次弹窗敕门 + 内嵌中文字体（已完成）→ S1 断链补齐（会话头/七层提示词/符胆接线、覆盖表写入、字体许可随包，已完成）→ 太极编排 / moli·问天·召将·摄行（未开始）** → M4 发布流水线。全量缺口与逐项进度见 `TODO.md`。**中文 IME 预编辑是 M0 硬验收门槛**，不达标即切 iced（`fulu-ui` 已隔离）。
+M0 架构冻结（代码完成，IME 人工验收待办）→ M1 符·箓·篆内核（箓/缴符已落地）→ M2 法坛运行时（协议链路完成，真机权重推理待办）→ M2.5 能力面增量（代码完成）→ M3 外宗接法坛 + 符箓台（已完成）→ M3.1 外宗逐工具分级与敕门（已完成）→ **M3.2 GUI 逐次弹窗敕门 + 内嵌中文字体（已完成）** → **S1 断链补齐（会话头/七层提示词/符胆接线、覆盖表写入、字体许可随包，已完成）** → **S2 太极符图编排最小可用版（已完成）** → 召将子符 / moli·问天·召将·摄行（未开始）→ M4 发布流水线。全量缺口与逐项进度见 `TODO.md`。**中文 IME 预编辑是 M0 硬验收门槛**，不达标即切 iced（`fulu-ui` 已隔离）。
 
 ## 原则
 

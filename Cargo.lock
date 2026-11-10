@@ -606,6 +606,7 @@ dependencies = [
  "fulu-core",
  "fulu-mcp",
  "fulu-model",
+ "fulu-orchestrator",
  "fulu-prompt",
  "fulu-provider",
  "fulu-register",
@@ -677,6 +678,10 @@ dependencies = [
 [[package]]
 name = "fulu-orchestrator"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "fulu-prompt"
