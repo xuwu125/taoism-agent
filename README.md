@@ -6,6 +6,65 @@
 
 **当前状态：M3 进行中（外宗接法坛 + 符箓台 + 外宗逐工具分级已完成）。** 仓库已有 16 个 crate 的 workspace、CI、符文领域模型、箓层授权（含双向权限核验）、风火轮工具（含敕行分 OS 命令行）、法坛状态机、缴符事件链、内置模型清单与合规闸门、本地 `llama-server` 的 OpenAI 兼容 HTTP 实现、会话头采集、分层提示词装配、全局 MCP 与技能包发现。**M3 本轮新增：外宗工具真正进入焚符循环（stdio 与回环 HTTP 双传输，真实子进程 + 真实 TCP 端到端测试）、符箓台三栏 GUI（符箓／法坛／缴符，焚符走后台线程）、外宗逐工具分级与「敕门」（破坏性召将未获确认一律敕否，可 `--allow-risk` 预授权或 `--ask` 逐次问人）**。**S1 补齐断链（会话头与七层提示词真正进焚符循环、符胆摘要重校验、覆盖表写入）；S2 太极符图编排最小可用版（DAG 拓扑校验 + 按层串行执行 + `fulu taiji run`）与召将子符（`summon.fu`：独立法坛 + minimal 档 + 禁环回 + 不继承父符高危授权）**。本机真实接上了本机唯一的 `streamable-http` MCP server 并列出 9 个工具。**真实 LFM 权重仍未下载、未做真机推理**；中文 IME 人工验收仍是 M0 唯一硬门槛。
 
+## 系统架构
+
+分层自上而下单向依赖（上层可用下层，下层绝不知上层），接口层（CLI / GUI）可整体替换：
+
+```mermaid
+flowchart TB
+    subgraph IF["接口层"]
+        CLI["fulu-cli · 无头命令行"]
+        UI["fulu-ui · 符箓台（egui 原生自绘，非 WebView）"]
+    end
+    subgraph FACADE["门面层"]
+        APP["fulu-app · 仪轨会话门面<br/>（含召将子符 summon.fu）"]
+    end
+    subgraph ORCH["编排层"]
+        TAIJI["fulu-orchestrator · 太极<br/>符图 DAG：拓扑校验 + 按层串行执行"]
+    end
+    subgraph RT["运行时层"]
+        ALTAR["fulu-runtime · 法坛<br/>仪轨状态机 + agent loop + 符脚判定"]
+        PROMPT["fulu-prompt · 篆心<br/>七层提示词装配（full/minimal/none）"]
+        CTX["fulu-context · 会话头<br/>硬件与 IP 所在地（全项容错）"]
+        PROV["fulu-provider · 请神<br/>本地 llama-server 的回环 HTTP 客户端"]
+    end
+    subgraph CAP["能力层"]
+        TOOLS["fulu-tools · 风火轮<br/>只读工具 + 白名单与路径边界"]
+        MCPS["fulu-mcp · 外宗箓<br/>stdio / 回环 HTTP 双传输 + 风险注解"]
+        SKILL["fulu-skills · 符胆<br/>全局技能包发现 + sha256 摘要校验"]
+        REG["fulu-register · 箓<br/>权限等级 / 名册 / 配额 / 双向核验"]
+        MODEL["fulu-model · 模型清单<br/>唯一事实源 + SHA256 校验 + 离线导入"]
+    end
+    subgraph KERNEL["符 · 篆 · 审计内核（零 I/O 优先）"]
+        CORE["fulu-core · 符<br/>符文模型 + 结构校验 + 仪轨状态机"]
+        SCRIPT["fulu-script · 篆<br/>canonical 序列化 + 符印哈希 + .fu 编解码"]
+        AUDIT["fulu-audit · 缴符<br/>append-only 事件链 + sha256 链式摘要"]
+    end
+
+    CLI --> APP
+    UI --> APP
+    APP --> TAIJI
+    APP --> ALTAR
+    APP --> CTX
+    TAIJI --> ALTAR
+    ALTAR --> PROMPT
+    ALTAR --> PROV
+    ALTAR --> TOOLS
+    ALTAR --> REG
+    ALTAR --> AUDIT
+    PROMPT --> CTX
+    PROV --> MODEL
+    TOOLS --> REG
+    MCPS --> REG
+    TOOLS --> SCRIPT
+    SKILL --> SCRIPT
+    PROMPT --> CORE
+    TOOLS --> CORE
+    AUDIT --> CORE
+```
+
+要点：**敕门在能力层与运行时之间**——`fulu-register` 回答「这张符最多能碰什么」（权限，静态），风险等级回答「碰之前要不要人点头」（逐次），两维正交不可合并；**内核三 crate（符 / 篆 / 缴符）不感知网络与 GUI**，可无头测试。
+
 ## 文档
 
 | 文档 | 内容 |
@@ -92,6 +151,51 @@ cargo run -p fulu-cli -- altar run sample.fu --confirm --summon --allow-risk mut
 
 `fulu model verify` 在清单未固化 sha256 时明确输出 `UNVERIFIED`，**不会伪称校验通过**；`model fetch` 需 `--i-understand-license` 且清单摘要固化后才可能放行（本轮仍拒绝，见 `docs/02` 第 13.4 节）。
 
+## 焚符仪轨流程
+
+一张符的一生 = 仪轨状态机（`fulu-core::TalismanState`，唯一迁移裁判 `can_transition`）：
+
+```mermaid
+stateDiagram-v2
+    [*] --> 草稿: 书符（fulu fu sample 或手写 .fu）
+    草稿 --> 成符: schema 通过、内容冻结
+    成符 --> 已盖印: 盖印（箓层授箓核验 + 计算符印）
+    成符 --> 驳回: 盖印时授箓核验不通过（越权 / 配额不足）
+    已盖印 --> 待焚: dry-run 通过（零网络，列出影响面与确认门）
+    待焚 --> 破符: dry-run 后符文被改动（必须重新盖印）
+    待焚 --> 焚化中: 显式 --confirm（此点起不可撤销）
+    焚化中 --> 回执: 符脚 success_criteria 达标
+    焚化中 --> 炸炉: 运行时失败 / 预算耗尽（converged=false 不伪装成功）
+    焚化中 --> 过坛: 超时
+    回执 --> 归档: 缴符（append-only 事件链 + sha256 链式摘要）
+    炸炉 --> 归档
+    过坛 --> 归档
+    归档 --> [*]: 按符印只读回放
+    破符 --> [*]
+    驳回 --> [*]
+```
+
+**焚化中**不是黑盒，是法坛的 agent loop（含敕门与召将子符）：
+
+```mermaid
+flowchart LR
+    A["焚化中"] --> B["请神：本地 llama-server\n（127.0.0.1 回环 OpenAI 兼容 HTTP）"]
+    B --> C{"要调用工具吗？"}
+    C -- "否（直接回话）" --> D["回执，焚化结束"]
+    C -- "是" --> E{"箓层：权限核验\n（符沙箱 ≥ 工具要求？）"}
+    E -- "不通过 → PermissionTooLow / 越权" --> F["驳回，理由回喂模型换路"]
+    E -- "通过" --> G{"敕门：风险等级\n（Observe 免确认 / Mutate 每符一次 /\nDestructive 每次确认）"}
+    G -- "无人点头（fail closed）" --> F
+    G -- "确认" --> H["执行工具\n（风火轮 / 外宗 MCP）"]
+    H -- "summon.fu" --> I["子符：独立法坛\nminimal 档 · 禁环回 ·\n不继承父符高危授权"]
+    I --> J["回执摘要回喂父符"]
+    J --> B
+    H --> B
+    F --> B
+```
+
+同一工具连续被拒 2 次才停止焚化；太极把多张符编成 DAG 后，**每个节点都完整走一遍上述仪轨**，失败跳过下游而独立分支照跑。
+
 ## M2 实现要点
 
 - **敕门（M3.1）**：权限回答「能不能碰」，风险等级回答「碰之前要不要人点头」。`Observe` 免确认、`Mutate` 每符一次、`Destructive` 每次确认；未装确认器时**一律敕否**（fail closed），被拒的召将把理由交回模型而不是炸炉，同一工具连续被拒 2 次才停止焚化。外宗等级取自 server 的 `annotations`（只用于收紧，从不放宽权限）；server 未声明时用 fulu 自己的 `~/.fulu/outer-sect-risk.json` 逐条覆盖，绝不改 MCP 配置。
@@ -117,6 +221,7 @@ crates/fulu-model           内置模型清单、SHA256 校验、离线导入
 crates/fulu-provider        供应商 trait、最小 HTTP 客户端、本地 LFM provider、工具调用归一化
 crates/fulu-register        箓层：授箓名册、权限等级与配额、副作用等级
 crates/fulu-tools           风火轮：只读工具、白名单与路径边界
+crates/fulu-skills          符胆：全局技能包发现与 sha256 摘要校验
 crates/fulu-runtime         法坛：仪轨状态机、Harness、agent loop、符脚判定
 crates/fulu-audit           缴符：append-only 事件日志、脱敏、链式校验与回放
 crates/fulu-app             GUI/CLI 共用的仪轨会话门面
