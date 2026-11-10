@@ -39,9 +39,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # 与 ci.yml 同一份依赖表：fulu-ui（glow）在 Linux 链接期需要完整 X11/Wayland 客户端库。
       - name: Install Linux GUI system deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
 
       - name: Build release binaries
         run: cargo build --release --locked --target ${{ matrix.target }} -p fulu-ui -p fulu-cli
@@ -86,6 +91,7 @@ jobs:
             taoism-agent-*.zip
             SHA256SUMS-*.txt
           fail_on_unmatched_files: false
+          generate_release_notes: true
 
   # 离线 bundle 默认不跑：会下载约 1.1 GB 权重，且使我们成为 lfm1.0 的分发者。
   # 触发前必须确认：随包附 LICENSE 全文 + THIRD_PARTY_NOTICES.md + 保留全部署名。
