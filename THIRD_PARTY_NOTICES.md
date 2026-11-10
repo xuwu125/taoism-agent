@@ -47,9 +47,10 @@
 
 | 字体 | 许可 | 义务 |
 |---|---|---|
-| Ubuntu-Light + NotoEmoji（`epaint_default_fonts`，eframe `default_fonts` 特性带入） | (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0 | 随包附许可全文；不得单独以「Ubuntu」名义再分发或售卖；修改后的字体不得使用保留字体名 |
-| 思源黑体简中子集 `NotoSansSC-Regular-gui.otf`（源字体 Noto Sans CJK SC，经子集化截取 U+4E00–9FFF 全部汉字与常用符号，约 6 MB） | SIL Open Font License 1.1 | 许可全文随源码放在 `crates/fulu-ui/assets/fonts/LICENSE-NotoSansSC.txt`，正式发布安装包时必须把它放进 bundle；不得单独售卖字体；修改版不得使用保留字体名 |
+| Ubuntu-Light（`epaint_default_fonts`，eframe `default_fonts` 特性带入） | Ubuntu Font Licence 1.0（UFL） | 随包附许可全文；不得单独以「Ubuntu」名义再分发或售卖；修改后的字体不得使用保留字体名 |
+| NotoEmoji / Hack / egui-icons / emoji-icon-font（同包内其余内嵌字体） | OFL-1.1 / MIT / DejaVu 公有领域等，逐份见 `licenses/` | 随包附各自许可全文 |
+| 思源黑体简中子集 `NotoSansSC-Regular-gui.otf`（源字体 Noto Sans CJK SC，经子集化截取 U+4E00–9FFF 全部汉字与常用符号，约 6 MB） | SIL Open Font License 1.1 | 随包附许可全文；不得单独售卖字体；修改版不得使用保留字体名 |
 
-两者的许可全文可从 <https://ubuntu.com/legal/font-licence> 与 <https://scripts.sil.org/OFL> 取得；M4 打包清单中把「随包附字体许可全文」列为必检项。
+**许可全文已随源码入库**：`crates/fulu-ui/assets/fonts/licenses/` 收录 `LICENSE-NotoSansSC.txt`、`UFL.txt`、`OFL.txt`、`Hack-Regular.txt`、`egui-icons.txt`、`emoji-icon-font-mit-license.txt`（后五份取自本机 `epaint_default_fonts 0.37` 字体包）。T07 起 `release.yml` 在四平台打包时把整个 `licenses/` 目录放进发布包，并有 `Verify bundled font licenses` 步骤逐一断言文件存在且非空——漏一份即红，不再停留在「M4 必检项」的文字承诺。
 
 思源黑体子集只覆盖常用区段；扩展 A 区等生僻字在运行时回退到**用户系统已有**的 CJK 字体（Windows `msyh.ttc` / macOS `PingFang.ttc` / Linux Noto CJK 等，见 `fulu-ui/src/fonts.rs` 的固定候选列表）——只读取，不分发。未来若引入其他素材，须在此补充其名称、版本与许可。视频分析文档属评论性引用，不含原片与第三方源码。

@@ -207,9 +207,9 @@ impl Talisman {
                 success_criteria: "output.len <= 200".into(),
             },
             tool_refs: vec!["fs.read".into()],
-            skill_refs: vec![
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
-            ],
+            // 示例符不引用符胆：T03 起运行时会按摘要重校验，全 0 占位摘要
+            // 会被判为「引用了不存在的技能包」而破符——绝不编造校验值。
+            skill_refs: Vec::new(),
             output: OutputSpec {
                 schema: "summary.v1".into(),
                 max_iterations: 3,

@@ -12,7 +12,7 @@ use fulu_audit::{AuditEvent, AuditLog, EventKind};
 use fulu_core::{Talisman, TalismanState, can_transition};
 use fulu_provider::{InvocationRequest, Provider, ProviderError};
 use fulu_register::{Authorization, Confirmation, Register, RegisterError, RiskClass};
-use fulu_script::seal_hex;
+use fulu_script::{digest_hex, seal_hex};
 use fulu_tools::{ToolArguments, ToolRegistry};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,6 +104,9 @@ pub struct DryRunPlan {
     pub criteria: String,
     pub transitions: Vec<String>,
     pub notes: Vec<String>,
+    /// 装配好的系统提示词摘要（T01/T02）：没有装配时为 None。
+    /// 焚烧时重算并比对，防止「dry-run 时看的是一套提示词、执行时换了另一套」。
+    pub system_digest: Option<String>,
 }
 
 impl DryRunPlan {
@@ -142,6 +145,9 @@ impl DryRunPlan {
             format!("符脚判据   : {}", self.criteria),
             format!("仪轨       : {}", self.transitions.join(" → ")),
         ];
+        if let Some(digest) = &self.system_digest {
+            lines.push(format!("提示词装配 : sha256:{}", digest));
+        }
         for note in &self.notes {
             lines.push(format!("提示       : {note}"));
         }
@@ -162,12 +168,26 @@ pub struct Receipt {
     pub events: Vec<AuditEvent>,
 }
 
+/// 符胆（技能包）摘要重校验。
+///
+/// 法坛不碰文件系统：由会话层注入实现（扫描用户全局技能目录，只读）。
+/// 符文只引用 `sha256:` 摘要，两次焚符之间技能文件被改动就必须破符。
+pub trait SkillVerifier: Send {
+    fn verify(&self, refs: &[String]) -> Result<(), String>;
+}
+
 pub struct Altar<'a> {
     pub provider: &'a dyn Provider,
     pub tool_registry: &'a ToolRegistry,
     pub register: &'a Register,
     pub audit: &'a mut AuditLog,
     pub config: RitualConfig,
+    /// 会话层装配好的系统提示词；None = 沿用符文自带的 `fu.system`。
+    system_prompt: Option<String>,
+    /// 装配说明（哪几层、多少字符），进 dry-run notes 供人复核。
+    prompt_note: Option<String>,
+    /// 符胆校验器；未装时不校验（库级调用保持旧行为）。
+    skill_verifier: Option<&'a dyn SkillVerifier>,
     /// 未装确认器时一切需要确认的召将都被敕否（fail closed）。
     confirmer: Option<&'a mut dyn Confirmer>,
     /// 本符内已确认过的工具（对应 `Confirmation::OncePerTalisman`）
@@ -190,6 +210,9 @@ impl<'a> Altar<'a> {
             register,
             audit,
             config,
+            system_prompt: None,
+            prompt_note: None,
+            skill_verifier: None,
             confirmer: None,
             confirmed_once: BTreeSet::new(),
             denials: BTreeMap::new(),
@@ -202,6 +225,34 @@ impl<'a> Altar<'a> {
     /// 反过来若法坛持有 `Box`，每次焚符都得重新造一个，交互状态就断了。
     pub fn set_confirmer(&mut self, confirmer: &'a mut dyn Confirmer) {
         self.confirmer = Some(confirmer);
+    }
+
+    /// 注入会话层装配好的系统提示词（七层分层 + 会话头）。
+    /// `note` 会原样进 dry-run 计划，让用户确认前看得见用了哪几层。
+    pub fn set_system_prompt(&mut self, text: String, note: String) {
+        self.system_prompt = Some(text);
+        self.prompt_note = Some(note);
+    }
+
+    pub fn set_skill_verifier(&mut self, verifier: &'a dyn SkillVerifier) {
+        self.skill_verifier = Some(verifier);
+    }
+
+    /// 符胆校验：只在装了校验器时生效，失败即破符并留痕，不静默跳过。
+    fn verify_skills(&mut self, seal: &str, fu: &Talisman) -> Result<(), RitualError> {
+        let Some(verifier) = self.skill_verifier else {
+            return Ok(());
+        };
+        if fu.skill_refs.is_empty() {
+            return Ok(());
+        }
+        if let Err(reason) = verifier.verify(&fu.skill_refs) {
+            let message = format!("符胆摘要失配：{reason}");
+            self.audit
+                .append(seal, TalismanState::Broken, EventKind::Broken, &message)?;
+            return Err(RitualError::Broken(message));
+        }
+        Ok(())
     }
 
     fn transition(&self, from: TalismanState, to: TalismanState) -> Result<(), RitualError> {
@@ -222,6 +273,9 @@ impl<'a> Altar<'a> {
             )?;
             return Err(RitualError::Broken(problems.to_string()));
         }
+
+        // 符胆：成符时就重新校验内容摘要，技能包被改动即破符。
+        self.verify_skills(&seal, fu)?;
 
         self.transition(TalismanState::Draft, TalismanState::Formed)?;
         self.audit.append(
@@ -285,6 +339,9 @@ impl<'a> Altar<'a> {
         if auth.network {
             notes.push("符申请了网络能力，请复核域名白名单".into());
         }
+        if let Some(note) = &self.prompt_note {
+            notes.push(note.clone());
+        }
         // 确认门必须在待焚前说清楚：哪些召将会停下来等人点头。
         let gated = auth.tools_needing_confirmation();
         if gated.is_empty() {
@@ -329,6 +386,10 @@ impl<'a> Altar<'a> {
                 "待焚(dry-run)".into(),
             ],
             notes,
+            system_digest: self
+                .system_prompt
+                .as_deref()
+                .map(|text| digest_hex(text.as_bytes())),
         };
         self.audit.append(
             &seal,
@@ -365,6 +426,18 @@ impl<'a> Altar<'a> {
                 "符文在 dry-run 之后被改动，必须重新成符盖印".into(),
             ));
         }
+        // dry-run 与焚化之间提示词不能偷换：装配结果也纳入一致性校验。
+        let system_digest = self
+            .system_prompt
+            .as_deref()
+            .map(|text| digest_hex(text.as_bytes()));
+        if system_digest != plan.system_digest {
+            let message = "系统提示词在 dry-run 之后被改动，必须重新成符盖印".to_owned();
+            self.audit
+                .append(&seal, TalismanState::Broken, EventKind::Broken, &message)?;
+            return Err(RitualError::Broken(message));
+        }
+        self.verify_skills(&seal, fu)?;
         let auth = self
             .register
             .authorize(fu)
@@ -415,7 +488,10 @@ impl<'a> Altar<'a> {
 
             let request = InvocationRequest {
                 model_id: fu.deity.model_id.clone(),
-                system: fu.system.clone(),
+                system: self
+                    .system_prompt
+                    .clone()
+                    .unwrap_or_else(|| fu.system.clone()),
                 user: user_input.clone(),
                 tools_json: tools_json.clone(),
                 sampling: fu.deity.sampling.clone(),
@@ -723,6 +799,7 @@ pub fn build_tools_json(auth: &Authorization, register: &Register) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fulu_audit::EventKind;
     use fulu_provider::{InvocationReply, StubProvider, ToolCall, Usage, text_reply};
     use fulu_register::ToolGrant;
     use std::sync::{Arc, Mutex};
@@ -1167,5 +1244,79 @@ mod tests {
             value[0]["function"]["parameters"]["required"][0],
             Value::String("text".into())
         );
+    }
+
+    /// T02：装配好的系统提示词必须真的送进 provider，且进 dry-run 计划。
+    #[test]
+    fn assembled_system_prompt_reaches_provider() {
+        let (fu, register, tools, mut audit) = fixture();
+        let provider = StubProvider::default();
+        provider.push_reply(text_reply("完成", 10, 10));
+        let mut altar = altar(&provider, &tools, &register, &mut audit);
+        altar.set_system_prompt(
+            "## 篆心\n你是符箓\n\n## 符文正文\n测试正文".into(),
+            "提示词装配：测试 2 层".into(),
+        );
+        let plan = altar.prepare(&fu).unwrap();
+        assert!(plan.system_digest.is_some());
+        assert!(plan.notes.iter().any(|note| note.contains("提示词装配")));
+        altar.ignite(&fu, &plan, true).unwrap();
+        let request = provider.last_request().unwrap();
+        assert!(
+            request.system.starts_with("## 篆心"),
+            "{:?}",
+            request.system
+        );
+        assert!(
+            !request.system.contains(&fu.system),
+            "不得再直接塞裸符文 system"
+        );
+        audit.verify_chain().unwrap();
+    }
+
+    /// dry-run 与焚化之间偷换提示词 = 破符，且一次都不许请神。
+    #[test]
+    fn prompt_changed_after_dry_run_breaks_before_invocation() {
+        let (fu, register, tools, mut audit) = fixture();
+        let provider = StubProvider::default();
+        let plan = {
+            let mut altar = altar(&provider, &tools, &register, &mut audit);
+            altar.set_system_prompt("装配 A".into(), "提示词装配：A".into());
+            altar.prepare(&fu).unwrap()
+        };
+        let mut altar = altar(&provider, &tools, &register, &mut audit);
+        altar.set_system_prompt("装配 B".into(), "提示词装配：B".into());
+        assert!(matches!(
+            altar.ignite(&fu, &plan, true),
+            Err(RitualError::Broken(_))
+        ));
+        assert_eq!(provider.call_count(), 0);
+    }
+
+    struct RejectSkills;
+
+    impl SkillVerifier for RejectSkills {
+        fn verify(&self, _refs: &[String]) -> Result<(), String> {
+            Err("技能包内容已变化".into())
+        }
+    }
+
+    /// T03：符胆校验器在成符阶段就拦下失配的符，不留到焚化后才发现。
+    #[test]
+    fn skill_verifier_breaks_talisman_before_sealing() {
+        let (mut fu, register, tools, mut audit) = fixture();
+        fu.skill_refs = vec!["sha256:deadbeef".into()];
+        let provider = StubProvider::default();
+        let verifier = RejectSkills;
+        let mut altar = altar(&provider, &tools, &register, &mut audit);
+        altar.set_skill_verifier(&verifier);
+        assert!(matches!(altar.prepare(&fu), Err(RitualError::Broken(_))));
+        assert!(
+            audit
+                .events()
+                .iter()
+                .any(|event| event.kind == EventKind::Broken)
+        );
+        assert_eq!(provider.call_count(), 0);
     }
 }

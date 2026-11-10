@@ -61,6 +61,9 @@ jobs:
           mkdir -p "$OUT"
           cp "$BIN/fulu" "$BIN/fulu-ui" "$OUT/"
           cp LICENSE THIRD_PARTY_NOTICES.md models/manifest.json models/README.md "$OUT/"
+          # T07：二进制内嵌字体 = 分发字体，许可全文必须随包（THIRD_PARTY_NOTICES.md 第 4 节）。
+          mkdir -p "$OUT/licenses"
+          cp crates/fulu-ui/assets/fonts/*.txt crates/fulu-ui/assets/fonts/licenses/*.txt "$OUT/licenses/"
           tar -czf "$OUT.tar.gz" "$OUT"
 
       - name: Package (Windows)
@@ -71,7 +74,20 @@ jobs:
           $out = "taoism-agent-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "$bin/fulu.exe", "$bin/fulu-ui.exe", "LICENSE", "THIRD_PARTY_NOTICES.md", "models/manifest.json", "models/README.md" -Destination $out
+          # T07：与 Unix 一致，字体许可全文随包。
+          New-Item -ItemType Directory -Force -Path "$out/licenses" | Out-Null
+          Copy-Item "crates/fulu-ui/assets/fonts/*.txt", "crates/fulu-ui/assets/fonts/licenses/*.txt" -Destination "$out/licenses"
           Compress-Archive -Path "$out/*" -DestinationPath "$out.zip"
+
+      - name: Verify bundled font licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="taoism-agent-${{ github.ref_name }}-${{ matrix.target }}"
+          for f in LICENSE-NotoSansSC.txt UFL.txt OFL.txt Hack-Regular.txt egui-icons.txt emoji-icon-font-mit-license.txt; do
+            if [ ! -s "$OUT/licenses/$f" ]; then echo "::error::发布包缺少字体许可全文 $f"; exit 1; fi
+          done
+          echo "字体许可齐全：$(ls "$OUT/licenses" | wc -l) 份"
 
       - name: Checksums
         shell: bash

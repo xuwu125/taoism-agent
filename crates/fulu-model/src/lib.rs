@@ -3,7 +3,8 @@
 //! 关键约束（docs/02 第 8.5 节）：
 //! - 权重**不进 Git**，仓库只放 `models/manifest.json` 与合规文本；
 //! - 未固化 sha256 时校验结果必须是 `UNVERIFIED`，不伪称通过；
-//! - M0 不发起任何网络请求；`model fetch` 在 M2 落地。
+//! - M0 不发起任何网络请求；`model fetch` 当前是**许可 + 校验闸门**，
+//!   公网 HTTPS 下载与摘要固化仍列为 M2.1 待办（见 TODO.md T20/T21）。
 
 pub mod manifest;
 pub mod verify;

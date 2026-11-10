@@ -23,6 +23,8 @@ pub const GENESIS: &str = "genesis";
 pub enum EventKind {
     Formed,
     Sealed,
+    /// 会话头（每会话一次）：只记粗粒度的会话上下文摘要，不写符文正文
+    Context,
     DryRun,
     Ignited,
     Invoked,
@@ -45,6 +47,7 @@ impl EventKind {
         match self {
             Self::Formed => "成符",
             Self::Sealed => "盖印",
+            Self::Context => "会话头",
             Self::DryRun => "待焚",
             Self::Ignited => "焚化",
             Self::Invoked => "请神",

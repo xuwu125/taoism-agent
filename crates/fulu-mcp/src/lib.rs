@@ -1,7 +1,8 @@
 //! 外宗箓（MCP）：全局 MCP 配置的**只读**发现与 stdio 接入（docs/02 第 8.6 节）。
 //!
 //! 原则：**只展示，不管理。** 安装、升级、删除全局 MCP 配置一律由用户在原有生态
-//! 完成；本 crate 绝不写任何全局配置文件。
+//! 完成；本 crate 绝不写任何全局配置文件。唯一会写的是 **fulu 自有**的
+//! `~/.fulu/outer-sect-risk.json` 风险覆盖表（T05），与 MCP 生态配置无关。
 //!
 //! 安全边界：
 //! - 发现只读解析配置；`env` 只显示**键名**，值一律不读不出（疑似密钥零泄漏）。
@@ -15,7 +16,7 @@ use fulu_tools::{Tool, ToolArguments, ToolError, ToolOutput, ToolPolicy};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -237,6 +238,11 @@ impl RiskOverrides {
         self.map.len()
     }
 
+    /// 覆盖表条目（按工具全名字典序），供 `mcp risk list` 展示。
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &RiskClass)> {
+        self.map.iter()
+    }
+
     /// 覆盖表里指向不存在工具的条目（多半是 server 升级后改了工具名）。
     pub fn stale_entries(&self, tool_ids: &[String]) -> Vec<String> {
         self.map
@@ -245,6 +251,110 @@ impl RiskOverrides {
             .cloned()
             .collect()
     }
+
+    /// 写入一条覆盖；`None` 表示撤销该工具的覆盖。
+    pub fn set_entry(&mut self, tool_id: &str, risk: Option<RiskClass>) {
+        match risk {
+            Some(level) => {
+                self.map.insert(tool_id.to_owned(), level);
+            }
+            None => {
+                self.map.remove(tool_id);
+            }
+        }
+    }
+
+    /// 序列化成人类可读、可手工审阅的 JSON（坏条目已在 `load` 阶段剔除）。
+    pub fn to_json_pretty(&self) -> Result<String, String> {
+        let mut tools = serde_json::Map::new();
+        for (id, risk) in &self.map {
+            tools.insert(
+                id.clone(),
+                serde_json::Value::String(risk_key(*risk).into()),
+            );
+        }
+        let mut root = serde_json::Map::new();
+        root.insert("tools".into(), serde_json::Value::Object(tools));
+        serde_json::to_string_pretty(&serde_json::Value::Object(root))
+            .map_err(|error| format!("覆盖表序列化失败：{error}"))
+    }
+
+    /// 原子写：先写同目录临时文件，再替换目标；替换失败时尽力恢复旧文件。
+    ///
+    /// 只写 fulu 自己的配置路径（由调用方给定），绝不触碰 MCP 生态的配置。
+    pub fn write_to(&self, path: &Path) -> Result<(), String> {
+        let text = format!("{}\n", self.to_json_pretty()?);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("无法创建 {}：{error}", parent.display()))?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let backup = path.with_extension("json.bak");
+        std::fs::write(&tmp, text)
+            .map_err(|error| format!("写入 {} 失败：{error}", tmp.display()))?;
+
+        // Windows 上 rename 未必能覆盖已存在文件：先把旧文件挪开，失败则回滚。
+        let had_old = path.exists();
+        if had_old {
+            let _ = std::fs::remove_file(&backup);
+            std::fs::rename(path, &backup).map_err(|error| format!("备份旧覆盖表失败：{error}"))?;
+        }
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            if had_old {
+                let _ = std::fs::rename(&backup, path); // 尽力恢复
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("替换覆盖表失败：{error}"));
+        }
+        if had_old {
+            let _ = std::fs::remove_file(&backup);
+        }
+        Ok(())
+    }
+}
+
+/// 覆盖表里的等级字符串（与 `RiskClass` 的 serde snake_case 一致）。
+pub fn risk_key(risk: RiskClass) -> &'static str {
+    match risk {
+        RiskClass::Observe => "observe",
+        RiskClass::Mutate => "mutate",
+        RiskClass::Destructive => "destructive",
+    }
+}
+
+/// 解析 CLI 传入的等级；不认识的值必须报错，绝不猜一个等级放行。
+pub fn parse_risk(raw: &str) -> Option<RiskClass> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "observe" => Some(RiskClass::Observe),
+        "mutate" => Some(RiskClass::Mutate),
+        "destructive" => Some(RiskClass::Destructive),
+        _ => None,
+    }
+}
+
+/// 写入/撤销一条覆盖，返回更新后的覆盖表与读取时的坏条目说明。
+///
+/// 工具全名必须是精确名字：含通配符、空白或空串一律拒绝。猜错名字的代价
+/// 是放行一个破坏性操作，比让用户多写几个字符贵得多。
+pub fn set_risk_override(
+    path: &Path,
+    tool_id: &str,
+    risk: Option<RiskClass>,
+) -> Result<(RiskOverrides, Vec<String>), String> {
+    let id = tool_id.trim();
+    if id.is_empty()
+        || id
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch == '*' || ch == '?')
+    {
+        return Err(
+            "工具名必须是精确全名（如 mcp.cucumber.read_file），不接受空白、* 或 ? 通配".into(),
+        );
+    }
+    let (mut overrides, issues) = RiskOverrides::load(&[path.to_path_buf()]);
+    overrides.set_entry(id, risk);
+    overrides.write_to(path)?;
+    Ok((overrides, issues))
 }
 
 /// 只读发现：解析每个配置文件的 `mcpServers` 表。文件缺失/损坏跳过并返回错误说明，
@@ -1342,6 +1452,63 @@ for line in sys.stdin:
         let (empty, issues) = RiskOverrides::load(&[dir.join("nope.json")]);
         assert!(empty.is_empty());
         assert!(issues.is_empty());
+    }
+
+    /// T05：写入入口只改 fulu 自己的覆盖表，且写入后立刻可读回。
+    #[test]
+    fn risk_override_write_set_unset_roundtrip() {
+        let dir = std::env::temp_dir().join("fulu_mcp_risk_write");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("outer-sect-risk.json");
+
+        let (after_set, _) = set_risk_override(
+            &path,
+            "mcp.cucumber.get_dashboard",
+            Some(RiskClass::Observe),
+        )
+        .unwrap();
+        assert_eq!(after_set.len(), 1);
+        let (reloaded, issues) = RiskOverrides::load(std::slice::from_ref(&path));
+        assert!(
+            issues.is_empty(),
+            "写出的 JSON 必须能被自己读回：{issues:?}"
+        );
+        assert_eq!(
+            reloaded.get("mcp.cucumber.get_dashboard"),
+            Some(RiskClass::Observe)
+        );
+
+        // 第二条写入不得抹掉第一条。
+        set_risk_override(&path, "mcp.cucumber.start_process", Some(RiskClass::Mutate)).unwrap();
+        let (two, _) = RiskOverrides::load(std::slice::from_ref(&path));
+        assert_eq!(two.len(), 2);
+
+        let (after_unset, _) =
+            set_risk_override(&path, "mcp.cucumber.get_dashboard", None).unwrap();
+        assert_eq!(after_unset.len(), 1);
+        assert_eq!(after_unset.get("mcp.cucumber.get_dashboard"), None);
+        assert!(!path.with_extension("json.tmp").exists(), "临时文件要清掉");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 模糊匹配是安全红线：宁可拒绝，也不猜一个可能放行破坏性操作的工具名。
+    #[test]
+    fn risk_override_rejects_wildcards_and_blank_names() {
+        let path = std::env::temp_dir().join("fulu_mcp_risk_reject.json");
+        for bad in ["", "   ", "mcp.cucumber.*", "mcp.?", "has space"] {
+            let error = set_risk_override(&path, bad, Some(RiskClass::Observe)).unwrap_err();
+            assert!(error.contains("精确全名"), "{bad:?} -> {error}");
+        }
+        assert!(!path.exists(), "被拒的写入绝不能落盘");
+    }
+
+    #[test]
+    fn parse_risk_is_strict() {
+        assert_eq!(parse_risk("OBSERVE"), Some(RiskClass::Observe));
+        assert_eq!(parse_risk("mutate"), Some(RiskClass::Mutate));
+        assert_eq!(parse_risk("destructive"), Some(RiskClass::Destructive));
+        assert_eq!(parse_risk("harmless"), None);
+        assert_eq!(risk_key(RiskClass::Destructive), "destructive");
     }
 
     #[test]

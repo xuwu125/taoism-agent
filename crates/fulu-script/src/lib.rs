@@ -46,6 +46,15 @@ pub fn seal_hex<T: Serialize>(value: &T) -> Result<String, ScriptError> {
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// 任意字节的 sha256（内容寻址）。
+///
+/// 与 `seal_hex` 的区别：不做 JSON 规范化包装，适合给「装配好的提示词」
+/// 与「技能包原文」这类非符文内容做摘要——符印仍只由 `seal_hex` 生成。
+pub fn digest_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// 校验符印；内容有任何改动都会返回 false。
 pub fn verify_seal(fu: &Talisman, expected: &str) -> Result<bool, ScriptError> {
     Ok(seal_hex(fu)?.eq_ignore_ascii_case(expected.trim()))

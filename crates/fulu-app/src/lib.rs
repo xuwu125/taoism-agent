@@ -4,16 +4,23 @@
 //! 环境体检、符文加载、dry-run、显式确认后焚化、缴符导出与本地服务探活。
 //! UI 层不允许直接碰 `fulu-runtime`，全部经此门面。
 
-use fulu_audit::AuditLog;
-use fulu_core::Talisman;
+use fulu_audit::{AuditLog, EventKind};
+use fulu_context::{SessionContext, collect as collect_context};
+use fulu_core::{Talisman, TalismanState};
 use fulu_mcp::{McpServerInfo, RiskOverrides, RiskSource};
 use fulu_model::{ModelManifest, VerifyStatus, model_path, status, verify_file};
+use fulu_prompt::{CORE_TEXT, LayerCaps, LayerId, PromptDraft, assemble};
 use fulu_provider::{Health, LocalLfmProvider};
 use fulu_register::{Register, ToolGrant};
+use fulu_skills::{default_roots, digest_matches, discover_global};
 
+/// 提示词档位对外暴露：CLI `--prompt-mode` 与未来的子符分派都要用它。
+pub use fulu_prompt::{AssembledPrompt, PromptMode};
 /// 风险等级与确认档位对外暴露：CLI/GUI 需要它们解析 `--allow-risk` 与渲染敕门卡片。
 pub use fulu_register::{Confirmation, RiskClass};
-use fulu_runtime::{AllowUpTo, Altar, Confirmer, RitualConfig, RitualError};
+use fulu_runtime::{AllowUpTo, Altar, Confirmer, RitualConfig, RitualError, SkillVerifier};
+/// 内容摘要对外暴露：CLI 的装配预览要展示与 dry-run 计划一致的 sha256。
+pub use fulu_script::digest_hex;
 use fulu_script::{decode_fu, encode_fu, seal_hex};
 use fulu_tools::{Tool, ToolPolicy, ToolRegistry};
 use std::fmt;
@@ -266,6 +273,82 @@ impl OuterSectReport {
     }
 }
 
+/// 符胆校验器：扫描用户全局技能目录（**只读**），按符文里的 `sha256:` 引用重校验。
+///
+/// T03：符只引用不内嵌；两次焚符之间技能文件被改动 / 被删除 → 破符。
+/// 不写任何技能包，符合「全局技能包只展示不管理」。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GlobalSkillVerifier {
+    pub roots: Vec<PathBuf>,
+}
+
+impl GlobalSkillVerifier {
+    pub fn from_defaults() -> Self {
+        Self {
+            roots: default_roots(),
+        }
+    }
+}
+
+impl SkillVerifier for GlobalSkillVerifier {
+    fn verify(&self, refs: &[String]) -> Result<(), String> {
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let (skills, issues) = discover_global(&self.roots);
+        for reference in refs {
+            let Some(digest) = reference.strip_prefix("sha256:") else {
+                return Err(format!("「{reference}」不是 sha256: 内容寻址引用"));
+            };
+            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("「{reference}」摘要格式不合法"));
+            }
+            let Some(skill) = skills
+                .iter()
+                .find(|skill| skill.sha256.eq_ignore_ascii_case(digest))
+            else {
+                let tail = if issues.is_empty() {
+                    "（扫描无异常）".to_owned()
+                } else {
+                    format!("（扫描异常：{}）", issues.join("；"))
+                };
+                return Err(format!(
+                    "找不到内容匹配的技能包：{reference}{tail}。技能包被改动或删除时必须重新成符，不能沿用旧引用"
+                ));
+            };
+            if !digest_matches(skill) {
+                return Err(format!("技能包 {} 内容已变化：{reference}", skill.name));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// fulu 自有配置目录（与风险覆盖表同处），不存在时返回 None。
+fn fulu_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|home| PathBuf::from(home).join(".fulu"))
+}
+
+/// 人类锁定层：只读文件，缺失/不可读 = 空层（装配器会跳过空小节）。
+/// 上层权限阶梯（AI 提案需盖印）由流程约束，本函数绝不写回。
+fn read_locked_layer(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!("{head}…[TRUNCATED]")
+}
+
 /// 一场仪轨的完整会话。provider / 箓 / 风火轮 / 缴符都在这里组装，
 /// GUI 与 CLI 各自只负责展示与收集「确认」。
 pub struct AltarSession {
@@ -276,6 +359,22 @@ pub struct AltarSession {
     outer_sect: OuterSectReport,
     /// 本次会话的确认器；`None` = 一律敕否（fail closed）
     confirmer: Option<Box<dyn Confirmer>>,
+    /// 工作区根目录（T02 的「工作区约定」层从这里的 `fulu.agents.md` 读取）。
+    workspace: Option<PathBuf>,
+    /// 提示词档位；主会话 full，子符 minimal，机械调用 none。
+    prompt_mode: PromptMode,
+    /// 会话头开关（可整体关闭）。
+    context_enabled: bool,
+    /// IP 粗粒度查询开关：**默认 false**，开启即显式允许一次外部查询，绝不静默联网。
+    context_ip: bool,
+    /// 每会话只采集一次；改变工作区或开关后重新采集。
+    session_context: Option<SessionContext>,
+    /// 静态层（0/1/3/4/5）快照，每会话装配一次；动态层（外宗、符文正文）每次装配。
+    base_layers: Option<PromptDraft>,
+    /// 会话头已落缴符事件的标记（每会话一条）。
+    context_logged: bool,
+    /// 符胆校验器（只读扫描全局技能目录）。
+    skills: GlobalSkillVerifier,
 }
 
 impl Default for AltarSession {
@@ -303,6 +402,14 @@ impl AltarSession {
             audit: AuditLog::new(),
             outer_sect: OuterSectReport::default(),
             confirmer: None,
+            workspace: None,
+            prompt_mode: PromptMode::Full,
+            context_enabled: true,
+            context_ip: false,
+            session_context: None,
+            base_layers: None,
+            context_logged: false,
+            skills: GlobalSkillVerifier::from_defaults(),
         }
     }
 
@@ -327,9 +434,60 @@ impl AltarSession {
     pub fn set_workspace(&mut self, root: PathBuf) {
         // 只换策略，保留已注册的外宗工具：重建 registry 会把它们静默丢掉。
         self.tools.set_policy(ToolPolicy {
-            root: Some(root),
+            root: Some(root.clone()),
             allowed_domains: Vec::new(),
         });
+        // 工作区变了，约定层与磁盘信息都要重取，避免把旧工作区的提示词带进新符。
+        self.workspace = Some(root);
+        self.base_layers = None;
+        self.session_context = None;
+    }
+
+    /// 提示词档位：主会话默认 full；召将子符用 minimal；纯机械调用用 none。
+    pub fn set_prompt_mode(&mut self, mode: PromptMode) {
+        self.prompt_mode = mode;
+    }
+
+    pub fn prompt_mode(&self) -> PromptMode {
+        self.prompt_mode
+    }
+
+    /// 会话头总开关（关掉后系统提示词不含硬件/地域信息）。
+    pub fn set_context_enabled(&mut self, enabled: bool) {
+        self.context_enabled = enabled;
+        self.base_layers = None;
+    }
+
+    /// IP 粗粒度查询：**必须显式开启**，默认关闭（不静默联网）。
+    pub fn set_context_ip(&mut self, enabled: bool) {
+        self.context_ip = enabled;
+        self.session_context = None;
+        self.base_layers = None;
+    }
+
+    pub fn context_ip(&self) -> bool {
+        self.context_ip
+    }
+
+    /// 自定义符胆扫描根目录（测试与自定义部署用；只读）。
+    pub fn set_skill_roots(&mut self, roots: Vec<PathBuf>) {
+        self.skills = GlobalSkillVerifier { roots };
+    }
+
+    /// 会话头摘要（供 CLI/GUI 展示；未采集时返回 None）。
+    pub fn context_summary(&mut self) -> Option<String> {
+        if !self.context_enabled {
+            return None;
+        }
+        self.ensure_context();
+        self.session_context
+            .as_ref()
+            .map(|context| context.summary())
+    }
+
+    /// 七层装配预览：与真正送进法坛的 system 文本一致（同一装配函数）。
+    pub fn prompt_preview(&mut self, fu: &Talisman) -> AssembledPrompt {
+        self.ensure_prompt(fu)
     }
 
     pub fn outer_sect(&self) -> &OuterSectReport {
@@ -488,9 +646,122 @@ impl AltarSession {
         })
     }
 
+    /// 每会话采集一次；IP 查询默认关闭，开启才发起一次外部请求。
+    fn ensure_context(&mut self) {
+        if self.session_context.is_none() && self.context_enabled {
+            self.session_context =
+                Some(collect_context(self.workspace.as_deref(), self.context_ip));
+        }
+    }
+
+    /// 七层装配（T01/T02）：静态层每会话一次，动态层（外宗 / 符文正文）按符装配。
+    ///
+    /// 符文正文原样放进第 6 层，`fu.system` 一字不改；会话头只进系统消息与
+    /// 缴符事件，绝不写回符文。人类锁定层只读，AI 提案需盖印（本轮不写入）。
+    fn ensure_prompt(&mut self, fu: &Talisman) -> AssembledPrompt {
+        if self.base_layers.is_none() {
+            let mut draft = PromptDraft::new().set(LayerId::Core, CORE_TEXT);
+            if self.context_enabled {
+                self.ensure_context();
+                if let Some(context) = &self.session_context {
+                    draft = draft.set(LayerId::SessionHeader, context.summary());
+                }
+            }
+            if let Some(home) = fulu_home() {
+                if let Some(text) = read_locked_layer(&home.join("user.md")) {
+                    draft = draft.set(LayerId::UserProfile, text);
+                }
+                if let Some(text) = read_locked_layer(&home.join("soul.md")) {
+                    draft = draft.set(LayerId::Soul, text);
+                }
+            }
+            if let Some(root) = &self.workspace
+                && let Some(text) = read_locked_layer(&root.join("fulu.agents.md"))
+            {
+                draft = draft.set(LayerId::WorkspacePact, text);
+            }
+            self.base_layers = Some(draft);
+        }
+        let mut draft = self.base_layers.clone().unwrap_or_default();
+        draft = draft.set(LayerId::OuterEnv, self.outer_env_text());
+        draft = draft.set(LayerId::TalismanBody, fu.system.clone());
+        assemble(self.prompt_mode, &draft, &LayerCaps::default())
+    }
+
+    /// 环境外宗层：外宗工具摘要 + 符胆发现计数（都只读，不写任何全局配置）。
+    fn outer_env_text(&self) -> String {
+        let (skills, issues) = discover_global(&self.skills.roots);
+        let note = if issues.is_empty() {
+            "扫描无异常".to_owned()
+        } else {
+            issues.join("；")
+        };
+        format!(
+            "{}\n符胆：{} 个技能包（只读发现，{}）",
+            self.outer_sect.summary(),
+            skills.len(),
+            note
+        )
+    }
+
+    /// 写进 dry-run 计划的装配说明：用了哪几层、多少字符、有没有截断。
+    fn prompt_note(&self, assembled: &AssembledPrompt) -> String {
+        let mode = match assembled.mode {
+            PromptMode::Full => "full",
+            PromptMode::Minimal => "minimal",
+            PromptMode::None => "none",
+        };
+        let layers = assembled
+            .sections
+            .iter()
+            .map(|section| section.layer.label())
+            .collect::<Vec<_>>()
+            .join("、");
+        format!(
+            "提示词装配：{mode} 档 {} 层（{layers}）/ {} 字符{}；IP 查询{}；会话头只进系统消息与缴符，不进符文正文",
+            assembled.sections.len(),
+            assembled.total_chars,
+            if assembled.total_truncated {
+                "（有截断）"
+            } else {
+                ""
+            },
+            if self.context_ip {
+                "已显式开启"
+            } else {
+                "关闭（默认不联网）"
+            }
+        )
+    }
+
+    /// T04：会话头落一条缴符事件（每会话一条，写入前由缴符层脱敏）。
+    fn log_session_context(&mut self, seal: &str) -> Result<(), AppError> {
+        if self.context_logged {
+            return Ok(());
+        }
+        let detail = match &self.session_context {
+            Some(context) => format!(
+                "会话头（每会话一次，IP {}）：{}",
+                if self.context_ip {
+                    "显式开启"
+                } else {
+                    "关闭"
+                },
+                truncate_chars(&context.summary(), 512)
+            ),
+            None => "会话头：已按配置关闭（不采集）".to_owned(),
+        };
+        self.audit
+            .append(seal, TalismanState::Pending, EventKind::Context, &detail)
+            .map_err(|error| AppError::Io(format!("缴符会话头事件写入失败：{error}")))?;
+        self.context_logged = true;
+        Ok(())
+    }
+
     /// 成符 → 盖印 → 待焚。零网络请求。
     pub fn dry_run(&mut self, fu: &Talisman) -> Result<DryRunPlan, AppError> {
-        let mut altar = self.altar(fu);
+        let assembled = self.ensure_prompt(fu);
+        let mut altar = self.altar(fu, &assembled);
         let mut plan = altar.prepare(fu)?;
         // 把外宗的影响面写进 dry-run 计划：用户确认前必须看见「这张符能召哪些外宗将」。
         if !self.outer_sect.servers.is_empty() {
@@ -526,6 +797,7 @@ impl AltarSession {
                 }
             }
         }
+        self.log_session_context(&plan.seal)?;
         Ok(plan)
     }
 
@@ -536,7 +808,8 @@ impl AltarSession {
         plan: &DryRunPlan,
         confirmed: bool,
     ) -> Result<Receipt, AppError> {
-        let mut altar = self.altar(fu);
+        let assembled = self.ensure_prompt(fu);
+        let mut altar = self.altar(fu, &assembled);
         Ok(altar.ignite(fu, plan, confirmed)?)
     }
 
@@ -547,7 +820,8 @@ impl AltarSession {
             .map_err(|e| AppError::Io(e.to_string()))
     }
 
-    fn altar(&mut self, fu: &Talisman) -> Altar<'_> {
+    fn altar(&mut self, fu: &Talisman, assembled: &AssembledPrompt) -> Altar<'_> {
+        let note = self.prompt_note(assembled);
         // 逐字段借用：确认器要借给法坛，缴符日志同时要可变借用。
         let Self {
             provider,
@@ -555,6 +829,7 @@ impl AltarSession {
             register,
             audit,
             confirmer,
+            skills,
             ..
         } = self;
         let mut altar = Altar::new(
@@ -564,6 +839,10 @@ impl AltarSession {
             audit,
             RitualConfig::from_talisman(fu),
         );
+        // T02：装配结果交给法坛送进 system 消息，法坛不关心层的来源。
+        altar.set_system_prompt(assembled.text.clone(), note);
+        // T03：符胆校验器由门面注入，法坛不碰文件系统。
+        altar.set_skill_verifier(&*skills);
         // 未装确认器时不装 —— 法坛自己会 fail closed，needless 不替它兜底。
         if let Some(confirmer) = confirmer.as_mut() {
             altar.set_confirmer(confirmer.as_mut());
@@ -575,6 +854,7 @@ impl AltarSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fulu_audit::EventKind;
 
     #[test]
     fn doctor_reports_embedded_model_without_touching_disk() {
@@ -624,5 +904,111 @@ mod tests {
         let mut session = AltarSession::new();
         assert!(session.set_endpoint("http://0.0.0.0:8080").is_err());
         assert!(session.set_endpoint("http://127.0.0.1:8080").is_ok());
+    }
+
+    /// T01/T02：七层真正装配出来，会话头与符文正文都在 system 里，符文本身不变。
+    #[test]
+    fn session_assembles_layers_and_logs_context_event() {
+        let mut session = AltarSession::new();
+        let fu = Talisman::sample();
+        let original_system = fu.system.clone();
+        let assembled = session.prompt_preview(&fu);
+        assert_eq!(assembled.mode, PromptMode::Full);
+        let layers: Vec<LayerId> = assembled.sections.iter().map(|s| s.layer).collect();
+        for expected in [LayerId::Core, LayerId::SessionHeader, LayerId::TalismanBody] {
+            assert!(layers.contains(&expected), "缺层：{expected:?}");
+        }
+        assert!(assembled.text.contains("## 符文正文"));
+        assert!(assembled.text.contains(&original_system));
+        assert!(
+            assembled.text.contains("系统："),
+            "会话头应出现在系统消息里"
+        );
+        assert_eq!(fu.system, original_system, "装配不得改写符文正文");
+        assert!(!session.context_ip(), "IP 查询默认必须关闭（不静默联网）");
+
+        let plan = session.dry_run(&fu).unwrap();
+        assert!(
+            plan.system_digest.is_some(),
+            "提示词摘要必须进 dry-run 计划"
+        );
+        assert!(plan.notes.iter().any(|note| note.contains("提示词装配")));
+        assert!(plan.notes.iter().any(|note| note.contains("IP 查询关闭")));
+        assert!(
+            session
+                .audit()
+                .events()
+                .iter()
+                .any(|event| event.kind == EventKind::Context),
+            "会话头必须落缴符事件"
+        );
+        session.audit().verify_chain().unwrap();
+    }
+
+    /// T02：minimal 档与关闭会话头后，相应层必须真的消失。
+    #[test]
+    fn minimal_mode_and_disabled_context_drop_layers() {
+        let mut session = AltarSession::new();
+        session.set_context_enabled(false);
+        session.set_prompt_mode(PromptMode::Minimal);
+        let fu = Talisman::sample();
+        let assembled = session.prompt_preview(&fu);
+        assert_eq!(assembled.mode, PromptMode::Minimal);
+        let layers: Vec<LayerId> = assembled.sections.iter().map(|s| s.layer).collect();
+        assert!(layers.contains(&LayerId::Core));
+        assert!(layers.contains(&LayerId::TalismanBody));
+        assert!(!layers.contains(&LayerId::SessionHeader));
+        assert!(!layers.contains(&LayerId::OuterEnv));
+        assert!(!assembled.text.contains("系统："));
+        assert!(
+            session.context_summary().is_none(),
+            "关闭采集后不返回会话头摘要"
+        );
+    }
+
+    /// T03：技能包内容被改动后，引用旧摘要的符必须破符。
+    #[test]
+    fn changed_skill_digest_breaks_the_talisman() {
+        let root = std::env::temp_dir().join(format!("fulu_app_skill_{}", std::process::id()));
+        let skill_dir = root.join("demo");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        let text = "name: demo\nversion: 1.0\n\n原始技能内容\n";
+        std::fs::write(&path, text).unwrap();
+        let digest = fulu_script::digest_hex(text.as_bytes());
+
+        let mut session = AltarSession::new();
+        session.set_skill_roots(vec![root.clone()]);
+        let mut fu = Talisman::sample();
+        fu.skill_refs = vec![format!("sha256:{digest}")];
+        assert!(session.dry_run(&fu).is_ok(), "摘要匹配时应正常成符");
+
+        std::fs::write(&path, "name: demo\nversion: 2.0\n\n被偷偷改过的技能\n").unwrap();
+        let error = session.dry_run(&fu).unwrap_err().to_string();
+        assert!(
+            error.contains("符胆") || error.contains("技能包"),
+            "{error}"
+        );
+        assert!(
+            session
+                .audit()
+                .events()
+                .iter()
+                .any(|event| event.kind == EventKind::Broken),
+            "失配必须留下破符事件"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn malformed_skill_refs_are_rejected() {
+        let mut session = AltarSession::new();
+        session.set_skill_roots(vec![std::env::temp_dir().join("fulu_no_such_skills")]);
+        let mut fu = Talisman::sample();
+        fu.skill_refs = vec!["skill:demo".into()];
+        assert!(session.dry_run(&fu).is_err(), "非内容寻址引用必须破符");
+        fu.skill_refs = vec!["sha256:not-a-digest".into()];
+        assert!(session.dry_run(&fu).is_err(), "假摘要必须破符");
     }
 }

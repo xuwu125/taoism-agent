@@ -30,7 +30,7 @@ fulu-tools = { path = "crates/fulu-tools", version = "0.1.0" }
 fulu-skills = { path = "crates/fulu-skills", version = "0.1.0" }
 fulu-audit = { path = "crates/fulu-audit", version = "0.1.0" }
 fulu-app = { path = "crates/fulu-app", version = "0.1.0" }
-# v0.3 能力面增量（占位，M2.5 落地）
+# v0.3 能力面增量（M2.5 落地；M3.2 起会话头/提示词/符胆均已接入焚符循环）
 fulu-mcp = { path = "crates/fulu-mcp", version = "0.1.0" }
 fulu-context = { path = "crates/fulu-context", version = "0.1.0" }
 fulu-prompt = { path = "crates/fulu-prompt", version = "0.1.0" }

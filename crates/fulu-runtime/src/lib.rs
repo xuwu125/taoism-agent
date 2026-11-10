@@ -13,7 +13,9 @@ pub mod ritual;
 
 pub use converge::{Convergence, Criterion, evaluate, parse};
 pub use gate::{AllowUpTo, ConfirmRequest, ConfirmVerdict, Confirmer, DenyAll};
-pub use ritual::{Altar, DryRunPlan, Receipt, RitualConfig, RitualError, build_tools_json};
+pub use ritual::{
+    Altar, DryRunPlan, Receipt, RitualConfig, RitualError, SkillVerifier, build_tools_json,
+};
 
 /// 里程碑标识，供自检与文档生成使用。
 pub const MILESTONE: &str = "M2";

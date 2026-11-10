@@ -1,6 +1,6 @@
 [package]
 name = "fulu-ui"
-description = "符箓台：egui/eframe 原生自绘 GUI（M0：中文 IME 探针空窗口）"
+description = "符箓台：egui/eframe 原生自绘 GUI（三栏法坛 + 逐次敕门 + 内嵌中文字体）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
