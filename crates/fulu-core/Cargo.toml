@@ -1,0 +1,12 @@
+[package]
+name = "fulu-core"
+description = "符层：符文数据模型、结构校验与状态机定义（零 I/O）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

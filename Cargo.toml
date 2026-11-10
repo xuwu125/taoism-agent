@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/xuwu125/taoism-agent"
+rust-version = "1.99"
+
+[workspace.dependencies]
+# 外部依赖：M0 刻意保持极小，只保留清单解析、摘要校验与原生 GUI。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+
+# 内部 crate：依赖方向严格单向，见 docs/02 第 5 节。
+fulu-core = { path = "crates/fulu-core" }
+fulu-script = { path = "crates/fulu-script" }
+fulu-register = { path = "crates/fulu-register" }
+fulu-provider = { path = "crates/fulu-provider" }
+fulu-model = { path = "crates/fulu-model" }
+fulu-runtime = { path = "crates/fulu-runtime" }
+fulu-orchestrator = { path = "crates/fulu-orchestrator" }
+fulu-tools = { path = "crates/fulu-tools" }
+fulu-skills = { path = "crates/fulu-skills" }
+fulu-audit = { path = "crates/fulu-audit" }
+fulu-app = { path = "crates/fulu-app" }
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

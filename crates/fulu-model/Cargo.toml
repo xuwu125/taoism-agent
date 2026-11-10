@@ -1,0 +1,13 @@
+[package]
+name = "fulu-model"
+description = "内置 2B 级 LFM 模型清单、SHA256 校验、离线导入与缓存路径"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+fulu-core.workspace = true

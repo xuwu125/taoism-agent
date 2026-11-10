@@ -1,0 +1,9 @@
+[package]
+name = "fulu-audit"
+description = "缴符：append-only 事件日志、脱敏、回放与导出（M0 占位骨架）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

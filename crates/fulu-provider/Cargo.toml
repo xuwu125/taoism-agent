@@ -1,0 +1,11 @@
+[package]
+name = "fulu-provider"
+description = "模型供应商抽象：统一 trait、能力协商、本地 LFM provider 接口"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+fulu-core.workspace = true

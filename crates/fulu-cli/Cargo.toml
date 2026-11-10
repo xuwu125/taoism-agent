@@ -1,0 +1,15 @@
+[package]
+name = "fulu-cli"
+description = "无头 CLI：doctor、模型清单/校验/离线导入、符文检查"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fulu"
+path = "src/main.rs"
+
+[dependencies]
+fulu-app.workspace = true
+fulu-model.workspace = true

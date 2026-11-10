@@ -1,0 +1,9 @@
+[package]
+name = "fulu-tools"
+description = "风火轮：工具 trait、最小权限执行、路径与域名白名单（M0 占位骨架）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

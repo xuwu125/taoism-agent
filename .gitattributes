@@ -1,0 +1,9 @@
+# 保证三平台换行一致，避免 rustfmt --check 与符印快照出现平台差异
+* text=auto eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.py text eol=lf

@@ -1,0 +1,9 @@
+[package]
+name = "fulu-register"
+description = "箓层：箓牒、系统凭据库、工具注册表、权限与配额核验（M0 占位骨架）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,13 @@
+[package]
+name = "fulu-script"
+description = "篆层：canonical 序列化、符印哈希、.fu 编解码（M0 用 JSON 过渡）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+fulu-core.workspace = true

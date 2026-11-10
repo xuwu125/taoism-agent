@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "updated": "2026-11-10",
+  "policy": {
+    "weights_in_git": false,
+    "license_isolation": "repo code is MIT; model weights are LFM Open License v1.0 and are never re-licensed as MIT",
+    "engine": "llama-server (OpenAI-compatible HTTP)",
+    "bind": "127.0.0.1",
+    "default_context_tokens": 8192,
+    "fetch_requires_explicit_command": true,
+    "note": "M0 只落清单与校验链路；权重本轮未下载、未打包。精确字节数与 SHA256 在首次 fetch / Release 固化后回填，未登记时校验结果一律标记为 unverified，绝不伪称通过。"
+  },
+  "entries": [
+    {
+      "slot": "default",
+      "model_id": "lfm3-1.7b-q4km",
+      "repo": "LiquidAI/LFM3-1.7B-GGUF",
+      "file": "LFM3-1.7B-Q4_K_M.gguf",
+      "source_url": "https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-Q4_K_M.gguf",
+      "license": "LFM Open License v1.0",
+      "license_spdx": "lfm1.0",
+      "license_url": "https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/raw/main/LICENSE",
+      "quant": "Q4_K_M",
+      "params": "1.73B",
+      "context_tokens": 262144,
+      "default_context_tokens": 8192,
+      "arch": "lfm3",
+      "approx_size": "1.1 GB",
+      "bytes": null,
+      "sha256": null,
+      "min_runtime": "llama.cpp >= b11960 (v0.8.0)",
+      "sampling": {
+        "temperature_milli": 100,
+        "top_k": 50,
+        "repeat_penalty_milli": 1100
+      },
+      "runnable": true,
+      "is_default": true,
+      "notes": "2026-10-27 发布，官方归类 2B 级；三混合架构，专为本地 agent 与工具调用后训练；支持中文。"
+    },
+    {
+      "slot": "lowmem",
+      "model_id": "lfm3-1.7b-qad-q4_0",
+      "repo": "LiquidAI/LFM3-1.7B-GGUF",
+      "file": "LFM3-1.7B-QAD-Q4_0.gguf",
+      "source_url": "https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-QAD-Q4_0.gguf",
+      "license": "LFM Open License v1.0",
+      "license_spdx": "lfm1.0",
+      "license_url": "https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/raw/main/LICENSE",
+      "quant": "Q4_0 (QAD)",
+      "params": "1.73B",
+      "context_tokens": 262144,
+      "default_context_tokens": 8192,
+      "arch": "lfm3",
+      "approx_size": "1.05 GB",
+      "bytes": null,
+      "sha256": null,
+      "min_runtime": "llama.cpp >= b11960 (v0.8.0)",
+      "sampling": {
+        "temperature_milli": 100,
+        "top_k": 50,
+        "repeat_penalty_milli": 1100
+      },
+      "runnable": true,
+      "is_default": false,
+      "notes": "量化感知蒸馏 (QAD) 检查点，适合 <=4GB 内存设备；不是普通 Q4_0 后量化。"
+    },
+    {
+      "slot": "fallback",
+      "model_id": "lfm2-2.6b-q4km",
+      "repo": "LiquidAI/LFM2-2.6B-GGUF",
+      "file": "LFM2-2.6B-Q4_K_M.gguf",
+      "source_url": "https://huggingface.co/LiquidAI/LFM2-2.6B-GGUF/resolve/main/LFM2-2.6B-Q4_K_M.gguf",
+      "license": "LFM Open License v1.0",
+      "license_spdx": "lfm1.0",
+      "license_url": "https://huggingface.co/LiquidAI/LFM2-2.6B-GGUF/raw/main/LICENSE",
+      "quant": "Q4_K_M",
+      "params": "2.569B",
+      "context_tokens": 32768,
+      "default_context_tokens": 8192,
+      "arch": "lfm2",
+      "approx_size": "1.56 GB",
+      "bytes": null,
+      "sha256": null,
+      "min_runtime": "llama.cpp with lfm2 support; candle quantized-lfm2 example",
+      "sampling": {
+        "temperature_milli": 300,
+        "top_k": 0,
+        "repeat_penalty_milli": 1050
+      },
+      "runnable": true,
+      "is_default": false,
+      "notes": "生态最成熟的备选：llama.cpp 与纯 Rust candle 均可跑；切换默认只需把本条 is_default 置 true 并把 default 置 false。"
+    },
+    {
+      "slot": "finetune_base",
+      "model_id": "lfm3-1.7b-base",
+      "repo": "LiquidAI/LFM3-1.7B-Base",
+      "file": "model.safetensors",
+      "source_url": "https://huggingface.co/LiquidAI/LFM3-1.7B-Base/resolve/main/model.safetensors",
+      "license": "LFM Open License v1.0",
+      "license_spdx": "lfm1.0",
+      "license_url": "https://huggingface.co/LiquidAI/LFM3-1.7B-Base/raw/main/LICENSE",
+      "quant": "BF16",
+      "params": "1.73B",
+      "context_tokens": 262144,
+      "default_context_tokens": 8192,
+      "arch": "lfm3",
+      "approx_size": "3.46 GB",
+      "bytes": null,
+      "sha256": null,
+      "min_runtime": "not applicable",
+      "sampling": {
+        "temperature_milli": 0,
+        "top_k": 0,
+        "repeat_penalty_milli": 0
+      },
+      "runnable": false,
+      "is_default": false,
+      "notes": "纯预训练底座：只有 BF16 safetensors、无 GGUF、无指令跟随能力，仅供自行微调，禁止作为内置推理模型。"
+    }
+  ]
+}

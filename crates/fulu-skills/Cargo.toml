@@ -1,0 +1,9 @@
+[package]
+name = "fulu-skills"
+description = "符胆：技能包版本化、sha256 内容寻址与导入导出（M0 占位骨架）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,125 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      include_model:
+        description: "额外打包离线模型 bundle（约 1.1 GB；须先履行 lfm1.0 分发义务）"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # M0/M4 之间：先产出轻量二进制包（不含权重）+ SHA256SUMS。
+  # 安装包（MSI / DMG / AppImage / DEB）与签名在 M4 接入，见 docs/02 第 8.2 节。
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: macos-13, target: x86_64-apple-darwin }
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GUI system deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p fulu-ui -p fulu-cli
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release"
+          OUT="taoism-agent-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$OUT"
+          cp "$BIN/fulu" "$BIN/fulu-ui" "$OUT/"
+          cp LICENSE THIRD_PARTY_NOTICES.md models/manifest.json models/README.md "$OUT/"
+          tar -czf "$OUT.tar.gz" "$OUT"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release"
+          $out = "taoism-agent-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "$bin/fulu.exe", "$bin/fulu-ui.exe", "LICENSE", "THIRD_PARTY_NOTICES.md", "models/manifest.json", "models/README.md" -Destination $out
+          Compress-Archive -Path "$out/*" -DestinationPath "$out.zip"
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="taoism-agent-${{ github.ref_name }}-${{ matrix.target }}"
+          for file in "$NAME.tar.gz" "$NAME.zip"; do
+            if [ -f "$file" ]; then sha256sum "$file" >> "SHA256SUMS-${{ matrix.target }}.txt"; fi
+          done
+          cat "SHA256SUMS-${{ matrix.target }}.txt"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            taoism-agent-*.tar.gz
+            taoism-agent-*.zip
+            SHA256SUMS-*.txt
+          fail_on_unmatched_files: false
+
+  # 离线 bundle 默认不跑：会下载约 1.1 GB 权重，且使我们成为 lfm1.0 的分发者。
+  # 触发前必须确认：随包附 LICENSE 全文 + THIRD_PARTY_NOTICES.md + 保留全部署名。
+  model-bundle:
+    if: github.event_name == 'workflow_dispatch' && inputs.include_model == true
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download default weights (opt-in)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import json; d=json.load(open("models/manifest.json", encoding="utf-8")); e=next(x for x in d["entries"] if x["is_default"]); print(e["file"], e["source_url"], e["license_url"])' > model_info.txt
+          read -r FILE URL LICENSE_URL < model_info.txt
+          curl -L --fail --retry 3 -o "$FILE" "$URL"
+          sha256sum "$FILE" | tee "$FILE.sha256"
+          mkdir -p bundle
+          cp "$FILE" "$FILE.sha256" models/manifest.json models/README.md THIRD_PARTY_NOTICES.md bundle/
+          curl -L --fail -o bundle/LICENSE-LFM "$LICENSE_URL"
+          echo "注意：分发 bundle 时必须在 Release 说明中标注权重不是 MIT、仍受 lfm1.0 约束。"
+
+      - name: Assemble offline bundle
+        shell: bash
+        run: |
+          tar -cf "taoism-agent-model-bundle-${{ github.ref_name }}.tar" bundle
+          sha256sum "taoism-agent-model-bundle-${{ github.ref_name }}.tar" > "taoism-agent-model-bundle-${{ github.ref_name }}.tar.sha256"
+
+      - name: Attach bundle to release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            "taoism-agent-model-bundle-${{ github.ref_name }}.tar" \
+            "taoism-agent-model-bundle-${{ github.ref_name }}.tar.sha256" --clobber

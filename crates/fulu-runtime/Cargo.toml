@@ -1,0 +1,9 @@
+[package]
+name = "fulu-runtime"
+description = "法坛：tokio 调度、Harness 强制、沙箱边界、事件产生（M0 占位骨架）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,9 @@
+[package]
+name = "fulu-orchestrator"
+description = "太极：多 agent 编排、DAG、模型路由与回执汇总（M0 占位骨架）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

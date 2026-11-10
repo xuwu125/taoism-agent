@@ -1,0 +1,15 @@
+[package]
+name = "fulu-ui"
+description = "符箓台：egui/eframe 原生自绘 GUI（M0：中文 IME 探针空窗口）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fulu-ui"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+fulu-app.workspace = true
