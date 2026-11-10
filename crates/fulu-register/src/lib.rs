@@ -354,6 +354,11 @@ impl Register {
         self.grants.get(id)
     }
 
+    /// 已登记的工具名（字典序），供展示与测试。
+    pub fn tool_ids(&self) -> Vec<String> {
+        self.grants.keys().cloned().collect()
+    }
+
     /// 盖印前的「授箓核验」。不通过即驳回，绝不带着越权进入法坛。
     pub fn authorize(&self, fu: &Talisman) -> Result<Authorization, RegisterError> {
         let problems = fu.validate();

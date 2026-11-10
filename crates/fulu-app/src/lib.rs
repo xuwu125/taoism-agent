@@ -15,6 +15,12 @@ use fulu_provider::{Health, LocalLfmProvider};
 use fulu_register::{Register, ToolGrant};
 use fulu_skills::{default_roots, digest_matches, discover_global};
 
+mod summon;
+pub use summon::{
+    DispatchRecord, MAX_DISPATCH_DEPTH, SUB_MAX_STEPS, SUB_MAX_TIMEOUT_SECS,
+    SUMMON_PARAMETERS_JSON, SUMMON_TOOL_ID, SummonConfig, SummonTool,
+};
+
 /// 太极符图对外暴露：CLI 只依赖门面，不直接构造编排器对象。
 pub use fulu_orchestrator::{
     GraphError, GraphNode, NodeReceipt, NodeResult, NodeStatus, OrchestrationReceipt, TaijiGraph,
@@ -375,7 +381,7 @@ fn read_locked_layer(path: &Path) -> Option<String> {
     Some(text)
 }
 
-fn truncate_chars(text: &str, limit: usize) -> String {
+pub(crate) fn truncate_chars(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_owned();
     }
@@ -412,6 +418,8 @@ pub struct AltarSession {
     context_logged: bool,
     /// 符胆校验器（只读扫描全局技能目录）。
     skills: GlobalSkillVerifier,
+    /// 召将子符工具（T10）；`None` = 未启用分派。
+    summon: Option<Arc<SummonTool>>,
 }
 
 impl Default for AltarSession {
@@ -447,6 +455,7 @@ impl AltarSession {
             base_layers: None,
             context_logged: false,
             skills: GlobalSkillVerifier::from_defaults(),
+            summon: None,
         }
     }
 
@@ -509,6 +518,38 @@ impl AltarSession {
     /// 自定义符胆扫描根目录（测试与自定义部署用；只读）。
     pub fn set_skill_roots(&mut self, roots: Vec<PathBuf>) {
         self.skills = GlobalSkillVerifier { roots };
+    }
+
+    /// 当前会话可用的工具名（含外宗与召将；供 GUI 展示与测试）。
+    pub fn tool_ids(&self) -> Vec<String> {
+        self.register.tool_ids()
+    }
+
+    /// 启用召将子符（T10）：把 `summon.fu` 挂进风火轮与箓。
+    ///
+    /// 授权：受限级（符须 `sandbox: limited`）、风险 `Mutate`（每符确认一次）、配额 4 次。
+    /// **须在设好端点之后调用**：子符使用启用时的端点快照。
+    /// 子符的全部安全边界见 `summon.rs` 模块文档。
+    pub fn enable_summoning(&mut self) {
+        let tool = Arc::new(SummonTool::new(SummonConfig {
+            endpoint: self.provider.endpoint.clone(),
+            child_depth: 1,
+            workspace: self.workspace.clone(),
+        }));
+        self.tools.register(tool.clone() as Arc<dyn Tool>);
+        let mut grant = ToolGrant::limited(
+            SUMMON_TOOL_ID,
+            "分派一张子符在独立法坛上焚化（minimal 档、独立预算、禁环回、\n不继承父符高危授权）",
+        )
+        .with_risk(RiskClass::Mutate)
+        .with_parameters_json(SUMMON_PARAMETERS_JSON);
+        grant.max_calls = 4;
+        self.register.grant_tool(grant);
+        self.summon = Some(tool);
+    }
+
+    pub fn summoning_enabled(&self) -> bool {
+        self.summon.is_some()
     }
 
     /// 会话头摘要（供 CLI/GUI 展示；未采集时返回 None）。
@@ -845,6 +886,12 @@ impl AltarSession {
                 }
             }
         }
+        // T10：启用召将子符时，确认页必须能看见子符的影响面与边界。
+        if self.summoning_enabled() {
+            plan.notes.push(format!(
+                "召将子符：summon.fu 已启用（minimal 档、独立预算、步数上限 {SUB_MAX_STEPS}、禁环回、不继承父符高危授权；每次分派需敕可，配额 4 次）"
+            ));
+        }
         self.log_session_context(&plan.seal)?;
         Ok(plan)
     }
@@ -858,7 +905,20 @@ impl AltarSession {
     ) -> Result<Receipt, AppError> {
         let assembled = self.ensure_prompt(fu);
         let mut altar = self.altar(fu, &assembled);
-        Ok(altar.ignite(fu, plan, confirmed)?)
+        let result = altar.ignite(fu, plan, confirmed);
+        // T10：无论成败，把分派经过与子符回执摘要落进父符缴符事件链。
+        // 主链完整性已由法坛保证；此处尽力而为，不让记账失败掩盖焚化结果。
+        if let Some(tool) = &self.summon {
+            for record in tool.take_dispatch_log() {
+                let _ = self.audit.append(
+                    &plan.seal,
+                    TalismanState::Igniting,
+                    EventKind::ToolResult,
+                    &format!("召将子符：{}", record.line()),
+                );
+            }
+        }
+        Ok(result?)
     }
 
     /// 太极：按符图的拓扑序串行焚化一组符（T09）。
@@ -1122,6 +1182,42 @@ mod tests {
         assert!(!receipt.converged);
         assert!(parse_taiji_graph("{").is_err(), "坏 JSON 必须明确报错");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T10：召将子符的登记必须落在正确档位，且影响面进 dry-run 计划。
+    #[test]
+    fn summoning_registration_is_limited_mutate_with_quota() {
+        let mut session = AltarSession::new();
+        session.enable_summoning();
+        assert!(session.summoning_enabled());
+        assert!(session.tool_ids().iter().any(|id| id == SUMMON_TOOL_ID));
+        let grant = session
+            .register
+            .tool(SUMMON_TOOL_ID)
+            .expect("启用后箓里必须有 summon.fu");
+        assert_eq!(
+            grant.permission,
+            fulu_register::Permission::Limited,
+            "召将子符是受限级工具：只读符不得申请"
+        );
+        assert_eq!(grant.risk, RiskClass::Mutate, "分派子符每符确认一次");
+        assert_eq!(grant.max_calls, 4, "分派配额必须有上限");
+        let plan = session.dry_run(&Talisman::sample()).unwrap();
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("summon.fu") && note.contains("禁环回")),
+            "确认页必须看见子符影响面：{:?}",
+            plan.notes
+        );
+        // 只读符申请召将必须在箓层被双向核验驳回（子符不继承、父符也不能越权申请）。
+        let mut strict = Talisman::sample();
+        strict.tool_refs = vec![SUMMON_TOOL_ID.into()];
+        strict.harness.allow_tools = vec![SUMMON_TOOL_ID.into()];
+        assert!(matches!(
+            session.register.authorize(&strict),
+            Err(fulu_register::RegisterError::PermissionTooLow { .. })
+        ));
     }
 
     #[test]

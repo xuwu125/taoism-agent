@@ -346,6 +346,8 @@ struct AltarOptions {
     context_ip: bool,
     /// T01：完全关闭会话头
     no_context: bool,
+    /// T10：启用召将子符（summon.fu，minimal 档、禁环回）
+    summon: bool,
 }
 
 fn parse_altar_options(args: &[String]) -> AltarOptions {
@@ -386,6 +388,7 @@ fn parse_altar_options(args: &[String]) -> AltarOptions {
                 }
             }
             "--ask" => options.ask = true,
+            "--summon" => options.summon = true,
             "--context-ip" => options.context_ip = true,
             "--no-context" => options.no_context = true,
             "--prompt-mode" => {
@@ -572,6 +575,14 @@ fn altar(args: &[String]) -> i32 {
     // 确认门：默认一律敕否。--allow-risk 预授权到某等级，--ask 逐次问人。
     if options.ask || options.allow_risk.is_some() {
         session.set_confirmer(Box::new(CliGate::terminal(options.ask, options.allow_risk)));
+    }
+    // T10：召将子符必须在端点与工作区都定下之后启用（子符用启用时的端点快照）。
+    // 分派本身是 Mutate 级召将：默认敕否，需 --allow-risk mutate 或 --ask 点头。
+    if options.summon {
+        session.enable_summoning();
+        println!(
+            "[OK] 召将子符已启用：summon.fu（minimal 档、独立预算、步数上限 8、禁环回、不继承父符高危授权；分派需敕可）"
+        );
     }
     if let Some(explicit) = &options.mcp {
         // 外宗接入发生在 dry-run 之前：工具面必须出现在待焚计划里，
