@@ -64,6 +64,9 @@ jobs:
           if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
           "$PY" --version
           "$PY" .github/scripts/check_model_manifest.py
+          # T24：合规声明生成器 —— 清单校验 + 单测全绿（--require-bundle 当前预期失败，不在 CI 断言）
+          "$PY" .github/scripts/gen_compliance_notes.py --check
+          "$PY" -m unittest discover -s .github/scripts/tests -v
           # 验收用的本地 mock 不是产品代码，但语法必须过——不能等到验收当天才发现跑不起来
           "$PY" -m py_compile tools/mock-llama.py
 

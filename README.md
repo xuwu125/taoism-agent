@@ -273,6 +273,7 @@ crates/fulu-prompt          篆心：分层系统提示词装配器（快照测�
 | T32 性能实测（2026-11-11） | Windows 10 / GTX 1050 Ti 实测基线：单符校验 **0.019 ms**、release 出窗 **44 ms**（debug 269 ms）、CLI 峰值内存 **8.39 MB**、GUI 空闲 **97.6 MB**（private 125.1 MB，98 s 不增长）、release 二进制 CLI 1.06 MB + GUI 11.64 MB（zstd 6.65 MB）。**GUI 的「≤ 80 MB」目标不成立**——该数字是无 GUI 口径，已按 CLI ≤ 12 MB / GUI ≤ 130 MB 拆两档；首帧绘制时间与安装包体积**未测**（详见 docs/02 第 35 节） |
 | RetryPolicy 接网络（2026-11-11） | 从纯函数摆设变为真实退避循环：`RateLimited`（429）/`ServerError`（5xx）可分类重试，**流式只在零增量时重试**（listener 计数证明首增量后绝不重连）；重试计数进缴符 `Invoked` 事件（`重试=N`）、`Receipt.retries_total` 与 CLI/GUI 回执，`--retry N`（0=关闭）。5 条真实 TCP 测试 + 1 条缴符记账测试。**未验**真实 `llama-server` 的 429/5xx（仍缺权重）（详见 docs/02 第 36 节） |
 | 太极编排视图（2026-11-11） | 符箓台顶栏「太极」→ 底部面板：载入符图即校验（环/未知依赖红字原文）、层视图展示、勾确认后逐节点串行焚化（跳过带理由、预算耗尽不伪装收敛）、后台线程不阻塞。**无中止按钮且面板写明原因**。示例 `examples/taiji-demo.json`，CLI mock 实测「gather-a→gather-b→report，收敛 是」。**未验**面板真人点击（docs/04 WIN-16）（详见 docs/02 第 37 节） |
+| T24 分发合规自动化（2026-11-11） | 合规从注释变成会拒绝执行的闸门：`gen_compliance_notes.py` 四模式（缺字段拒 / `--require-bundle` 对 null sha256 拒 / 防权重误标 MIT / 输出确定性）；release.yml 三处接线（Compliance gate、锚点幂等写回 Release 说明、model-bundle 下载前 sha256 硬闸门），原 echo 已删。**当前清单 sha256 为 null → bundle 分发被硬拒绝**（正确行为）。**未验** Actions 实跑（详见 docs/02 第 38 节） |
 
 ## 里程碑
 

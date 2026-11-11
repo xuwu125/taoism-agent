@@ -268,6 +268,26 @@ jobs:
             --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple "$DMG"
 
+      # ---------------- T24：模型 bundle 分发合规 ----------------
+
+      # 先 --check 硬校验清单（失败即拒绝发布），再生成随 dist/* 一起上传的合规声明。
+      # TARGETS 列表必须与上方 build 矩阵保持一致：各矩阵腿生成的文件字节相同，
+      # 不会因同名资产互相覆盖产生内容漂移。
+      - name: Compliance gate (T24)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
+          TARGETS="x86_64-pc-windows-msvc,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu"
+          TAG_ARG=""
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then TAG_ARG="--tag $GITHUB_REF_NAME"; fi
+          if ! "$PY" .github/scripts/gen_compliance_notes.py --check; then
+            echo "::error::T24 合规闸门：模型清单未通过合规检查，拒绝发布"
+            exit 1
+          fi
+          "$PY" .github/scripts/gen_compliance_notes.py $TAG_ARG --targets "$TARGETS" \
+            --out dist/COMPLIANCE-NOTES.md
+
       - name: Checksums
         shell: bash
         run: |
@@ -295,6 +315,57 @@ jobs:
             SHA256SUMS-*.txt
           fail_on_unmatched_files: false
           generate_release_notes: true
+
+  # T24：把自动生成的合规段拼进 Release 说明。
+  # 幂等：用固定锚点 <!-- fulu:compliance:begin/end --> 先删旧段再拼新段，重复跑不会重复。
+  compliance-notes:
+    name: Release notes compliance section (T24)
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate compliance notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGETS="x86_64-pc-windows-msvc,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu"
+          TAG_ARG=""
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then TAG_ARG="--tag $GITHUB_REF_NAME"; fi
+          python3 .github/scripts/gen_compliance_notes.py $TAG_ARG --targets "$TARGETS" \
+            --out dist/COMPLIANCE-NOTES.md
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            echo "非 tag 发布，仅生成产物，不写回 Release 说明"
+          fi
+
+      - name: Splice compliance section into release notes
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          gh release view "$TAG" --json body -q .body > body.md
+          python3 - <<'PY'
+          from pathlib import Path
+          BEGIN = "<!-- fulu:compliance:begin -->"
+          END = "<!-- fulu:compliance:end -->"
+          base = Path("body.md").read_text(encoding="utf-8")
+          notes = Path("dist/COMPLIANCE-NOTES.md").read_text(encoding="utf-8").strip()
+          # 幂等：先移除旧合规段（含锚点），再统一拼一次。
+          b = base.find(BEGIN)
+          if b != -1:
+              e = base.find(END)
+              if e == -1:
+                  raise SystemExit(
+                      "发现 begin 锚点但缺少 end 锚点，Release 说明疑似被手工破坏，拒绝写回"
+                  )
+              base = (base[:b] + base[e + len(END):]).rstrip() + "\n"
+          merged = base.rstrip() + "\n\n" + BEGIN + "\n\n" + notes + "\n\n" + END + "\n"
+          Path("body.md").write_text(merged, encoding="utf-8", newline="\n")
+          PY
+          gh release edit "$TAG" --notes-file body.md
 
   # T28：SBOM（CycloneDX）。单独 job，避免污染构建矩阵时间。
   sbom:
@@ -329,24 +400,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # T24：下载前就硬拒绝——清单未固化 sha256 时不许先下 1.1 GB 再失败。
+      - name: Require fixed sha256 before any download (T24)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("models/manifest.json", encoding="utf-8"))
+          defaults = [x for x in d["entries"] if x.get("is_default")]
+          if len(defaults) != 1:
+              print("::error::T24 合规闸门：清单默认条目必须恰好一个，拒绝分发", file=sys.stderr)
+              sys.exit(1)
+          sha = defaults[0].get("sha256")
+          if not isinstance(sha, str) or len(sha) != 64 or not all(c in "0123456789abcdef" for c in sha):
+              print("::error::拒绝分发：清单未固化 sha256，无法校验将随包分发的权重（T20–T25 未完成）", file=sys.stderr)
+              sys.exit(1)
+          open("expected_sha256.txt", "w", encoding="utf-8").write(sha + "\n")
+          print(f"[OK] 清单已固化默认权重 sha256：{sha}")
+          PY
+
       - name: Download default weights (opt-in)
         shell: bash
         run: |
           set -euo pipefail
           python3 -c 'import json; d=json.load(open("models/manifest.json", encoding="utf-8")); e=next(x for x in d["entries"] if x["is_default"]); print(e["file"], e["source_url"], e["license_url"])' > model_info.txt
           read -r FILE URL LICENSE_URL < model_info.txt
+          EXPECTED_SHA256="$(cat expected_sha256.txt)"
           curl -L --fail --retry 3 -o "$FILE" "$URL"
+          # T24：与清单固化的 sha256 逐字节比对，不一致即失败，绝不发出去。
+          echo "$EXPECTED_SHA256  $FILE" | sha256sum -c -
           sha256sum "$FILE" | tee "$FILE.sha256"
           mkdir -p bundle
           cp "$FILE" "$FILE.sha256" models/manifest.json models/README.md THIRD_PARTY_NOTICES.md bundle/
           curl -L --fail -o bundle/LICENSE-LFM "$LICENSE_URL"
-          echo "注意：分发 bundle 时必须在 Release 说明中标注权重不是 MIT、仍受 lfm1.0 约束。"
+          # T24：随包合规声明由脚本生成并校验（--require-bundle 在 sha256 未固化时退出 1），
+          # 取代原先的纯 echo 合规提示。
+          python3 .github/scripts/gen_compliance_notes.py --require-bundle \
+            --tag "${{ github.ref_name }}" --out bundle/COMPLIANCE-NOTES.md
 
       - name: Assemble offline bundle
         shell: bash
         run: |
           tar -cf "taoism-agent-model-bundle-${{ github.ref_name }}.tar" bundle
           sha256sum "taoism-agent-model-bundle-${{ github.ref_name }}.tar" > "taoism-agent-model-bundle-${{ github.ref_name }}.tar.sha256"
+
+      # T24：上传前最后一道硬闸门（与生成步骤同一判定口径）。
+      - name: Final bundle compliance gate (T24)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/gen_compliance_notes.py --require-bundle --check
+          echo "[OK] bundle 合规硬闸门通过"
 
       - name: Attach bundle to release
         if: github.ref_type == 'tag'

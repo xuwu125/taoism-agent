@@ -29,6 +29,10 @@
 
 > **合规提示**：这不是技术验证能豁免的法务项。商业化前请复核年营收门槛与下游使用条款；不适用时更换模型或取得商业授权。
 
+### 2.1 Release 说明合规段（自动生成，T24）
+
+Release 说明末尾的「发布合规声明」段由 `.github/scripts/gen_compliance_notes.py` 依据 `models/manifest.json` 自动生成并拼接（锚点 `<!-- fulu:compliance:begin -->` 与 `<!-- fulu:compliance:end -->` 之间），人工修改会在下次发布被覆盖；如需调整措辞，请改脚本或本文件，不要手改 Release 说明。当前默认权重的 `sha256` 仍是 **UNVERIFIED（未固化）**，因此脚本在 `--require-bundle` 模式下硬拒绝 bundle 分发（退出码 1），`release.yml` 的 `model-bundle` job 也在下载权重前先行失败——校验值回填之前，本项目不随包分发权重。
+
 ## 3. Rust 依赖
 
 | 组件 | 许可 | 用途 |

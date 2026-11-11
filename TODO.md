@@ -67,7 +67,7 @@
 - [ ] **T21 HTTPS 公网下载链路** — 证据：`cli/main.rs:221-248` 闸门桩；`provider/src/http.rs` 不支持 HTTPS；`models/README.md:21`、`docs/02:561`。做法：引入 TLS 依赖（白名单唯一例外）、断点续传、落到 `models/cache/`、下载后校验再放行；放行条件全部保留。阻塞：用户批准 + T20 的校验值来源。
 - [ ] **T22 `llama-server` 进程生命周期管理** — 证据：`docs/02:562`「由用户手动完成，尚未进 Rust」；`provider/src/local.rs:26,62`。做法：按需拉起（仅回环端口）、健康检查、闲置退出、异常清理（Drop/超时）；**不静默启动**，须显式命令或明确配置。阻塞：本机需有 `llama-server` 二进制。
 - [ ] **T23 真机端到端验收** — 证据：`docs/02:817,822` 敕门卡片真人端到端待权重；`README.md:7`。做法：真模型 + 真 MCP + GUI 逐次弹窗完整跑一遍；记录模型效果**不承诺**。依赖 T20–T22。
-- [ ] **T24 模型 bundle 分发合规** — 证据：`release.yml:96-115` 默认不跑，且「必须在 Release 说明中标注 lfm1.0」只是 echo；`THIRD_PARTY_NOTICES.md:28`。做法：自动生成合规 Release 说明段（附许可全文、NOTICE、署名、明确非 MIT），未满足则拒绝上传。依赖用户批准 + 法务复核。
+- [x] **T24 模型 bundle 分发合规**（2026-11-11，`docs/02` 第 38 节）：`gen_compliance_notes.py` 四模式闸门（缺字段拒、`--require-bundle` 对 null sha256 拒、防「权重误标 MIT」）、8 条 unittest 进 CI；release.yml 三处接线（build Compliance gate、compliance-notes 锚点幂等写回、model-bundle 下载前 sha256 硬闸门 + 下载后比对 + 上传前再闸），原 echo 已删。**当前清单 sha256 为 null → bundle 被硬拒绝，这正是未固化校验值时的正确行为**。**未验**：Actions 实跑与 gh 写回（本机无 gh）
 - [ ] **T25 内嵌推理后端评估** — 证据：`docs/02:316` 提到 `llama-cpp-2` / `candle::quantized_lfm2` 但无选型方案。做法：出对比结论（构建复杂度 / C++ 依赖 / 许可 / 内存），不进默认依赖。
 
 # S5 · M4 发布流水线与合规
@@ -156,6 +156,7 @@ T27（签名 Secrets）/ T20（1.1GB 下载）= 外部阻塞项；T37 已于 202
 | S2 | T13 收尾：GUI 中止按钮 + 「取消」独立错误变体（取消不再显示成炸炉；取消时缴符不许出现 `ToolResult`） | 完成 / 按钮真人点击未验 | 2026-11-11 |
 | S2 | RetryPolicy 接网络：`RateLimited`/`ServerError` 变体、退避循环、流式零增量才重试、计数进缴符事件（重试=N）与回执 | 完成 | 2026-11-11 |
 | S2 | T36 太极编排视图：`taiji.rs` 纯逻辑分层 + 底部面板 + 逐节点进度（`run_taiji_with_progress`）+ 示例符图；无中止如实标注 | 完成 / WIN-16 未测 | 2026-11-11 |
+| S5 | T24 合规自动化：生成器四模式闸门 + 8 条 unittest + release.yml 三处接线（echo 已删，bundle 无 sha256 即拒） | 完成 / Actions 实跑未验 | 2026-11-11 |
 | — | 基线：358 测试零失败 / clippy 零告警 / fmt 全绿 | 完成 | 2026-11-11 |
 | — | 基线：343 测试零失败 / clippy 零告警 / fmt 全绿 | 完成 | 2026-11-11 |
 | — | T32 性能预算实测：单符校验 0.019 ms / 出窗 44 ms(release) / CLI 峰值 8.4 MB / GUI 空闲 97.6 MB / 发布二进制 12.7 MB；GUI 的 80 MB 目标按实测改为 130 MB | 完成 | 2026-11-11 |
