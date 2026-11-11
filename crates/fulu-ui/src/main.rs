@@ -12,6 +12,7 @@
 
 mod confirm;
 mod fonts;
+mod paper;
 
 use confirm::ConfirmExchange;
 use eframe::egui;
@@ -89,6 +90,28 @@ struct FuluApp {
     vault_note: String,
     vault_lines: Vec<String>,
     vault_issues: Vec<String>,
+
+    // ---- T36 符纸视图 ----
+    /// 当前选中的符纸条带（点击符纸上的热区即选中）。
+    paper_pick: Option<paper::Band>,
+    /// 字段表单里要高亮/聚焦的那一项（由符纸热区点击触发，用完即清）。
+    form_focus: Option<FormFocus>,
+    /// 字段表单是否展开（符纸热区点击时会自动展开）。
+    form_open: bool,
+    /// 焚符成功那一刻的时刻，用于「火光」衰减动效（纯视觉，不承载逻辑）。
+    fire_at: Option<std::time::Instant>,
+}
+
+/// 字段表单里可被符纸热区定位的输入项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormFocus {
+    Name,
+    Model,
+    Sandbox,
+    Steps,
+    Budget,
+    Goal,
+    Criteria,
 }
 
 impl FuluApp {
@@ -155,6 +178,10 @@ impl FuluApp {
             vault_note: String::new(),
             vault_lines: Vec::new(),
             vault_issues: Vec::new(),
+            paper_pick: None,
+            form_focus: None,
+            form_open: false,
+            fire_at: None,
         };
         app.refresh_files();
         app.reload_models();
@@ -331,6 +358,8 @@ impl FuluApp {
                         self.receipt = Some(receipt);
                         self.plan = None;
                         self.confirm_checked = false;
+                        // T36 火光：只在此刻点一次，纯视觉，不参与任何判定。
+                        self.fire_at = Some(std::time::Instant::now());
                     }
                     Err(error) => {
                         self.say(format!("炸炉：{error}"), Tone::Bad);
@@ -920,6 +949,8 @@ impl FuluApp {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("法坛");
             ui.label("符文正文（YAML / .fu）。改了正文就要重新盖印——符印只认当下的字。");
+            self.paper_view(ui, ctx);
+            ui.separator();
             let mut changed = false;
             egui::ScrollArea::vertical()
                 .id_salt("fu_editor")
@@ -1037,11 +1068,319 @@ impl FuluApp {
         });
     }
 
+    /// T36：符纸视图。
+    ///
+    /// 全部用 `egui::Painter` 画矢量，**不用 HTML/CSS/WebView**（`docs/02` 第 7 节的
+    /// 视觉约定），版式数字全部来自 `paper::plan`（背后是 `fulu-script` 的云篆描述）。
+    /// 这里只做三件事：把归一化版式乘成像素、把热区做成可点、把「未成符 / 截断 /
+    /// 已盖印 / 火光」如实画出来——**不画任何能让人误会成「已完成」的东西**。
+    fn paper_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // 解不出符就不画：宁可空白，也不拿半张符冒充符纸。
+        let fu = match fulu_app::parse_fu(&self.fu_text) {
+            Ok(fu) => fu,
+            Err(error) => {
+                ui.label(
+                    egui::RichText::new(format!("符纸视图：正文当前不能解析（{error}）"))
+                        .small()
+                        .weak(),
+                );
+                return;
+            }
+        };
+        let script = fulu_script::describe_cloud(&fu);
+        let layout = paper::plan(&fu, &script);
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("符纸视图 · 九段热区（点击选段，去字段表单改）")
+                    .small()
+                    .weak(),
+            );
+            if layout.truncated {
+                ui.label(
+                    egui::RichText::new("正文超出版式，符胆末行已省略")
+                        .small()
+                        .color(egui::Color32::from_rgb(0xB4, 0x5F, 0x06)),
+                );
+            }
+        });
+
+        let missing = layout.missing();
+        if !missing.is_empty() {
+            let names: Vec<&str> = missing.iter().map(|band| band.label()).collect();
+            ui.label(
+                egui::RichText::new(format!("未成符：{}（灰底虚线）", names.join("、")))
+                    .small()
+                    .color(egui::Color32::from_rgb(0x8A, 0x8A, 0x8A)),
+            );
+        }
+
+        // 纸面尺寸：3:5 竖长方，装进可用区域（缩放在 `paper::fit` 里，有单测）。
+        let (paper_w, paper_h) =
+            paper::fit(layout.aspect, ui.available_width(), ui.available_height());
+        ui.horizontal_top(|ui| {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(paper_w, paper_h), egui::Sense::click());
+            let painter = ui.painter_at(rect);
+
+            // 金纸底 + 朱砂细边。
+            painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(0xF3, 0xE7, 0xC8));
+            painter.rect_stroke(
+                rect,
+                4.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(0xB9, 0x8A, 0x4E)),
+                egui::StrokeKind::Inside,
+            );
+
+            let hover_y = response
+                .hover_pos()
+                .map(|pos| ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0));
+            let hovered_zone = hover_y.and_then(|y| layout.band_at(y));
+            let hovered = hovered_zone.map(|zone| zone.band);
+
+            for zone in &layout.zones {
+                let top = rect.top() + zone.start * rect.height();
+                let bottom = rect.top() + zone.end * rect.height();
+                let band_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), top),
+                    egui::pos2(rect.right(), bottom),
+                );
+                let selected = self.paper_pick == Some(zone.band);
+                if selected {
+                    painter.rect_filled(
+                        band_rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(0xC0, 0x39, 0x2B, 26),
+                    );
+                } else if hovered == Some(zone.band) {
+                    painter.rect_filled(
+                        band_rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 10),
+                    );
+                }
+                if !zone.filled {
+                    // 缺部件：灰底 + 顶部虚线，明确「这里还没写」。
+                    painter.rect_filled(band_rect, 0.0, egui::Color32::from_rgb(0xE4, 0xDF, 0xD2));
+                    let mut x = band_rect.left() + 2.0;
+                    while x < band_rect.right() - 2.0 {
+                        painter.line_segment(
+                            [
+                                egui::pos2(x, band_rect.top() + 1.0),
+                                egui::pos2((x + 4.0).min(band_rect.right()), band_rect.top() + 1.0),
+                            ],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x9A, 0x93, 0x84)),
+                        );
+                        x += 7.0;
+                    }
+                }
+                // 段名：竖排太窄，横排小字压在左上角，不抢正文。
+                painter.text(
+                    egui::pos2(band_rect.left() + 4.0, band_rect.top() + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    zone.band.label(),
+                    egui::FontId::proportional(9.0),
+                    egui::Color32::from_rgb(0x8A, 0x6A, 0x3B),
+                );
+
+                // 内容：从段名下方起画，行高按段高与行数取小，绝不让字溢出条带。
+                let text_left = band_rect.left() + 4.0;
+                let text_top = band_rect.top() + 12.0;
+                let avail_h = (band_rect.height() - 12.0).max(0.0);
+                let rows = zone.lines.len().max(1) as f32;
+                let line_h = (avail_h / rows).clamp(7.0, 13.0);
+                if zone.lines.is_empty() || zone.lines.iter().all(|line| line.trim().is_empty()) {
+                    painter.text(
+                        egui::pos2(text_left, text_top),
+                        egui::Align2::LEFT_TOP,
+                        if zone.filled {
+                            "（空）"
+                        } else {
+                            "未成符"
+                        },
+                        egui::FontId::proportional(9.0),
+                        egui::Color32::from_rgb(0x9A, 0x93, 0x84),
+                    );
+                } else {
+                    for (index, line) in zone.lines.iter().enumerate() {
+                        let y = text_top + index as f32 * line_h;
+                        if y + line_h > band_rect.bottom() {
+                            break;
+                        }
+                        painter.text(
+                            egui::pos2(text_left, y),
+                            egui::Align2::LEFT_TOP,
+                            line,
+                            egui::FontId::proportional(9.5),
+                            egui::Color32::from_rgb(0x2B, 0x24, 0x1B),
+                        );
+                    }
+                }
+            }
+
+            // 盖印：只有校验过（`self.seal` 有值）才盖，朱砂方印压在符脚右下。
+            if let Some(seal) = &self.seal {
+                let side = (paper_w * 0.22).clamp(22.0, 40.0);
+                let stamp = egui::Rect::from_min_size(
+                    egui::pos2(rect.right() - side - 6.0, rect.bottom() - side - 6.0),
+                    egui::vec2(side, side),
+                );
+                painter.rect_stroke(
+                    stamp,
+                    2.0,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(0xC0, 0x39, 0x2B)),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    stamp.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &seal[..8.min(seal.len())],
+                    egui::FontId::proportional(8.0),
+                    egui::Color32::from_rgb(0xC0, 0x39, 0x2B),
+                );
+            }
+
+            // 火光：焚符成功后 0.9 秒内从符心向外淡出的暖光。纯视觉，不影响任何状态。
+            if let Some(start) = self.fire_at {
+                let elapsed = start.elapsed().as_secs_f32();
+                if elapsed >= 0.9 {
+                    self.fire_at = None;
+                } else {
+                    let t = 1.0 - elapsed / 0.9;
+                    let radius = paper_w * (0.25 + 0.55 * (1.0 - t));
+                    for ring in 0..3 {
+                        let alpha = ((t * 70.0) as u8).saturating_sub(ring * 18);
+                        if alpha == 0 {
+                            continue;
+                        }
+                        painter.circle_filled(
+                            rect.center(),
+                            radius * (1.0 - ring as f32 * 0.22),
+                            egui::Color32::from_rgba_unmultiplied(0xE0, 0x6A, 0x1B, alpha),
+                        );
+                    }
+                    ctx.request_repaint();
+                }
+            }
+
+            // 热区交互：点击选中该段，并把字段表单展开到对应输入项。
+            if response.clicked()
+                && let Some(band) = hovered
+            {
+                self.paper_pick = Some(band);
+                self.form_focus = match band {
+                    paper::Band::Head => Some(FormFocus::Name),
+                    paper::Band::Deity => Some(FormFocus::Model),
+                    paper::Band::Harness => Some(FormFocus::Sandbox),
+                    paper::Band::Foot => Some(FormFocus::Goal),
+                    _ => None,
+                };
+                if self.form.is_none()
+                    && let Ok(fu) = fulu_app::parse_fu(&self.fu_text)
+                {
+                    self.form = Some(fu);
+                }
+                self.form_open = self.form.is_some();
+                let hint = match band {
+                    paper::Band::Head
+                    | paper::Band::Deity
+                    | paper::Band::Harness
+                    | paper::Band::Foot => "已跳到字段表单对应项".to_owned(),
+                    other => format!(
+                        "该段字段：{}（请在正文或表单里改，改完必须重新盖印）",
+                        other.fields()
+                    ),
+                };
+                self.say(format!("选中 {}：{hint}", band.label()), Tone::Info);
+            }
+            if let Some(zone) = hovered_zone {
+                response.clone().on_hover_text(format!(
+                    "{}（{}）\n字段：{}\n状态：{}",
+                    zone.band.label(),
+                    if zone.filled { "已成" } else { "未成符" },
+                    zone.band.fields(),
+                    if zone.filled { "已填" } else { "留空" }
+                ));
+            }
+
+            // 右侧：选中段的字段清单 + 云篆笔画基元（抽象几何，非书法字形）。
+            ui.vertical(|ui| {
+                if let Some(band) = self.paper_pick {
+                    ui.label(egui::RichText::new(format!("选中：{}", band.label())).strong());
+                    ui.label(egui::RichText::new(band.fields()).small().monospace());
+                } else {
+                    ui.label(
+                        egui::RichText::new("点左侧任一符纸条带，看它对应哪些字段。")
+                            .small()
+                            .weak(),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("云篆笔画基元（归一化折线，T39 数据源）")
+                        .small()
+                        .weak(),
+                );
+                let cell = 26.0;
+                let (strip, _) = ui.allocate_exact_size(
+                    egui::vec2(cell * script.strokes.len() as f32 + 4.0, cell),
+                    egui::Sense::hover(),
+                );
+                let strip_painter = ui.painter_at(strip);
+                for (index, stroke) in script.strokes.iter().enumerate() {
+                    let origin = egui::pos2(strip.left() + index as f32 * cell + 2.0, strip.top());
+                    let box_rect = egui::Rect::from_min_size(origin, egui::vec2(cell - 4.0, cell));
+                    strip_painter.rect_stroke(
+                        box_rect,
+                        2.0,
+                        egui::Stroke::new(0.5, egui::Color32::from_rgb(0xB9, 0x8A, 0x4E)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let points: Vec<egui::Pos2> = stroke
+                        .points
+                        .iter()
+                        .map(|(x, y)| {
+                            egui::pos2(
+                                box_rect.left() + (*x as f32 / 1000.0) * box_rect.width(),
+                                box_rect.top() + (*y as f32 / 1000.0) * box_rect.height(),
+                            )
+                        })
+                        .collect();
+                    if points.len() >= 2 {
+                        strip_painter.add(egui::Shape::line(
+                            points,
+                            egui::Stroke::new(1.2, egui::Color32::from_rgb(0x2B, 0x24, 0x1B)),
+                        ));
+                    }
+                    strip_painter.text(
+                        egui::pos2(box_rect.center().x, box_rect.bottom() + 1.0),
+                        egui::Align2::CENTER_TOP,
+                        stroke.name,
+                        egui::FontId::proportional(8.0),
+                        egui::Color32::from_rgb(0x8A, 0x6A, 0x3B),
+                    );
+                }
+            });
+        });
+    }
+
     /// T33：保存 .fu + 字段表单 + 语法辅助。
     fn save_and_form(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("符文保存与字段表单（T33）")
-            .default_open(false)
-            .show(ui, |ui| {
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id("fu_save_form_header"),
+            false,
+        );
+        // 符纸热区点击会把 `form_open` 置 true：这里同步展开，别让人点了没反应。
+        if self.form_open {
+            self.form_open = false;
+            state.set_open(true);
+        }
+        state
+            .show_header(ui, |ui| {
+                ui.label("符文保存与字段表单（T33）");
+            })
+            .body(|ui| {
                 ui.horizontal(|ui| {
                     ui.label("文件名");
                     ui.add(
@@ -1095,17 +1434,23 @@ impl FuluApp {
                     ui.separator();
                     let slots = self.model_ids.clone();
                     let mut apply = false;
+                    // 符纸热区点击要求「定位到某一项」：把标记摘出来，用完写回（None 即已消费）。
+                    let mut focus = self.form_focus.take();
                     if let Some(form) = self.form.as_mut() {
                         egui::Grid::new("fu_form")
                             .num_columns(2)
                             .spacing([12.0, 6.0])
                             .show(ui, |ui| {
                                 ui.label("符名");
-                                ui.text_edit_singleline(&mut form.name);
+                                let response = ui.text_edit_singleline(&mut form.name);
+                                if focus == Some(FormFocus::Name) {
+                                    response.request_focus();
+                                    focus = None;
+                                }
                                 ui.end_row();
 
                                 ui.label("请神（model_id）");
-                                egui::ComboBox::from_id_salt("model_id_pick")
+                                let response = egui::ComboBox::from_id_salt("model_id_pick")
                                     .selected_text(form.deity.model_id.clone())
                                     .show_ui(ui, |ui| {
                                         for id in &slots {
@@ -1116,10 +1461,14 @@ impl FuluApp {
                                             );
                                         }
                                     });
+                                if focus == Some(FormFocus::Model) {
+                                    response.response.request_focus();
+                                    focus = None;
+                                }
                                 ui.end_row();
 
                                 ui.label("沙箱");
-                                egui::ComboBox::from_id_salt("sandbox_pick")
+                                let response = egui::ComboBox::from_id_salt("sandbox_pick")
                                     .selected_text(format!("{:?}", form.harness.sandbox))
                                     .show_ui(ui, |ui| {
                                         for level in [
@@ -1134,34 +1483,56 @@ impl FuluApp {
                                             );
                                         }
                                     });
+                                if focus == Some(FormFocus::Sandbox) {
+                                    response.response.request_focus();
+                                    focus = None;
+                                }
                                 ui.end_row();
 
                                 ui.label("步数上限");
-                                ui.add(
+                                let response = ui.add(
                                     egui::DragValue::new(&mut form.harness.max_steps)
                                         .range(1..=64),
                                 );
+                                if focus == Some(FormFocus::Steps) {
+                                    response.request_focus();
+                                    focus = None;
+                                }
                                 ui.end_row();
 
                                 ui.label("token 预算");
-                                ui.add(
+                                let response = ui.add(
                                     egui::DragValue::new(&mut form.harness.budget_tokens)
                                         .range(256..=200_000),
                                 );
+                                if focus == Some(FormFocus::Budget) {
+                                    response.request_focus();
+                                    focus = None;
+                                }
                                 ui.end_row();
 
                                 ui.label("目标描述");
-                                ui.text_edit_multiline(&mut form.goal.description);
+                                let response = ui.text_edit_multiline(&mut form.goal.description);
+                                if focus == Some(FormFocus::Goal) {
+                                    response.request_focus();
+                                    focus = None;
+                                }
                                 ui.end_row();
 
                                 ui.label("完成判据");
-                                ui.text_edit_multiline(&mut form.goal.success_criteria);
+                                let response =
+                                    ui.text_edit_multiline(&mut form.goal.success_criteria);
+                                if focus == Some(FormFocus::Criteria) {
+                                    response.request_focus();
+                                    focus = None;
+                                }
                                 ui.end_row();
                             });
                         if ui.button("应用表单 → 重写正文").clicked() {
                             apply = true;
                         }
                     }
+                    self.form_focus = focus;
                     if apply {
                         self.apply_form();
                     }

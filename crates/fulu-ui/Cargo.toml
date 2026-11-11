@@ -13,4 +13,6 @@ path = "src/main.rs"
 [dependencies]
 eframe.workspace = true
 fulu-app.workspace = true
+# 符纸版式（云篆描述层）由 fulu-script 提供：GUI 只消费数据，不自己发明排版。
+fulu-script.workspace = true
 fulu-vault.workspace = true
