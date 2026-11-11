@@ -172,7 +172,7 @@ impl FuluApp {
             .flatten()
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "fu"))
+            .filter(|path| is_ruin_file(path))
             .collect();
         self.fu_files.sort();
     }
@@ -826,7 +826,10 @@ impl FuluApp {
                     self.say("已载入内置示例符", Tone::Info);
                 }
                 ui.separator();
-                ui.label(format!("工作区共 {} 张 .fu", self.fu_files.len()));
+                ui.label(format!(
+                    "工作区共 {} 个符文文件（.fu / .dsl / .fub）",
+                    self.fu_files.len()
+                ));
                 if ui.button("重新扫描").clicked() {
                     self.refresh_files();
                 }
@@ -837,14 +840,28 @@ impl FuluApp {
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
                         if ui.selectable_label(false, name).clicked() {
-                            match std::fs::read_to_string(&path) {
-                                Ok(text) => {
-                                    self.fu_text = text;
-                                    self.invalidate();
-                                    self.say(format!("已载入 {}", path.display()), Tone::Info);
-                                }
+                            // 与 CLI 同一个门面：`.fub` / 中文 DSL 都能开；
+                            // 打开后一律转成**规范 JSON 文本**进编辑器（编辑器只认文本）。
+                            match fulu_app::load_fu_file(&path) {
+                                Ok((fu, form)) => match fulu_app::dump_fu(&fu) {
+                                    Ok(text) => {
+                                        self.fu_text = text;
+                                        self.invalidate();
+                                        self.say(
+                                            format!(
+                                                "已载入 {}（{}，已转为规范文本；原文件不会被改写）",
+                                                path.display(),
+                                                form.label()
+                                            ),
+                                            Tone::Info,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        self.say(format!("转换失败：{error}"), Tone::Bad);
+                                    }
+                                },
                                 Err(error) => {
-                                    self.say(format!("读取失败：{error}"), Tone::Bad);
+                                    self.say(format!("破符：{error}"), Tone::Bad);
                                 }
                             }
                         }
@@ -1399,4 +1416,30 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+/// 工作区扫描的判据：只看扩展名，三种符文形态都算。
+///
+/// 真正的形态识别在 `fulu_app::load_fu_file`（按内容，不靠扩展名）；这里仅决定
+/// 「要不要列出来」——扩展名写错的文件仍可手动打开，不会因为扫描漏掉就消失。
+fn is_ruin_file(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "fu" | "dsl" | "fub"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ruin_file;
+    use std::path::Path;
+
+    #[test]
+    fn workspace_scan_lists_all_three_forms_but_not_junk() {
+        for name in ["a.fu", "b.dsl", "c.fub"] {
+            assert!(is_ruin_file(Path::new(name)), "{name} 应被列出");
+        }
+        for name in ["a.fu.bak", "notes.txt", "no_ext", "a.FU"] {
+            assert!(!is_ruin_file(Path::new(name)), "{name} 不应被列出");
+        }
+    }
 }

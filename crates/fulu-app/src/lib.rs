@@ -267,10 +267,56 @@ pub fn parse_fu(text: &str) -> Result<Talisman, AppError> {
 }
 
 /// 从 `.fu` 文件加载；解析阶段即做结构校验，破符绝不进入法坛。
+/// 符文的三种物理形态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuForm {
+    /// `.fu`：人可读 JSON（权威形态，符印基于它）
+    Json,
+    /// 中文 DSL：与 JSON 等价的另一种语法
+    Dsl,
+    /// `.fub`：紧凑二进制信封（自带符印）
+    Fub,
+}
+
+impl FuForm {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Json => "JSON",
+            Self::Dsl => "中文 DSL",
+            Self::Fub => "二进制 .fub",
+        }
+    }
+}
+
+/// 从文件加载符文：**按内容识别**三种形态，不靠扩展名（扩展名会骗人）。
+///
+/// 识别顺序：`.fub` magic → 首个非空白字符是否为 `{`（JSON）→ 否则当中文 DSL。
+/// 三条路径最终都要过结构校验，破符即返回错误，绝不返回半成品。
+pub fn load_fu_file(path: &Path) -> Result<(Talisman, FuForm), AppError> {
+    let bytes =
+        std::fs::read(path).map_err(|e| AppError::Io(format!("{}：{e}", path.display())))?;
+    if bytes.starts_with(&fulu_script::FUB_MAGIC) {
+        let fu = fulu_script::decode_fub(&bytes).map_err(|e| AppError::Script(e.to_string()))?;
+        return Ok((fu, FuForm::Fub));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| AppError::Script("既不是 .fub 二进制，也不是 UTF-8 文本".into()))?;
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    if trimmed.starts_with('{') {
+        let fu = decode_fu(&text).map_err(|e| AppError::Script(e.to_string()))?;
+        Ok((fu, FuForm::Json))
+    } else {
+        let fu = fulu_script::decode_dsl(&text).map_err(|e| AppError::Script(e.to_string()))?;
+        Ok((fu, FuForm::Dsl))
+    }
+}
+
+/// 从 `.fu` 文件加载（JSON 形态的快捷方式）。
+///
+/// 自 T39 起它**也接受**中文 DSL 与 `.fub`：同一个入口，三种形态，免得
+/// 「CLI 能烧 DSL、GUI 只认 JSON」这种分叉出现。
 pub fn load_fu(path: &Path) -> Result<Talisman, AppError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| AppError::Io(format!("{}：{e}", path.display())))?;
-    decode_fu(&text).map_err(|e| AppError::Script(e.to_string()))
+    load_fu_file(path).map(|(fu, _)| fu)
 }
 
 /// 解析太极符图 JSON（纯文本，不读磁盘）。
@@ -2012,5 +2058,49 @@ mod tests {
             Err(AppError::Vault(detail)) => assert!(detail.contains("不合法")),
             other => panic!("畸形引用必须被拒，实际：{other:?}"),
         }
+    }
+
+    #[test]
+    fn load_fu_file_accepts_all_three_forms_and_reports_which() {
+        let dir = std::env::temp_dir().join(format!("fulu-app-t39-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let fu = Talisman::sample();
+
+        let json_path = dir.join("a.fu");
+        std::fs::write(&json_path, encode_fu(&fu).expect("编码")).expect("写 JSON");
+        let (loaded, form) = load_fu_file(&json_path).expect("读 JSON");
+        assert_eq!(form, FuForm::Json);
+        assert_eq!(loaded, fu);
+
+        let dsl_path = dir.join("b.dsl");
+        std::fs::write(&dsl_path, fulu_script::encode_dsl(&fu)).expect("写 DSL");
+        let (loaded, form) = load_fu_file(&dsl_path).expect("读 DSL");
+        assert_eq!(form, FuForm::Dsl);
+        assert_eq!(loaded, fu);
+
+        let fub_path = dir.join("c.fub");
+        std::fs::write(&fub_path, fulu_script::encode_fub(&fu, true).expect("打包"))
+            .expect("写 fub");
+        let (loaded, form) = load_fu_file(&fub_path).expect("读 fub");
+        assert_eq!(form, FuForm::Fub);
+        assert_eq!(loaded, fu);
+
+        // 老入口 `load_fu` 也应当认这三种（CLI 的 altar run 直接受益）
+        assert_eq!(load_fu(&dsl_path).expect("读 DSL"), fu);
+        assert_eq!(load_fu(&fub_path).expect("读 fub"), fu);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_fu_file_rejects_garbage_instead_of_guessing() {
+        let dir = std::env::temp_dir().join(format!("fulu-app-t39-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let bad = dir.join("bad.fu");
+        std::fs::write(&bad, "这不是符，也不是 DSL\n").expect("写坏文件");
+        assert!(load_fu_file(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

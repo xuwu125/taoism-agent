@@ -1,6 +1,6 @@
 # 变更日志
 
-本项目采用「里程碑 + 补记」双轨：架构文档 `docs/02` 第 13–25 节记录设计决策与验证，本文件只记可交付的版本变化。
+本项目采用「里程碑 + 补记」双轨：架构文档 `docs/02` 第 13–27 节记录设计决策与验证，本文件只记可交付的版本变化。
 
 ## v0.3.1（2026-11-11，进行中）
 
@@ -16,6 +16,7 @@
 - **决策与设计文档**：新增 `docs/03-决策记录与增量设计.md`——T41 七条待确认事项逐条定案、T13 provider/SSE/能力协商设计稿、T19 威胁模型、T16 风险评估。
 - **M4 发布流水线（T26–T31）**：Windows MSI（WiX 3，perUser）、macOS DMG（Fulu.app + hdiutil）、Linux DEB 与 AppImage（best-effort）；签名有凭据才签、缺凭据写 `UNSIGNED-<target>.txt` 并告警；新增 SBOM（CycloneDX）与 `cargo audit` job；CI 补 Intel macOS 与 ARM64 Linux（CLI build-only）；清单闸门在 CI 内不再允许静默跳过，且 `source_url` 走域名白名单。安装包步骤待 CI 实跑验证（本机无 WiX/hdiutil/dpkg）。
 - **箓牒凭据库（T40，新增 crate `fulu-vault`）**：`credential_ref` 从「白名单字符串」变成真正可取密钥的引用。系统凭据库走委托路线（Windows `PasswordVault` / macOS `security` / Linux `secret-tool`，**不链接平台 SDK、不引入 `unsafe`**），文件级加密兜底用 RustCrypto（ChaCha20-Poly1305 + PBKDF2-HMAC-SHA256 600k，AAD 绑定引用名，密钥 `zeroize`、`Debug` 打码）。「库里有这条引用」= 已受箓；`dry_run` 闸门顺序为破符 → 凭据 → 授箓，`ignite` **未确认前不碰凭据库**，取不到凭据即拒绝执行。CLI 新增 `fulu vault backend|list|put|get [--reveal]|rm`（`put` 只吃 stdin），本地 provider 支持 `--api-key` 式 Bearer。真机验证：`.cred` 与主目录全目录 `grep` 明文 0 命中；macOS/Linux 两条系统后端分支未在真机执行。
+- **符文三形态：中文 DSL / `.fub` / 复文 / 云篆（T39）**：`fulu-script` 从「只有 JSON」扩成四块。中文 DSL（18 个必填键、分组行纯装饰、`符心`/`符事` 多行块）**只是语法不是语义**，符印仍由规范 JSON 算；`.fub` 二进制信封（magic `FUB\x01` + 版本 + 标志 + 32 字节符印 + varint 长度 + 符名）解码时**重算符印再比对**，严格模式拒绝尾部多余字节、未知版本、字典版本不符；复文用 24 条固定句式字典（最长优先、`0x01` 转义、带版本号）；云篆只产出 `CloudLayout` 版式与 6 种笔画基元，**不含一行绘制代码**。新增 `fulu fu dsl|pack|unpack|info` 与 `fulu convert --to dsl|json|fub`；形态识别按内容（magic / 首字符）不靠扩展名，统一入口 `fulu_app::load_fu_file`；`fu verify|seal` 与 GUI 工作区扫描同步改为接受三形态（`.fub` 载入后转规范文本，原文件不回写）。真机验证：同一张符三形态 `fu seal` 输出完全一致，`.fub` 改一字即破符。
 - **符箓台完善（S6 / T33–T35）**：新增存符（`.fu` 先 `parse_fu` 再 `dump_fu`，同名需显式允许覆盖，UI 明示「规范格式重写会丢注释与字段顺序」）、字段表单（改字段即 `invalidate()` 破符）、模型与法坛面板（清单逐档展示，`digest_pinned=false` 标 `UNVERIFIED`；新开法坛保留端点；缴符回放 + 关键字筛选）、只读设置面板（提示词档位 / IP 开关 / 会话头 / 七层预览 / 符胆 / 技能 / 风险覆盖表）。门面新增 `dump_fu`、`manifest_slots`、`skills_listing`、`risk_overrides_listing`、`AltarSession::replay_audit`，GUI 不直接拼业务逻辑、不写全局配置。GUI 交互无自动化测试，布局与手感待真人验证。
 
 ## v0.3.0（2026-11-11）

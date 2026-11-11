@@ -104,7 +104,7 @@ flowchart TB
 ## 快速开始
 
 ```bash
-cargo test --workspace                       # 208 个测试（含真实 HTTP 端到端、真实 MCP 子进程、外宗进仪轨循环、敕门、太极编排、召将子符、fs.write、问天、moli 真机无头浏览器）
+cargo test --workspace                       # 311 个测试（含真实 HTTP 端到端、真实 MCP 子进程、外宗进仪轨循环、敕门、太极编排、召将子符、fs.write、问天、moli 真机无头浏览器、符文三形态往返）
 cargo run -p fulu-cli -- doctor              # 环境体检（不联网、不启动推理）
 cargo run -p fulu-cli -- context show        # 会话头：硬件 + IP 所在地（粗粒度，--no-ip 可关）
 cargo run -p fulu-cli -- prompt show         # 分层提示词装配预览
@@ -115,7 +115,13 @@ cargo run -p fulu-cli -- skills list         # 符胆：全局技能包只读展
 cargo run -p fulu-cli -- init                # 引符：开箱基础配置 + 生成第一张示例符
 cargo run -p fulu-cli -- model list          # 查看内置模型槽位与权重状态
 cargo run -p fulu-cli -- fu sample > sample.fu
-cargo run -p fulu-cli -- fu verify sample.fu # 校验符文并打印符印
+cargo run -p fulu-cli -- fu verify sample.fu # 校验符文并打印符印（JSON / 中文 DSL / .fub 均可）
+cargo run -p fulu-cli -- fu dsl sample.fu    # 同一张符的中文 DSL（只是语法，符印不变）
+cargo run -p fulu-cli -- fu pack sample.fu -o sample.fub   # 复文折叠打包，如实报两种体积
+cargo run -p fulu-cli -- fu info sample.fub  # 只读文件头（不解正文，故不校验）
+cargo run -p fulu-cli -- fu seal sample.fub  # 符印一律重算，三种形态输出同一串
+cargo run -p fulu-cli -- convert sample.fu --to fub -o sample.fub   # 任意形态互转
+cargo run -p fulu-cli -- vault list          # 箓牒：引用清单（只显示引用名，不含密钥）
 cargo run -p fulu-cli -- altar dry-run sample.fu   # 成符→盖印→待焚，零网络请求
 cargo run -p fulu-cli -- taiji run taiji-graph.json --confirm   # 太极：符图 DAG 编排焚符
 cargo run -p fulu-ui                         # 符箓台：符箓／法坛／缴符三栏（含 M0 中文 IME 探针）

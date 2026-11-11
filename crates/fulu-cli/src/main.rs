@@ -30,6 +30,7 @@ fn run(args: &[String]) -> i32 {
         },
         Some("mcp") => mcp(&args[1..]),
         Some("skills") => skills(&args[1..]),
+        Some("convert") => convert(&args[1..]),
         Some("vault") => vault(&args[1..]),
         Some("taiji") => taiji(&args[1..]),
         Some("init") => init(&args[1..]),
@@ -57,8 +58,13 @@ fn help() {
          \x20 fulu model serve                    探活本地 llama-server（不启动进程）\n\
          \x20 fulu model fetch --i-understand-license   网络下载闸门（本轮仍拒绝，见提示）\n\
          \x20 fulu fu sample                      输出示例符文 (.fu)\n\
-         \x20 fulu fu verify <文件>               校验符文并打印符印\n\
-         \x20 fulu fu seal <文件>                 只打印符印\n\
+        \x20 fulu fu verify <文件>               校验符文并打印符印（JSON / DSL / .fub 均可）\n\
+        \x20 fulu fu seal <文件>                 只打印符印（符印一律重算，不抄文件头）\n\
+         \x20 fulu fu dsl <文件.fu>                打印中文 DSL（与 JSON 等价，符印不变）\n\
+         \x20 fulu fu pack <文件.fu> -o <文件.fub> 打包为二进制符（复文折叠，报告体积）\n\
+         \x20 fulu fu unpack <文件.fub>            解出 JSON 并校验符印\n\
+         \x20 fulu fu info <文件.fub>              只读文件头（符名 / 符印 / 体积）\n\
+         \x20 fulu convert <输入> --to <dsl|json|fub> [-o 输出]  按内容或 magic 自动识别输入\n\
          \x20 fulu altar dry-run <文件.fu>        成符→盖印→待焚（零网络）\n\
          \x20 fulu altar run <文件.fu> --confirm 显式确认后焚化→回执→缴符\n\
          \x20 fulu context show [--no-ip]         会话头：硬件与 IP 所在地（粗粒度，全容错）\n\
@@ -763,12 +769,270 @@ fn altar(args: &[String]) -> i32 {
     0
 }
 
+/// 符文文件的三种形态。识别靠 magic 与首字符，不靠扩展名（扩展名可以骗人）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FuFormat {
+    Json,
+    Dsl,
+    Fub,
+}
+
+impl FuFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Json => "JSON",
+            Self::Dsl => "中文 DSL",
+            Self::Fub => "二进制 .fub",
+        }
+    }
+}
+
+impl From<fulu_app::FuForm> for FuFormat {
+    fn from(form: fulu_app::FuForm) -> Self {
+        match form {
+            fulu_app::FuForm::Json => Self::Json,
+            fulu_app::FuForm::Dsl => Self::Dsl,
+            fulu_app::FuForm::Fub => Self::Fub,
+        }
+    }
+}
+
+/// 形态识别统一走门面（`fulu-app`），CLI 不自己再写一套——否则迟早与 GUI 分叉。
+fn load_fu_any(path: &Path) -> Result<(fulu_app::Fu, FuFormat), String> {
+    fulu_app::load_fu_file(path)
+        .map(|(fu, form)| (fu, FuFormat::from(form)))
+        .map_err(|error| error.to_string())
+}
+
+fn write_or_print(path: Option<&Path>, bytes: &[u8], binary: bool) -> i32 {
+    match path {
+        Some(path) => match std::fs::write(path, bytes) {
+            Ok(()) => {
+                println!("[OK] 已写入 {}（{} 字节）", path.display(), bytes.len());
+                0
+            }
+            Err(error) => {
+                eprintln!("[ERR] 写入 {} 失败：{error}", path.display());
+                1
+            }
+        },
+        None if binary => {
+            eprintln!("[ERR] 二进制输出必须用 -o 指定文件，不往终端里灌二进制");
+            2
+        }
+        None => {
+            print!("{}", String::from_utf8_lossy(bytes));
+            0
+        }
+    }
+}
+
+fn fu_to_dsl(args: &[String]) -> i32 {
+    let Some(path) = args.first() else {
+        eprintln!("[ERR] 用法：fulu fu dsl <文件.fu>");
+        return 2;
+    };
+    let loaded = match load_fu_any(Path::new(path)) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("[ERR] 破符：{error}");
+            return 1;
+        }
+    };
+    eprintln!(
+        "[INFO] 输入形态：{}（DSL 只是语法，符印不变）",
+        loaded.1.label()
+    );
+    println!("{}", fulu_script::encode_dsl(&loaded.0));
+    0
+}
+
+fn fu_binary(command: &str, args: &[String]) -> i32 {
+    let Some(path) = args.first() else {
+        eprintln!("[ERR] 缺少文件路径");
+        return 2;
+    };
+    match command {
+        "pack" => {
+            let out = args
+                .iter()
+                .position(|arg| arg == "-o")
+                .and_then(|index| args.get(index + 1))
+                .map(PathBuf::from);
+            let Some(out) = out else {
+                eprintln!("[ERR] 用法：fulu fu pack <文件.fu> -o <文件.fub>");
+                return 2;
+            };
+            let (fu, format) = match load_fu_any(Path::new(path)) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    eprintln!("[ERR] 破符：{error}");
+                    return 1;
+                }
+            };
+            let plain = match fulu_script::encode_fub(&fu, false) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("[ERR] {error}");
+                    return 1;
+                }
+            };
+            let folded = match fulu_script::encode_fub(&fu, true) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("[ERR] {error}");
+                    return 1;
+                }
+            };
+            // 如实报告两种体积，选小的那个写盘；不吹「压缩比」。
+            let (chosen, note) = if folded.len() < plain.len() {
+                (&folded, "复文折叠")
+            } else {
+                (&plain, "未折叠（折叠没有收益）")
+            };
+            println!(
+                "[INFO] 输入 {}（{} 字节，{}）→ 未折叠 {} 字节 / 折叠 {} 字节",
+                path,
+                std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+                format.label(),
+                plain.len(),
+                folded.len()
+            );
+            println!("[INFO] 采用：{note}");
+            write_or_print(Some(&out), chosen, true)
+        }
+        "unpack" => {
+            let (fu, format) = match load_fu_any(Path::new(path)) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    eprintln!("[ERR] {error}");
+                    return 1;
+                }
+            };
+            if format != FuFormat::Fub {
+                eprintln!(
+                    "[WARN] {} 不是 .fub（识别为 {}），仍按 JSON 输出",
+                    path,
+                    format.label()
+                );
+            }
+            match fulu_script::encode_fu(&fu) {
+                Ok(text) => {
+                    println!("{text}");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("[ERR] {error}");
+                    1
+                }
+            }
+        }
+        "info" => {
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("[ERR] 读取失败：{error}");
+                    return 1;
+                }
+            };
+            match fulu_script::inspect_fub(&bytes) {
+                Ok(info) => {
+                    println!("[OK] {path}");
+                    println!("  符名     : {}", info.name);
+                    println!(
+                        "  符印     : sha256:{}（文件内记录，info 不校验）",
+                        info.seal
+                    );
+                    println!("  复文折叠 : {}", if info.folded { "是" } else { "否" });
+                    println!(
+                        "  文件体积 : {} 字节（正文 {} 字节）",
+                        bytes.len(),
+                        info.body_len
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("[ERR] {error}");
+                    1
+                }
+            }
+        }
+        other => {
+            eprintln!("[ERR] 未知子命令：{other}");
+            2
+        }
+    }
+}
+
+fn convert(args: &[String]) -> i32 {
+    let Some(path) = args.first() else {
+        eprintln!("[ERR] 用法：fulu convert <输入> --to <dsl|json|fub> [-o 输出]");
+        return 2;
+    };
+    let to = args
+        .iter()
+        .position(|arg| arg == "--to")
+        .and_then(|index| args.get(index + 1))
+        .map(String::as_str);
+    let Some(to) = to else {
+        eprintln!("[ERR] 必须显式给 --to <dsl|json|fub>（不做「猜一个」的默认）");
+        return 2;
+    };
+    let out = args
+        .iter()
+        .position(|arg| arg == "-o")
+        .and_then(|index| args.get(index + 1))
+        .map(PathBuf::from);
+
+    let (fu, format) = match load_fu_any(Path::new(path)) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("[ERR] 破符：{error}");
+            return 1;
+        }
+    };
+    eprintln!("[INFO] 输入 {path}（{}）", format.label());
+
+    match to {
+        "dsl" => {
+            let text = fulu_script::encode_dsl(&fu);
+            write_or_print(out.as_deref(), text.as_bytes(), false)
+        }
+        "json" => match fulu_script::encode_fu(&fu) {
+            Ok(text) => write_or_print(out.as_deref(), text.as_bytes(), false),
+            Err(error) => {
+                eprintln!("[ERR] {error}");
+                1
+            }
+        },
+        "fub" => {
+            let Some(out) = out else {
+                eprintln!("[ERR] .fub 输出必须用 -o 指定文件");
+                return 2;
+            };
+            match fulu_script::encode_fub(&fu, true) {
+                Ok(bytes) => write_or_print(Some(&out), &bytes, true),
+                Err(error) => {
+                    eprintln!("[ERR] {error}");
+                    1
+                }
+            }
+        }
+        other => {
+            eprintln!("[ERR] 未知目标格式：{other}（可用 dsl / json / fub）");
+            2
+        }
+    }
+}
+
 fn fu(args: &[String]) -> i32 {
     let Some(command) = args.first().map(String::as_str) else {
         help();
         return 2;
     };
     match command {
+        "dsl" => fu_to_dsl(&args[1..]),
+        "pack" | "unpack" | "info" => fu_binary(command, &args[1..]),
         "sample" => match fulu_app::sample_fu_text() {
             Ok(text) => {
                 println!("{text}");
@@ -784,29 +1048,35 @@ fn fu(args: &[String]) -> i32 {
                 eprintln!("[ERR] 缺少符文文件路径");
                 return 2;
             };
-            let text = match std::fs::read_to_string(path) {
-                Ok(text) => text,
+            // 三种形态都走同一个门面：`.fub` 的符印由解码时**重算**得出，
+            // 不是抄文件头里那 32 字节——文件头只用于比对，不用于取信。
+            let (fu, form) = match load_fu_any(Path::new(path)) {
+                Ok(pair) => pair,
                 Err(error) => {
-                    eprintln!("[ERR] 读取失败：{error}");
+                    eprintln!("[ERR] 破符：{error}");
                     return 1;
                 }
             };
-            match fulu_app::inspect_fu(&text) {
-                Ok(report) => {
-                    if command == "seal" {
-                        println!("{}", report.seal);
-                    } else {
-                        println!("[OK] 成符：{}", report.name);
-                        println!("  神明名号 : {}", report.model_id);
-                        println!("  符印     : sha256:{}", report.seal);
-                    }
-                    0
-                }
+            let seal = match fulu_script::seal_hex(&fu) {
+                Ok(seal) => seal,
                 Err(error) => {
                     eprintln!("[ERR] 破符：{error}");
-                    1
+                    return 1;
                 }
+            };
+            if command == "seal" {
+                // `seal` 只吐一行，供脚本管道使用；校验失败已在上面 exit 1。
+                println!("{seal}");
+                return 0;
             }
+            // 结构校验已在解码时完成：JSON / DSL / `.fub` 三条解码路径都调
+            // `Talisman::validate()`，破符会直接以错误返回，走不到这里。
+            // 所以能读到这一步，就是「解得出且成得了符」，印 OK 不算撒谎。
+            println!("[OK] 成符：{}", fu.name);
+            println!("  神明名号 : {}", fu.deity.model_id);
+            println!("  符印     : sha256:{seal}");
+            println!("  文件形态 : {}", form.label());
+            0
         }
         other => {
             eprintln!("[ERR] 未知 fu 子命令：{other}");
@@ -1974,5 +2244,74 @@ mod tests {
         // 直接调会读 stdin；这里只验证前置判断用的解析结果与拒绝条件一致。
         let reference = fulu_vault::CredentialRef::parse(&args[0]).expect("引用本身合法");
         assert!(reference.is_local());
+    }
+
+    #[test]
+    fn load_fu_any_detects_form_by_content_not_by_extension() {
+        let dir = std::env::temp_dir().join(format!("fulu-cli-t39-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+
+        let json = fulu_app::sample_fu_text().expect("示例符");
+        let fu = fulu_script::decode_fu(&json).expect("解析示例符");
+        let dsl = fulu_script::encode_dsl(&fu);
+        let fub = fulu_script::encode_fub(&fu, true).expect("打包");
+
+        // 故意用「错」的扩展名：识别只看内容。
+        let json_path = dir.join("a.txt");
+        let dsl_path = dir.join("b.bin");
+        let fub_path = dir.join("c.dat");
+        std::fs::write(&json_path, &json).expect("写 JSON");
+        std::fs::write(&dsl_path, &dsl).expect("写 DSL");
+        std::fs::write(&fub_path, &fub).expect("写 fub");
+
+        let (from_json, json_format) = load_fu_any(&json_path).expect("读 JSON");
+        let (from_dsl, dsl_format) = load_fu_any(&dsl_path).expect("读 DSL");
+        let (from_fub, fub_format) = load_fu_any(&fub_path).expect("读 fub");
+        assert_eq!(json_format, FuFormat::Json);
+        assert_eq!(dsl_format, FuFormat::Dsl);
+        assert_eq!(fub_format, FuFormat::Fub);
+        assert_eq!(from_json, fu);
+        assert_eq!(from_dsl, fu);
+        assert_eq!(from_fub, fu);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seal_is_identical_across_all_three_forms() {
+        // `fu seal` 现在三种形态都走 `load_fu_any` + 重算符印。
+        // 若哪天有人让 `.fub` 直接吐文件头里那 32 字节，这条会立刻变红。
+        let json = fulu_app::sample_fu_text().expect("示例符");
+        let fu = fulu_script::decode_fu(&json).expect("解析示例符");
+        let dsl = fulu_script::encode_dsl(&fu);
+        let fub = fulu_script::encode_fub(&fu, true).expect("打包");
+
+        let dir = std::env::temp_dir().join(format!("fulu-cli-t39-seal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let json_path = dir.join("a.fu");
+        let dsl_path = dir.join("a.dsl");
+        let fub_path = dir.join("a.fub");
+        std::fs::write(&json_path, &json).expect("写 JSON");
+        std::fs::write(&dsl_path, &dsl).expect("写 DSL");
+        std::fs::write(&fub_path, &fub).expect("写 fub");
+
+        let mut seals = Vec::new();
+        for path in [&json_path, &dsl_path, &fub_path] {
+            let (loaded, _) = load_fu_any(path).expect("读符文");
+            seals.push(fulu_script::seal_hex(&loaded).expect("符印"));
+        }
+        assert_eq!(seals[0], seals[1]);
+        assert_eq!(seals[1], seals[2]);
+        assert_eq!(seals[0].len(), 64);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binary_output_without_a_destination_is_refused() {
+        // 往终端里灌二进制是灾难：必须要求 -o。
+        assert_eq!(write_or_print(None, &[0u8, 1, 2], true), 2);
     }
 }

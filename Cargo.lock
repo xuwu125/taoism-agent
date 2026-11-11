@@ -685,6 +685,7 @@ dependencies = [
  "fulu-mcp",
  "fulu-model",
  "fulu-prompt",
+ "fulu-script",
  "fulu-skills",
  "fulu-vault",
 ]

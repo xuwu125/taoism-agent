@@ -7,8 +7,22 @@
 //!
 //! 因此 Windows / macOS / Linux 对同一张符必然得到同一哈希；任何不符即「破符」。
 //!
-//! M0 用 JSON 作为 `.fu` 的过渡形态（便于评审与 diff）；M1 换成中文 DSL +
-//! `.fub` 紧凑二进制，但 `canonical_bytes` 的契约保持不变。
+//! M0 用 JSON 作为 `.fu` 的过渡形态（便于评审与 diff）；M1（T39）已补上中文 DSL、
+//! `.fub` 紧凑二进制、复文字典与云篆描述层，但 `canonical_bytes` 的契约保持不变：
+//! **JSON 是权威形态，符印只由它算；DSL 与 `.fub` 都只是同一棵树的另外两种写法。**
+
+mod dsl;
+mod fub;
+mod fuwen;
+mod yunzhuan;
+
+pub use dsl::{decode_dsl, encode_dsl};
+pub use fub::{
+    FUB_MAGIC, FUB_VERSION, FubInfo, decode as decode_fub, encode as encode_fub,
+    inspect as inspect_fub,
+};
+pub use fuwen::{DICTIONARY, FUVEN_VERSION, fold as fuwen_fold, unfold as fuwen_unfold};
+pub use yunzhuan::{CloudLayout, CloudScript, CloudSlot, Stroke, describe as describe_cloud};
 
 use fulu_core::Talisman;
 use serde::Serialize;
