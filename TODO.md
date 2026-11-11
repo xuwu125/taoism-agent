@@ -78,7 +78,7 @@
 - [x] **T29 `cargo audit` 接入 CI** — 证据：`docs/02:248,436` 设计有，`ci.yml` 无。做法：加独立 job（advisories），与 `cargo deny` 不重复冲突。**已落地：`audit` job（`rustsec/audit-check@v2`），与 cargo-deny 并行保留。**
 - [x] **T30 CI 矩阵补 macOS Intel / ARM64 Linux 评估** — 证据：`ci.yml:27-29` 只有 3 项；`docs/02:261,478` 把 `aarch64-unknown-linux-gnu` 列为可选待确认。做法：补 Intel macOS 编译；ARM64 Linux 由用户拍板是否纳入。**已落地：quality 增加 `macos-15-intel`；新增 `cross-build` 只编 `fulu-cli` 到 `aarch64-unknown-linux-gnu`（GUI 交叉编译明确不覆盖，见 docs/03 第 1 节第 4 条与 docs/02 第 24.4 节）。**
 - [x] **T31 清单闸门不许静默跳过** — 证据：`check_model_manifest.py:105-106` `git ls-files` 失败就 `[WARN] 跳过权重入库检查`；`:81` 只校验 `source_url` 前缀。做法：CI 内失败即红（非 CI 才允许降级），并校验 URL 域名白名单。验收：故意破坏环境时脚本返回非 0。**已落地：`IN_CI` 判定（CI/GITHUB_ACTIONS）+ 主机白名单（huggingface / github 系）；本机实测仓库内与 CI=1 均 exit 0，白名单对现有清单全绿（docs/02 第 24.5 节）。**
-- [~] **T32 文档根配套 + 性能预算实测**（`CHANGELOG` / `SECURITY` / `CONTRIBUTING` 已补；空闲内存 / 二进制体积 / 启动时间的实测基线**未做**） — 证据：`README.md:9-16` 文档表只有 4 份；仓库无 `CHANGELOG` / `SECURITY` / `CONTRIBUTING` / 使用手册；`docs/02:283,440` 内存/体积预算「M1 起实测校准」从未做。做法：补齐文档 + 出一份实测基线（空闲内存、二进制体积、启动时间），**不承诺达标**。
+- [x] **T32 文档根配套 + 性能预算实测**（`CHANGELOG` / `SECURITY` / `CONTRIBUTING` 已补；**实测基线已出（docs/02 第 35 节）**：单符校验 0.019 ms、release 出窗 44 ms / debug 269 ms、CLI 峰值内存 8.39 MB、GUI 空闲 97.6 MB WS（125.1 MB private，98 s 不增长）、release 二进制 CLI 1.06 MB + GUI 11.64 MB（zstd 6.65 MB）。结论：**GUI 的 80 MB 目标不成立**（原数字是无 GUI 口径），已按 CLI ≤ 12 MB / GUI ≤ 130 MB 拆两档；**未测**首帧绘制时间、安装包体积、macOS/Linux） — 证据：`README.md:9-16` 文档表只有 4 份；仓库无 `CHANGELOG` / `SECURITY` / `CONTRIBUTING` / 使用手册；`docs/02:283,440` 内存/体积预算「M1 起实测校准」从未做。做法：补齐文档 + 出一份实测基线（空闲内存、二进制体积、启动时间），**不承诺达标**。
 
 # S6 · 符箓台完整 UI 与真人验收
 
@@ -155,6 +155,7 @@ T27（签名 Secrets）/ T20（1.1GB 下载）= 外部阻塞项；T37 已于 202
 | S6 | T37 中文 IME 真人验收（Windows 10 / 百度输入法 / 100%）：P0 10/10 通过，无截图；P1 仅 IME-15 部分，IME-11–14/16 未测 → `docs/acceptance/2026-11-11-windows10.md` | 通过（P0 10/10） | 2026-11-11 |
 | S2 | T13 收尾：GUI 中止按钮 + 「取消」独立错误变体（取消不再显示成炸炉；取消时缴符不许出现 `ToolResult`） | 完成 / 按钮真人点击未验 | 2026-11-11 |
 | — | 基线：343 测试零失败 / clippy 零告警 / fmt 全绿 | 完成 | 2026-11-11 |
+| — | T32 性能预算实测：单符校验 0.019 ms / 出窗 44 ms(release) / CLI 峰值 8.4 MB / GUI 空闲 97.6 MB / 发布二进制 12.7 MB；GUI 的 80 MB 目标按实测改为 130 MB | 完成 | 2026-11-11 |
 | — | T38 同次实测：WIN-01 通过，其余 12 项未测；T36 符纸视觉 8 项全未测（不是「没问题」，是「没验」） | 部分 / 未测 | 2026-11-11 |
 
 > 规则：每完成一项，把上面 `[ ]` 改成 `[x]` 并在进度表补提交号；**未完成不得标已完成**（沿用「不伪装」铁律）。

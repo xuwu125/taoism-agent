@@ -5,6 +5,7 @@
 ## v0.3.1（2026-11-11，进行中）
 
 ### 新增
+- **性能预算实测基线（T32）**：把 9.3 那四条「M1 起实测校准」的数字真正测了——单符校验 **0.019 ms**（2000 次平均，目标 5 ms）、release 出窗 **44 ms** / debug **269 ms**（目标 1.5 s）、CLI 峰值内存 **8.39 MB**（完整焚符）、GUI 空闲 **97.6 MB** 工作集 / 125.1 MB private（98 s 不增长）、release 二进制 CLI 1.06 MB + GUI 11.64 MB（zstd 6.65 MB，目标 20 MB）。**结论之一是坏消息：GUI 达不到「空闲 ≤ 80 MB」**——那个数字是无 GUI 轻量包口径，用在 GUI 上是口径错配，故按实测拆成 CLI ≤ 12 MB / GUI ≤ 130 MB 两档（阈值 = 实测 + 30% 余量）。**未测**：首帧绘制时间（`MainWindowHandle` 只能证明窗口创建，不等于画面出来）、安装包体积、macOS/Linux（详见 docs/02 第 35 节）。
 - **GUI 中止按钮 + 「取消」独立错误类型（T13 收尾）**：焚化途中可点「中止」置旗标，焚符线程每收到一个流事件查一次，置真即返回 `StreamControl::Cancel`，provider 立刻关连接、法坛落 `Cancelled` 终态并记账已收字数；按中止时顺带把正在等的敕门卡片按「敕否」答掉，否则线程阻塞在等人点头上、旗标永远读不到。语义同时上移到错误类型：新增 `RitualError::Cancelled`（「中止 · 调用方取消」）与 `AppError::Cancelled`（「中止」），`From<RitualError>` 特判保留区分——此前取消走 `RitualError::Provider`，界面只能显示成「炸炉」，与「取消是独立终态」的设计自相矛盾。界面文案改为「已中止（不是炸炉）」，不给绿色成功的错觉。**未验**：按钮的真人点击、真实 `llama-server` 的中断行为（详见 docs/02 第 34 节）。
 - **太极符图编排（T09）**：`fulu-orchestrator` 从占位骨架变为可用 DAG 编排器；`fulu taiji run <符图.json> --confirm` 每节点走完整仪轨；`system_digest` 破符语义（dry-run 后提示词被换即破符）。
 - **召将子符（T10）**：`summon.fu` 把「分派子符」做成可受箓、可敕门的工具（受限级 + Mutate + 配额 4）；子符独立 `AltarSession`（minimal 档、独立预算、步数裁剪到 8、禁环回双防线、不继承父符高危授权）、全程记账进父符缴符事件链；CLI `altar run --summon`。
