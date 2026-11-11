@@ -723,6 +723,334 @@ fn open_with_browser(browser: &Path, url: &str, wait_ms: u64) -> Result<String, 
     Ok(String::from_utf8_lossy(&dom_bytes).into_owned())
 }
 
+// ---------------------------------------------------------------------------
+// 摄行（T16）：电脑控制。默认**不存在**，开启后逐次确认。
+// ---------------------------------------------------------------------------
+//
+// 这是全系统唯一能「以用户本人身份操作任意窗口」的能力：不受工作区路径约束，
+// 也不受命令行白名单约束。风险评估见 docs/03 第 4 节，硬规则：
+//
+// * 默认不注册（不是「注册后拒绝」——模型连看到它的机会都没有）；
+// * 环境变量 `FULU_ALLOW_SHEXING=1` + 会话显式开启，两把钥匙同时到位；
+// * 风险等级 `Destructive` → 敕门 `EveryCall`，每一次动作都要人点头；
+// * 平台：当前仅 Windows（SendKeys + user32）；其它平台如实报「不支持」，不假装。
+
+/// 摄行四件套的工具名（供箓层登记与 CLI 展示）。
+pub const SHEXING_TOOL_IDS: [&str; 4] = [
+    "shexing.type",
+    "shexing.key",
+    "shexing.click",
+    "shexing.screenshot",
+];
+/// 单次键入的字符上限（防模型把整篇文档「打」进别的程序）。
+pub const SHEXING_MAX_TEXT_CHARS: usize = 2000;
+/// 摄行单次动作超时。
+const SHEXING_TIMEOUT_MS: u64 = 8_000;
+
+const SENDKEYS_SCRIPT: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.SendKeys]::SendWait($env:FULU_SHEXING_KEYS)
+"#;
+
+const CLICK_SCRIPT: &str = r#"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class FuluInput {
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+}
+"@
+[FuluInput]::SetCursorPos([int]$env:FULU_SHEXING_X, [int]$env:FULU_SHEXING_Y) | Out-Null
+if ($env:FULU_SHEXING_BUTTON -eq 'right') {
+  [FuluInput]::mouse_event(0x0008, 0, 0, 0, [UIntPtr]::Zero)
+  [FuluInput]::mouse_event(0x0010, 0, 0, 0, [UIntPtr]::Zero)
+} else {
+  [FuluInput]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+  [FuluInput]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+}
+"#;
+
+const SCREENSHOT_SCRIPT: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+$bmp.Save($env:FULU_SHEXING_PATH, [System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose()
+$bmp.Dispose()
+Write-Output "$($bounds.Width)x$($bounds.Height)"
+"#;
+
+fn ensure_shexing_supported() -> Result<(), ToolError> {
+    if cfg!(windows) {
+        Ok(())
+    } else {
+        Err(ToolError::NotAllowed(
+            "摄行当前仅支持 Windows（SendKeys + user32）；macOS Accessibility / Linux xdotool 未实现，不做假装支持"
+                .into(),
+        ))
+    }
+}
+
+/// 跑一段 PowerShell。文本一律经环境变量传入，绝不拼进脚本——
+/// 避免引号/换行被当成代码执行。
+fn run_shexing_script(
+    script: &str,
+    env: &[(&str, &str)],
+    root: &Path,
+) -> Result<String, ToolError> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut command = Command::new("powershell");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| ToolError::Io(format!("摄行无法启动 PowerShell：{error}")))?;
+    let deadline = Instant::now() + Duration::from_millis(SHEXING_TIMEOUT_MS);
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|error| ToolError::Io(error.to_string()))?
+        {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ToolError::Io(format!(
+                    "摄行动作超时（>{SHEXING_TIMEOUT_MS}ms），已终止"
+                )));
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let output = child
+        .wait_with_output()
+        .map_err(|error| ToolError::Io(format!("摄行读取输出失败：{error}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr_text = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !status.success() {
+        let detail = if stderr_text.is_empty() {
+            stdout
+        } else {
+            stderr_text
+        };
+        return Err(ToolError::Io(format!("摄行脚本失败：{detail}")));
+    }
+    Ok(stdout)
+}
+
+/// 把普通文本转成 SendKeys 字面量：`+ ^ % ~ ( ) [ ] { }` 必须转义，
+/// 换行/制表转成 `{ENTER}` / `{TAB}`，其余原样。
+pub fn escape_sendkeys(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    for ch in text.chars() {
+        match ch {
+            '+' | '^' | '%' | '~' | '(' | ')' | '[' | ']' => {
+                out.push('{');
+                out.push(ch);
+                out.push('}');
+            }
+            '{' => out.push_str("{{}"),
+            '}' => out.push_str("{}}"),
+            '\n' => out.push_str("{ENTER}"),
+            '\r' => {} // 换行已由 \n 处理，避免 CRLF 打两次回车
+            '\t' => out.push_str("{TAB}"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// 组合键白名单：只允许字母数字与 `^ % +` 修饰符，以及 `{NAME}` 形式的命名键。
+/// 其它字符（尤其是引号、分号、换行）一律拒绝——它会被原样交给 SendKeys。
+fn validate_sendkeys(raw: &str) -> Result<(), String> {
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '^' | '%' | '+' => {}
+            '{' => {
+                let mut name = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(inner) if inner.is_ascii_alphanumeric() => name.push(inner),
+                        Some(_) => return Err("命名键只允许字母数字，如 {ENTER}、{F5}".into()),
+                        None => return Err("命名键缺少右花括号".into()),
+                    }
+                }
+                if name.is_empty() {
+                    return Err("命名键不能为空（花括号里要有键名）".into());
+                }
+            }
+            other if other.is_ascii_alphanumeric() => {}
+            other => return Err(format!("键位里有不认识的字符「{other}」")),
+        }
+    }
+    Ok(())
+}
+
+/// 摄行 · 键入文本。
+pub struct ShexingTypeTool;
+
+impl Tool for ShexingTypeTool {
+    fn id(&self) -> &str {
+        SHEXING_TOOL_IDS[0]
+    }
+
+    fn invoke(&self, args: &ToolArguments, policy: &ToolPolicy) -> Result<ToolOutput, ToolError> {
+        ensure_shexing_supported()?;
+        let text = args
+            .field("text")
+            .ok_or_else(|| ToolError::InvalidArguments("缺少 text".into()))?;
+        let chars = text.chars().count();
+        if chars == 0 {
+            return Err(ToolError::InvalidArguments("text 不能为空".into()));
+        }
+        if chars > SHEXING_MAX_TEXT_CHARS {
+            return Err(ToolError::InvalidArguments(format!(
+                "text 有 {chars} 个字符，超过单次 {SHEXING_MAX_TEXT_CHARS} 字符上限"
+            )));
+        }
+        let root = policy.root.clone().unwrap_or_else(|| PathBuf::from("."));
+        let keys = escape_sendkeys(&text);
+        run_shexing_script(SENDKEYS_SCRIPT, &[("FULU_SHEXING_KEYS", &keys)], &root)?;
+        Ok(ToolOutput {
+            name: self.id().into(),
+            content: format!("已向当前前台窗口键入 {chars} 个字符"),
+            truncated: false,
+        })
+    }
+}
+
+/// 摄行 · 发送组合键（SendKeys 语法子集：`^s`、`%{TAB}`、`{ENTER}`）。
+pub struct ShexingKeyTool;
+
+impl Tool for ShexingKeyTool {
+    fn id(&self) -> &str {
+        SHEXING_TOOL_IDS[1]
+    }
+
+    fn invoke(&self, args: &ToolArguments, policy: &ToolPolicy) -> Result<ToolOutput, ToolError> {
+        ensure_shexing_supported()?;
+        let keys = args
+            .field("keys")
+            .ok_or_else(|| ToolError::InvalidArguments("缺少 keys".into()))?;
+        validate_sendkeys(&keys).map_err(ToolError::InvalidArguments)?;
+        let root = policy.root.clone().unwrap_or_else(|| PathBuf::from("."));
+        run_shexing_script(SENDKEYS_SCRIPT, &[("FULU_SHEXING_KEYS", &keys)], &root)?;
+        Ok(ToolOutput {
+            name: self.id().into(),
+            content: format!("已发送组合键 {keys}"),
+            truncated: false,
+        })
+    }
+}
+
+/// 摄行 · 点击（先移动光标再按下/抬起）。
+pub struct ShexingClickTool;
+
+impl Tool for ShexingClickTool {
+    fn id(&self) -> &str {
+        SHEXING_TOOL_IDS[2]
+    }
+
+    fn invoke(&self, args: &ToolArguments, policy: &ToolPolicy) -> Result<ToolOutput, ToolError> {
+        ensure_shexing_supported()?;
+        let x: u32 = args
+            .field("x")
+            .and_then(|raw| raw.parse().ok())
+            .ok_or_else(|| ToolError::InvalidArguments("缺少合法整数 x".into()))?;
+        let y: u32 = args
+            .field("y")
+            .and_then(|raw| raw.parse().ok())
+            .ok_or_else(|| ToolError::InvalidArguments("缺少合法整数 y".into()))?;
+        let button = args.field("button").unwrap_or_else(|| "left".into());
+        if button != "left" && button != "right" {
+            return Err(ToolError::InvalidArguments(format!(
+                "button 只接受 left / right，收到「{button}」"
+            )));
+        }
+        let root = policy.root.clone().unwrap_or_else(|| PathBuf::from("."));
+        run_shexing_script(
+            CLICK_SCRIPT,
+            &[
+                ("FULU_SHEXING_X", &x.to_string()),
+                ("FULU_SHEXING_Y", &y.to_string()),
+                ("FULU_SHEXING_BUTTON", &button),
+            ],
+            &root,
+        )?;
+        Ok(ToolOutput {
+            name: self.id().into(),
+            content: format!("已在 ({x}, {y}) 执行{button}键点击"),
+            truncated: false,
+        })
+    }
+}
+
+/// 摄行 · 截屏（只写工作区，不联网、不自动进提示词）。
+pub struct ShexingScreenshotTool;
+
+impl Tool for ShexingScreenshotTool {
+    fn id(&self) -> &str {
+        SHEXING_TOOL_IDS[3]
+    }
+
+    fn invoke(&self, args: &ToolArguments, policy: &ToolPolicy) -> Result<ToolOutput, ToolError> {
+        ensure_shexing_supported()?;
+        let root = policy.root.as_ref().ok_or(ToolError::RootNotConfigured)?;
+        let raw = args
+            .field("path")
+            .ok_or_else(|| ToolError::InvalidArguments("缺少 path".into()))?;
+        let full = resolve_workspace_path(root, &raw)?;
+        if !full
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("png"))
+            .unwrap_or(false)
+        {
+            return Err(ToolError::InvalidArguments(
+                "截屏只写 .png 文件（路径需以 .png 结尾）".into(),
+            ));
+        }
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| ToolError::Io(format!("建父目录失败：{error}")))?;
+        }
+        let screen = run_shexing_script(
+            SCREENSHOT_SCRIPT,
+            &[("FULU_SHEXING_PATH", &full.display().to_string())],
+            root,
+        )?;
+        let bytes = std::fs::metadata(&full)
+            .map_err(|error| ToolError::Io(format!("截屏文件未生成：{error}")))?
+            .len();
+        Ok(ToolOutput {
+            name: self.id().into(),
+            content: format!(
+                "已截屏 {screen}（{}，{bytes} 字节）写入 {}",
+                if bytes > 0 {
+                    "非空"
+                } else {
+                    "空文件，可疑"
+                },
+                full.display()
+            ),
+            truncated: false,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
@@ -1408,5 +1736,59 @@ mod tests {
         let text = html_to_text(&dom);
         assert!(text.contains("急急如律令"), "{text}");
         assert!(text.contains("js-ok"), "JS 必须真实执行：{text}");
+    }
+
+    // ---- T16 摄行：默认不存在、转义与键位校验 ----
+
+    #[test]
+    fn shexing_tools_are_absent_from_the_builtin_registry() {
+        // 「默认禁用」的正确形态是**工具不存在**，而不是「存在但拒绝」。
+        let registry = ToolRegistry::default();
+        for id in SHEXING_TOOL_IDS {
+            assert!(
+                registry.get(id).is_none(),
+                "内置注册表不得含 {id}：摄行必须显式解锁"
+            );
+        }
+    }
+
+    #[test]
+    fn sendkeys_escaping_is_exact() {
+        assert_eq!(escape_sendkeys("a+b"), "a{+}b");
+        assert_eq!(escape_sendkeys("100%"), "100{%}");
+        assert_eq!(escape_sendkeys("{x}"), "{{}x{}}");
+        assert_eq!(escape_sendkeys("f(x)"), "f{(}x{)}");
+        assert_eq!(escape_sendkeys("a\nb"), "a{ENTER}b");
+        // CRLF 只打一次回车，不能打成两次。
+        assert_eq!(escape_sendkeys("a\r\nb"), "a{ENTER}b");
+        assert_eq!(escape_sendkeys("a\tb"), "a{TAB}b");
+    }
+
+    #[test]
+    fn sendkeys_validation_rejects_injection_shapes() {
+        assert!(validate_sendkeys("^s").is_ok());
+        assert!(validate_sendkeys("%{TAB}").is_ok());
+        assert!(validate_sendkeys("{ENTER}").is_ok());
+        assert!(validate_sendkeys("abc123").is_ok());
+        // 引号、分号、换行都可能被当成脚本/命令的一部分。
+        assert!(validate_sendkeys("a; Remove-Item").is_err());
+        assert!(validate_sendkeys("\"").is_err());
+        assert!(validate_sendkeys("a\nb").is_err());
+        assert!(validate_sendkeys("{ENTER").is_err());
+        assert!(validate_sendkeys("{}").is_err());
+        assert!(validate_sendkeys("{EN TER}").is_err());
+    }
+
+    #[test]
+    fn shexing_platform_gate_is_honest() {
+        // 只测平台闸门本身：**绝不**在测试里真的敲键盘/点鼠标——那会操作
+        // 开发者当前的前台窗口，属于不可接受的测试副作用。
+        let gate = ensure_shexing_supported();
+        if cfg!(windows) {
+            assert!(gate.is_ok());
+        } else {
+            let message = format!("{}", gate.unwrap_err());
+            assert!(message.contains("仅支持 Windows"), "{message}");
+        }
     }
 }

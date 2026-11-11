@@ -1,4 +1,4 @@
-//! 外宗箓（MCP）：全局 MCP 配置的**只读**发现与 stdio 接入（docs/02 第 8.6 节）。
+//! 外宗箓（MCP）：全局 MCP 配置的**只读**发现与接入（docs/02 第 8.6 节、docs/03 第 3 节）。
 //!
 //! 原则：**只展示，不管理。** 安装、升级、删除全局 MCP 配置一律由用户在原有生态
 //! 完成；本 crate 绝不写任何全局配置文件。唯一会写的是 **fulu 自有**的
@@ -8,6 +8,10 @@
 //! - 发现只读解析配置；`env` 只显示**键名**，值一律不读不出（疑似密钥零泄漏）。
 //! - stdio 传输：spawn 子进程 + JSON-RPC 2.0 按行分隔；每次请求都有总超时，
 //!   响应上限 8 MiB；server 输出视为**不可信文本**，只能作为工具结果进入当轮对话。
+//! - 回环 HTTP 传输：只允许 `http://127.0.0.1` / `localhost` 明文。
+//! - 远程 HTTPS 传输（T19）：唯一出网链路，硬约束见下方「远程 HTTPS」一节——
+//!   主机白名单（`~/.fulu/remote-mcp.json`）、禁重定向、IP 字面量拒绝、凭据只走
+//!   `${ENV:VAR}`、TLS 交给系统 `curl`（fulu 依赖树保持零 TLS）。
 //! - MCP 工具经 `McpToolAdapter` 归一为 `fulu-tools::Tool`，走与内置工具完全相同
 //!   的「箓」白名单/配额/边界核验，不因来源是第三方而绕过闸门。
 
@@ -36,8 +40,8 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// 一台 server 的接入方式。
 ///
-/// 只支持两种：本机 stdio 子进程、本机明文回环 HTTP。
-/// 远程 MCP（HTTPS）需要 TLS 边界，属独立增量，不在这里偷偷打开。
+/// 三种：本机 stdio 子进程、本机明文回环 HTTP、远程 HTTPS（T19，须白名单放行）。
+/// 远程走系统 curl 做 TLS，本 crate 不链接任何 TLS 库。
 #[derive(Clone, PartialEq, Eq)]
 pub enum Transport {
     Stdio {
@@ -1058,6 +1062,585 @@ impl McpCaller for McpHttpClient {
 }
 
 // ---------------------------------------------------------------------------
+// 远程 HTTPS 传输（T19）
+// ---------------------------------------------------------------------------
+//
+// 这是全仓库唯一一条会主动出网的链路，因此每一条限制都是硬编码的，没有
+// `--insecure` 之类的逃生开关：
+//
+// * 只接受 `https://`；明文 HTTP 仍限本机回环（`McpHttpClient`）；
+// * 主机必须命中 **fulu 自有** 白名单 `~/.fulu/remote-mcp.json`，且不接受
+//   IP 字面量（消掉 SSRF 到内网/元数据服务的主要路径）；
+// * 不跟随重定向（`--max-redirs 0`）——重定向是绕过主机白名单最省事的办法；
+// * TLS 交给系统 `curl`（Schannel / 系统 CA），fulu 依赖树保持零 TLS；
+// * 敏感头部必须是 `${ENV:VAR}` 引用，字面量一律拒绝连接（密钥不落盘）；
+// * 响应 8 MiB / 60s 硬上限，超出即失败，不做「尽力而为」。
+
+/// 远程白名单文件名（fulu 自有，位于 `~/.fulu/`，与 MCP 生态配置无关）。
+pub const REMOTE_POLICY_FILE: &str = "remote-mcp.json";
+/// 远程请求超时（秒）。
+const REMOTE_TIMEOUT_SECS: u64 = 60;
+/// 视为「敏感」的请求头：值必须是环境变量引用。
+const SENSITIVE_HEADERS: [&str; 4] = ["authorization", "cookie", "x-api-key", "api-key"];
+
+/// 远程 MCP 主机白名单。
+///
+/// 只从 fulu 自有的 `~/.fulu/remote-mcp.json` 读取；缺文件 = 全部拒绝
+/// （默认关闭，而不是默认放行）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemotePolicy {
+    allow_hosts: Vec<String>,
+}
+
+impl RemotePolicy {
+    /// 从主机列表构造（小写、去重、排序，便于展示与比较）。
+    pub fn from_hosts<I: IntoIterator<Item = String>>(hosts: I) -> Self {
+        let mut allow_hosts: Vec<String> = hosts
+            .into_iter()
+            .map(|host| host.trim().to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect();
+        allow_hosts.sort();
+        allow_hosts.dedup();
+        Self { allow_hosts }
+    }
+
+    pub fn hosts(&self) -> &[String] {
+        &self.allow_hosts
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.allow_hosts.is_empty()
+    }
+
+    /// 读取白名单。缺文件是常态（等价于「不放开任何远程主机」），不算错误；
+    /// 坏文件、坏条目逐条回报，绝不因为一个条目坏掉就整体放行。
+    pub fn load(paths: &[PathBuf]) -> (Self, Vec<String>) {
+        let mut hosts = Vec::new();
+        let mut issues = Vec::new();
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                issues.push(format!(
+                    "{}：不是合法 JSON，远程白名单未生效（远程 MCP 全部拒绝）",
+                    path.display()
+                ));
+                continue;
+            };
+            let Some(list) = value.get("allow_hosts").and_then(Value::as_array) else {
+                issues.push(format!("{}：缺少 allow_hosts 数组", path.display()));
+                continue;
+            };
+            for item in list {
+                let Some(host) = item.as_str().map(str::trim) else {
+                    issues.push(format!(
+                        "{}：allow_hosts 里有非字符串条目，已忽略",
+                        path.display()
+                    ));
+                    continue;
+                };
+                if host.is_empty() {
+                    continue;
+                }
+                if host.parse::<std::net::IpAddr>().is_ok() {
+                    issues.push(format!(
+                        "{host}：IP 字面量不得进入远程白名单（SSRF 风险），已忽略"
+                    ));
+                    continue;
+                }
+                hosts.push(host.to_string());
+            }
+        }
+        (Self::from_hosts(hosts), issues)
+    }
+
+    /// 精确主机，或 `*.suffix` 通配（只匹配**至少一级**子域，不匹配裸域）。
+    pub fn allows(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        self.allow_hosts
+            .iter()
+            .any(|entry| match entry.strip_prefix("*.") {
+                Some(suffix) => {
+                    host.len() > suffix.len() + 1
+                        && host.ends_with(suffix)
+                        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+                }
+                None => host == *entry,
+            })
+    }
+}
+
+/// 默认白名单路径（`$HOME/.fulu/remote-mcp.json`，Windows 用 `%USERPROFILE%`）。
+pub fn remote_policy_paths() -> Vec<PathBuf> {
+    match std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        Some(home) => vec![PathBuf::from(home).join(".fulu").join(REMOTE_POLICY_FILE)],
+        None => Vec::new(),
+    }
+}
+
+impl RemotePolicy {
+    /// 人类可读、可手工审阅的 JSON（白名单不是密钥，值得让人直接看懂）。
+    pub fn to_json_pretty(&self) -> Result<String, String> {
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "allow_hosts".into(),
+            Value::Array(
+                self.allow_hosts
+                    .iter()
+                    .map(|host| Value::String(host.clone()))
+                    .collect(),
+            ),
+        );
+        root.insert(
+            "note".into(),
+            Value::String(
+                "fulu 自有文件：只影响远程 MCP 的主机白名单，不修改任何 MCP server 配置。\
+                 IP 字面量与 localhost 一律拒绝；通配只支持 *.suffix。"
+                    .into(),
+            ),
+        );
+        serde_json::to_string_pretty(&Value::Object(root))
+            .map_err(|error| format!("远程白名单序列化失败：{error}"))
+    }
+
+    /// 原子写：临时文件 + 替换，失败回滚；只写 fulu 自有路径。
+    pub fn write_to(&self, path: &Path) -> Result<(), String> {
+        let text = format!("{}\n", self.to_json_pretty()?);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("无法创建 {}：{error}", parent.display()))?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let backup = path.with_extension("json.bak");
+        std::fs::write(&tmp, text)
+            .map_err(|error| format!("写入 {} 失败：{error}", tmp.display()))?;
+        let had_old = path.exists();
+        if had_old {
+            let _ = std::fs::remove_file(&backup);
+            std::fs::rename(path, &backup).map_err(|error| format!("备份旧白名单失败：{error}"))?;
+        }
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            if had_old {
+                let _ = std::fs::rename(&backup, path);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("替换白名单失败：{error}"));
+        }
+        if had_old {
+            let _ = std::fs::remove_file(&backup);
+        }
+        Ok(())
+    }
+}
+
+/// 写入/撤销一条远程主机放行。主机名必须是**纯主机**（不带 scheme / 路径 / 端口），
+/// 否则用户很容易以为自己放行了某个 URL，实际放行的是另一台主机。
+pub fn set_remote_host(
+    path: &Path,
+    host: &str,
+    allow: bool,
+) -> Result<(RemotePolicy, Vec<String>), String> {
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("主机名不能为空".into());
+    }
+    if host.contains("://") || host.contains('/') || host.contains('@') || host.contains(':') {
+        return Err(format!(
+            "「{host}」不是纯主机名：请只写域名（不带 scheme / 端口 / 路径）"
+        ));
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() || host == "localhost" {
+        return Err(format!(
+            "「{host}」是 IP 字面量或 localhost，远程 MCP 不接受（SSRF 风险）"
+        ));
+    }
+    if host.contains('*') && !host.starts_with("*.") {
+        return Err(format!("通配只支持 *.suffix 形式：「{host}」不合法"));
+    }
+    if host.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err("主机名不能含空白或控制字符".into());
+    }
+    let (policy, issues) = RemotePolicy::load(&[path.to_path_buf()]);
+    let mut hosts = policy.hosts().to_vec();
+    if allow {
+        if !hosts.iter().any(|known| known == &host) {
+            hosts.push(host);
+        }
+    } else {
+        hosts.retain(|known| known != &host);
+    }
+    let next = RemotePolicy::from_hosts(hosts);
+    next.write_to(path)?;
+    Ok((next, issues))
+}
+
+/// 通过校验的远程目标。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTarget {
+    pub host: String,
+    pub path: String,
+}
+
+/// 校验远程 URL。**任何一步不过就拒绝**，并且拒绝理由要能直接告诉用户怎么修。
+pub fn check_remote_url(url: &str, policy: &RemotePolicy) -> Result<RemoteTarget, McpError> {
+    let trimmed = url.trim();
+    let rest = trimmed.strip_prefix("https://").ok_or_else(|| {
+        McpError(format!(
+            "远程 MCP 只接受 https://（明文 http 仅限本机回环）：{trimmed}"
+        ))
+    })?;
+    if rest.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(McpError(format!("URL 含空白或控制字符：{trimmed}")));
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err(McpError(format!("URL 缺少主机名：{trimmed}")));
+    }
+    if authority.contains('@') {
+        return Err(McpError(
+            "URL 含 userinfo（@）：可见域名可能与真实主机不符，拒绝连接".into(),
+        ));
+    }
+    let host_part = if authority.starts_with('[') {
+        return Err(McpError(
+            "IPv6 字面量不得用于远程 MCP（请写域名并加入白名单）".into(),
+        ));
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    let host = host_part.to_ascii_lowercase();
+    if host.is_empty() {
+        return Err(McpError(format!("URL 缺少主机名：{trimmed}")));
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() || host == "localhost" {
+        return Err(McpError(
+            "IP 字面量 / localhost 不得用于远程 MCP：请用域名走白名单".into(),
+        ));
+    }
+    if policy.is_empty() {
+        return Err(McpError(format!(
+            "远程 MCP 默认关闭：请先在 ~/.fulu/{REMOTE_POLICY_FILE} 的 allow_hosts 里显式放行主机 {host}"
+        )));
+    }
+    if !policy.allows(&host) {
+        return Err(McpError(format!(
+            "主机 {host} 不在远程白名单内（已放行：{}）",
+            policy.hosts().join("、")
+        )));
+    }
+    let path = &rest[authority.len()..];
+    Ok(RemoteTarget {
+        host,
+        path: if path.is_empty() {
+            "/".into()
+        } else {
+            path.into()
+        },
+    })
+}
+
+/// `${ENV:VAR}` 引用解析：只认这一种写法，其余一律当字面量。
+fn env_reference(raw: &str) -> Option<String> {
+    let inner = raw.trim().strip_prefix("${ENV:")?.strip_suffix('}')?;
+    let name = inner.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// 解析请求头：敏感头必须是环境变量引用，且变量必须已设置（fail closed）。
+pub fn resolve_remote_headers(
+    headers: &[(String, String)],
+) -> Result<Vec<(String, String)>, McpError> {
+    let mut resolved_headers = Vec::with_capacity(headers.len());
+    for (name, raw) in headers {
+        let lower = name.to_ascii_lowercase();
+        let value = if let Some(var) = env_reference(raw) {
+            match std::env::var(&var) {
+                Ok(value) if !value.trim().is_empty() => value,
+                _ => {
+                    return Err(McpError(format!(
+                        "请求头 {name} 引用的环境变量 {var} 未设置；fulu 不读取配置文件里的明文密钥，请在启动前 export"
+                    )));
+                }
+            }
+        } else if SENSITIVE_HEADERS.contains(&lower.as_str()) {
+            return Err(McpError(format!(
+                "请求头 {name} 写了字面量值；远程 MCP 要求改成 ${{ENV:变量名}} 引用，避免密钥落盘"
+            )));
+        } else {
+            raw.clone()
+        };
+        if value.contains('\r') || value.contains('\n') {
+            return Err(McpError(format!("请求头 {name} 含换行，拒绝发送")));
+        }
+        resolved_headers.push((name.clone(), value));
+    }
+    Ok(resolved_headers)
+}
+
+/// `curl --dump-header` 风格的响应头部。
+struct CurlResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// 用系统 curl 发一次 HTTPS POST。
+///
+/// 选择 curl 而不是引入 TLS 栈，与 moli（T14）用系统浏览器同源：把 TLS 边界
+/// 交给已经被系统持续打好补丁的组件，fulu 自身保持零 TLS 依赖。代价是要求
+/// 本机有 curl——缺失时如实报错，不影响本地 stdio / 回环 HTTP。
+fn curl_post(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<CurlResponse, McpError> {
+    let timeout = REMOTE_TIMEOUT_SECS.to_string();
+    let max_bytes = MAX_RESPONSE_BYTES.to_string();
+    let mut command = Command::new("curl");
+    command.args([
+        "-sS",
+        "-i",
+        "--proto",
+        "=https",
+        "--max-redirs",
+        "0",
+        "--tlsv1.2",
+        "--max-time",
+        &timeout,
+        "--max-filesize",
+        &max_bytes,
+        "-X",
+        "POST",
+        "--data-binary",
+        "@-",
+    ]);
+    for (name, value) in headers {
+        command.arg("-H").arg(format!("{name}: {value}"));
+    }
+    command.arg(url);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|error| {
+        McpError(format!(
+            "无法启动系统 curl（远程 MCP 依赖它做 TLS 校验）：{error}"
+        ))
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(body)
+            .map_err(|error| McpError(format!("向 curl 写入请求体失败：{error}")))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| McpError(format!("等待 curl 失败：{error}")))?;
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().next().unwrap_or("").trim();
+        return Err(McpError(format!(
+            "远程 MCP 请求失败（curl 退出码 {code}）：{first}"
+        )));
+    }
+    if output.stdout.len() > MAX_RESPONSE_BYTES {
+        return Err(McpError(format!(
+            "远程响应超过 {} 字节上限",
+            MAX_RESPONSE_BYTES
+        )));
+    }
+    parse_curl_response(&output.stdout)
+}
+
+/// 找头部结束位置：返回（头部长度，分隔符长度）。`\r\n\r\n` 优先，兼容裸 `\n\n`。
+fn find_header_end(raw: &[u8]) -> Option<(usize, usize)> {
+    let crlf = raw.windows(4).position(|window| window == b"\r\n\r\n");
+    let lf = raw.windows(2).position(|window| window == b"\n\n");
+    match (crlf, lf) {
+        (Some(a), Some(b)) if b < a => Some((b, 2)),
+        (Some(a), _) => Some((a, 4)),
+        (None, Some(b)) => Some((b, 2)),
+        (None, None) => None,
+    }
+}
+
+/// 解析 `curl -i` 的 stdout：逐段跳过 1xx 与代理 CONNECT 的过渡块，
+/// 正文取最后一段头之后的全部字节。
+fn parse_curl_response(raw: &[u8]) -> Result<CurlResponse, McpError> {
+    let mut cursor = 0_usize;
+    loop {
+        let rest = &raw[cursor..];
+        let (header_len, sep_len) = find_header_end(rest)
+            .ok_or_else(|| McpError("远程响应缺少头部结束的空行（不是合法的 HTTP 响应）".into()))?;
+        let header_text = String::from_utf8_lossy(&rest[..header_len]);
+        let mut lines = header_text.lines();
+        let status_line = lines.next().unwrap_or_default().to_owned();
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .ok_or_else(|| McpError(format!("无法解析状态行：{status_line}")))?;
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+
+        let body_offset = cursor + header_len + sep_len;
+        let is_proxy_tunnel = status == 200 && status_line.contains("onnection established");
+        if (100..200).contains(&status) || is_proxy_tunnel {
+            cursor = body_offset;
+            continue;
+        }
+        return Ok(CurlResponse {
+            status,
+            headers,
+            body: raw[body_offset.min(raw.len())..].to_vec(),
+        });
+    }
+}
+
+/// 远程 MCP 客户端（streamable-http over HTTPS）。
+pub struct McpHttpsClient {
+    server: String,
+    url: String,
+    host: String,
+    path: String,
+    /// 原始头部（可能含 `${ENV:VAR}`），每次请求前解析。
+    headers: Vec<(String, String)>,
+    session_id: Option<String>,
+    next_id: u64,
+}
+
+impl McpHttpsClient {
+    /// 构造即校验：URL 策略与凭据可用性都在连接前判定，不留到握手时才炸。
+    pub fn new(
+        server: &str,
+        url: &str,
+        headers: Vec<(String, String)>,
+        policy: &RemotePolicy,
+    ) -> Result<Self, McpError> {
+        let target = check_remote_url(url, policy)?;
+        resolve_remote_headers(&headers)?;
+        Ok(Self {
+            server: server.to_owned(),
+            url: url.trim().to_owned(),
+            host: target.host,
+            path: target.path,
+            headers,
+            session_id: None,
+            next_id: 0,
+        })
+    }
+
+    /// 只读的「连到哪」描述（不含凭据），供日志与测试。
+    pub fn describe(&self) -> String {
+        format!("https://{}{}", self.host, self.path)
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let payload = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let body =
+            serde_json::to_vec(&payload).map_err(|e| McpError(format!("请求序列化失败：{e}")))?;
+
+        let mut headers: Vec<(String, String)> = vec![
+            (
+                "Accept".to_owned(),
+                "application/json, text/event-stream".to_owned(),
+            ),
+            (
+                "MCP-Protocol-Version".to_owned(),
+                PROTOCOL_VERSION.to_owned(),
+            ),
+        ];
+        headers.extend(resolve_remote_headers(&self.headers)?);
+        if let Some(session) = &self.session_id {
+            headers.push(("Mcp-Session-Id".to_owned(), session.clone()));
+        }
+
+        let response = curl_post(&self.url, &headers, &body)
+            .map_err(|error| McpError(format!("{method} 失败：{error}")))?;
+        if let Some(session) = response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "mcp-session-id")
+            .map(|(_, value)| value.clone())
+        {
+            self.session_id = Some(session);
+        }
+        if !(200..300).contains(&response.status) {
+            let body = String::from_utf8_lossy(&response.body);
+            let snippet: String = body.chars().take(200).collect();
+            return Err(McpError(format!(
+                "{method} 失败：远程 MCP 返回 HTTP {}：{snippet}",
+                response.status
+            )));
+        }
+        let text = String::from_utf8_lossy(&response.body).into_owned();
+        extract_from_payload(&text, id)?
+            .ok_or_else(|| McpError(format!("{method} 的响应里没有 id={id} 的结果")))
+    }
+
+    fn notify(&mut self, method: &str) {
+        let payload = json!({"jsonrpc": "2.0", "method": method});
+        let Ok(body) = serde_json::to_vec(&payload) else {
+            return;
+        };
+        let mut headers: Vec<(String, String)> = vec![(
+            "Accept".to_owned(),
+            "application/json, text/event-stream".to_owned(),
+        )];
+        if let Ok(extra) = resolve_remote_headers(&self.headers) {
+            headers.extend(extra);
+        }
+        if let Some(session) = &self.session_id {
+            headers.push(("Mcp-Session-Id".to_owned(), session.clone()));
+        }
+        let _ = curl_post(&self.url, &headers, &body);
+    }
+}
+
+impl McpCaller for McpHttpsClient {
+    fn server_name(&self) -> &str {
+        &self.server
+    }
+
+    fn initialize(&mut self) -> Result<Value, McpError> {
+        let result = self.request(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "fulu", "version": env!("CARGO_PKG_VERSION")}
+            }),
+        )?;
+        self.notify("notifications/initialized");
+        Ok(result)
+    }
+
+    fn list_tools(&mut self) -> Result<Vec<McpToolDesc>, McpError> {
+        let result = self.request("tools/list", json!({}))?;
+        Ok(collect_tool_descs(&self.server, &result))
+    }
+
+    fn call_tool(&mut self, tool: &str, arguments_json: &str) -> Result<ToolOutput, McpError> {
+        let arguments: Value = serde_json::from_str(arguments_json)
+            .map_err(|e| McpError(format!("参数不是合法 JSON：{e}")))?;
+        let result = self.request("tools/call", json!({"name": tool, "arguments": arguments}))?;
+        let (content, truncated) = render_tool_result(&self.server, tool, &result)?;
+        Ok(ToolOutput {
+            name: format!("mcp.{}.{}", self.server, tool),
+            content,
+            truncated,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 工具适配器：归一为 fulu-tools::Tool，走同一套箓核验
 // ---------------------------------------------------------------------------
 
@@ -1138,6 +1721,19 @@ pub fn connect_with(
     overrides: &RiskOverrides,
     floor: RiskClass,
 ) -> Result<McpSession, McpError> {
+    let (policy, issues) = RemotePolicy::load(&remote_policy_paths());
+    let mut session = connect_with_policy(info, &policy, overrides, floor)?;
+    session.warnings.extend(issues);
+    Ok(session)
+}
+
+/// 与 `connect_with` 相同，但白名单由调用方注入（测试与自定义部署用）。
+pub fn connect_with_policy(
+    info: &McpServerInfo,
+    policy: &RemotePolicy,
+    overrides: &RiskOverrides,
+    floor: RiskClass,
+) -> Result<McpSession, McpError> {
     let mut warnings = Vec::new();
     let shared: Arc<Mutex<dyn McpCaller>> = match &info.transport {
         Transport::Stdio { command, args } => Arc::new(Mutex::new(McpStdioClient::spawn(
@@ -1153,11 +1749,26 @@ pub fn connect_with(
                     info.name
                 ));
             }
-            Arc::new(Mutex::new(McpHttpClient::new(
-                &info.name,
-                url,
-                headers.clone(),
-            )?))
+            if url.trim_start().starts_with("https://") {
+                // T19：远程走系统 curl 的 TLS 校验 + 主机白名单。
+                warnings.push(format!(
+                    "server「{}」是远程 MCP（{}）：TLS 由系统 curl 校验、不跟随重定向、凭据只从环境变量读取",
+                    info.name,
+                    url.trim()
+                ));
+                Arc::new(Mutex::new(McpHttpsClient::new(
+                    &info.name,
+                    url,
+                    headers.clone(),
+                    policy,
+                )?))
+            } else {
+                Arc::new(Mutex::new(McpHttpClient::new(
+                    &info.name,
+                    url,
+                    headers.clone(),
+                )?))
+            }
         }
     };
 
@@ -1856,9 +2467,176 @@ for line in sys.stdin:
 
         let tls = McpHttpClient::new("tls", "https://127.0.0.1:8443/mcp", Vec::new());
         let Err(McpError(message)) = tls else {
-            panic!("HTTPS 必须被拒绝（需要 TLS 边界，属独立增量）");
+            panic!("回环客户端只收明文 HTTP：HTTPS 应交给 McpHttpsClient（T19）");
         };
         assert!(message.contains("HTTP"), "{message}");
+    }
+
+    // ---- T19：远程 HTTPS 白名单与凭据 ----
+
+    #[test]
+    fn remote_urls_require_an_explicit_allowlist() {
+        let empty = RemotePolicy::default();
+        let Err(McpError(message)) =
+            check_remote_url("https://mcp.example.com/mcp", &empty).map(|_| ())
+        else {
+            panic!("白名单为空时必须拒绝");
+        };
+        assert!(message.contains("默认关闭"), "{message}");
+
+        let policy =
+            RemotePolicy::from_hosts(vec!["mcp.example.com".into(), "*.trusted.dev".into()]);
+        assert!(check_remote_url("https://mcp.example.com/mcp", &policy).is_ok());
+        assert!(check_remote_url("https://a.trusted.dev/mcp", &policy).is_ok());
+        assert!(check_remote_url("https://a.b.trusted.dev/mcp", &policy).is_ok());
+        // 通配不匹配裸域，避免 `*.trusted.dev` 顺带放行 `trusted.dev` 本身。
+        assert!(check_remote_url("https://trusted.dev/mcp", &policy).is_err());
+        // 精确放行不覆盖子域。
+        assert!(check_remote_url("https://evil.mcp.example.com/mcp", &policy).is_err());
+    }
+
+    #[test]
+    fn remote_urls_reject_ssrf_shapes_and_plain_http() {
+        let policy = RemotePolicy::from_hosts(vec![
+            "mcp.example.com".into(),
+            "127.0.0.1".into(),
+            "localhost".into(),
+        ]);
+        for url in [
+            "http://mcp.example.com/mcp",        // 明文远程
+            "https://127.0.0.1:8443/mcp",        // IP 字面量
+            "https://localhost:8443/mcp",        // localhost
+            "https://[::1]:8443/mcp",            // IPv6 字面量
+            "https://user:pw@mcp.example.com/m", // userinfo 技巧
+            "file:///etc/passwd",                // 非 http(s)
+            "https://mcp.example.com/a b",       // 含空白
+        ] {
+            assert!(check_remote_url(url, &policy).is_err(), "必须拒绝：{url}");
+        }
+        let target = check_remote_url("https://mcp.example.com/mcp?x=1", &policy).unwrap();
+        assert_eq!(target.host, "mcp.example.com");
+        assert_eq!(target.path, "/mcp?x=1");
+    }
+
+    #[test]
+    fn remote_policy_load_ignores_bad_entries() {
+        let dir = std::env::temp_dir().join(format!("fulu-remote-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("remote-mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"allow_hosts":["Mcp.Example.com ","10.0.0.1","",42]}"#,
+        )
+        .unwrap();
+        let (policy, issues) = RemotePolicy::load(std::slice::from_ref(&path));
+        assert_eq!(policy.hosts(), ["mcp.example.com"]);
+        assert!(issues.iter().any(|issue| issue.contains("IP 字面量")));
+        assert!(issues.iter().any(|issue| issue.contains("非字符串")));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 坏文件不能让白名单「静默变空」而不告知。
+        let bad = std::env::temp_dir().join("fulu-remote-policy-bad.json");
+        std::fs::write(&bad, "not json").unwrap();
+        let (policy, issues) = RemotePolicy::load(std::slice::from_ref(&bad));
+        assert!(policy.is_empty());
+        assert_eq!(issues.len(), 1);
+        let _ = std::fs::remove_file(&bad);
+    }
+
+    #[test]
+    fn remote_headers_require_env_references_for_secrets() {
+        // 敏感头写字面量：直接拒绝，密钥不落盘。
+        let literal = vec![("Authorization".to_string(), "Bearer sk-123".to_string())];
+        let Err(McpError(message)) = resolve_remote_headers(&literal) else {
+            panic!("字面量凭据必须被拒绝");
+        };
+        assert!(message.contains("${ENV:"), "{message}");
+
+        // 引用了没设置的环境变量：fail closed。
+        let unset = vec![(
+            "Authorization".to_string(),
+            "${ENV:FULU_TEST_UNSET_TOKEN_XYZ}".to_string(),
+        )];
+        assert!(resolve_remote_headers(&unset).is_err());
+
+        // 已设置的环境变量被正确解析；非敏感头允许字面量。
+        let ok = vec![
+            ("Authorization".to_string(), "${ENV:PATH}".to_string()),
+            ("X-Trace".to_string(), "fulu".to_string()),
+        ];
+        let resolved = resolve_remote_headers(&ok).unwrap();
+        assert_eq!(resolved[0].0, "Authorization");
+        assert!(!resolved[0].1.contains("${ENV:"));
+        assert!(resolved[0].1.len() > 1);
+        assert_eq!(resolved[1].1, "fulu");
+
+        // 换行注入同样拒绝。
+        let injected = vec![("X-Trace".to_string(), "a\r\nX-Evil: 1".to_string())];
+        assert!(resolve_remote_headers(&injected).is_err());
+    }
+
+    #[test]
+    fn https_client_validates_before_connecting() {
+        let policy = RemotePolicy::from_hosts(vec!["mcp.example.com".into()]);
+        // 不在白名单：构造即失败，不会产生任何进程或网络动作。
+        assert!(
+            McpHttpsClient::new("s", "https://evil.example.net/mcp", Vec::new(), &policy).is_err()
+        );
+        // 白名单内但凭据缺失：同样在连接前失败。
+        assert!(
+            McpHttpsClient::new(
+                "s",
+                "https://mcp.example.com/mcp",
+                vec![(
+                    "Authorization".to_string(),
+                    "${ENV:FULU_UNSET_ZZZ}".to_string()
+                )],
+                &policy
+            )
+            .is_err()
+        );
+        let client =
+            McpHttpsClient::new("s", "https://mcp.example.com/mcp", Vec::new(), &policy).unwrap();
+        assert_eq!(client.describe(), "https://mcp.example.com/mcp");
+    }
+
+    #[test]
+    fn curl_path_fails_honestly_when_unreachable() {
+        // 直连本机未监听端口：要么 curl 报连接失败，要么本机没有 curl。
+        // 两种情况都必须是**如实报错**，绝不能伪装成功。
+        let result = curl_post("https://127.0.0.1:1/mcp", &[], b"{}");
+        let Err(McpError(message)) = result else {
+            panic!("连不上时不能返回成功");
+        };
+        assert!(message.contains("curl"), "{message}");
+        assert!(
+            message.contains("退出码") || message.contains("无法启动"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn curl_response_parsing_skips_transition_blocks() {
+        let raw = b"HTTP/1.1 200 Connection established\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: abc\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+        let parsed = parse_curl_response(raw).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(
+            parsed
+                .headers
+                .iter()
+                .find(|(name, _)| name == "mcp-session-id")
+                .map(|(_, value)| value.as_str()),
+            Some("abc")
+        );
+        assert!(String::from_utf8_lossy(&parsed.body).contains("\"result\""));
+    }
+
+    #[test]
+    fn curl_response_parsing_reports_garbage_as_error() {
+        let Err(McpError(message)) = parse_curl_response(b"not-http") else {
+            panic!("非 HTTP 响应必须报错");
+        };
+        assert!(message.contains("空行"), "{message}");
     }
 
     #[test]

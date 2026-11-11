@@ -315,6 +315,14 @@ impl OuterSectReport {
     }
 }
 
+/// 摄行（T16）进程级解锁判定。
+///
+/// 独立成纯函数：既能被环境变量路径复用，也能在测试里断言「只有 `1` 才算解锁」
+/// （`0`/`true`/空白一律不算——最高权限不接受含糊值）。
+fn shexing_unlock_matches(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
 /// 问天（T15）的后端挑选与 MCP 适配。
 ///
 /// 候选规则（宁缺勿滥，命中才算）：工具全名或描述含 `search` / `搜索`；
@@ -488,6 +496,8 @@ pub struct AltarSession {
     summon: Option<Arc<SummonTool>>,
     /// 问天后端（T15）；空 = 未启用搜索（工具本体仍登记，调用时明确报错）。
     search_backends: Vec<String>,
+    /// 摄行（T16）：默认 false，工具**不存在**于名册与风火轮。
+    shexing: bool,
 }
 
 impl Default for AltarSession {
@@ -525,6 +535,7 @@ impl AltarSession {
             skills: GlobalSkillVerifier::from_defaults(),
             summon: None,
             search_backends: Vec::new(),
+            shexing: false,
         }
     }
 
@@ -619,6 +630,71 @@ impl AltarSession {
 
     pub fn summoning_enabled(&self) -> bool {
         self.summon.is_some()
+    }
+
+    /// 启用摄行（T16）：电脑控制四件套。
+    ///
+    /// **默认不存在**——不调用本方法时，模型在箓与风火轮里都看不到这些工具。
+    /// 解锁需要两把钥匙：进程环境变量 `FULU_ALLOW_SHEXING=1` + 本方法（CLI
+    /// `--shexing` / GUI 开关）。授权为受限级 + `Destructive`（→ 敕门
+    /// `EveryCall`，每一次动作都要人点头）+ 配额 20 次。风险评估见 docs/03 第 4 节。
+    pub fn enable_shexing(&mut self) -> Result<(), AppError> {
+        if !shexing_unlock_matches(std::env::var("FULU_ALLOW_SHEXING").ok().as_deref()) {
+            return Err(AppError::Probe(
+                "摄行默认禁用：需先设置环境变量 FULU_ALLOW_SHEXING=1（进程级）+ 本开关（会话级）\
+                 ——最高权限要两把钥匙，任一缺失都不注册"
+                    .into(),
+            ));
+        }
+        self.enable_shexing_unlocked();
+        Ok(())
+    }
+
+    /// 真正注册摄行四件套（环境变量已由调用方核验）。测试直接调它。
+    fn enable_shexing_unlocked(&mut self) {
+        self.tools
+            .register(Arc::new(fulu_tools::ShexingTypeTool) as Arc<dyn Tool>);
+        self.tools
+            .register(Arc::new(fulu_tools::ShexingKeyTool) as Arc<dyn Tool>);
+        self.tools
+            .register(Arc::new(fulu_tools::ShexingClickTool) as Arc<dyn Tool>);
+        self.tools
+            .register(Arc::new(fulu_tools::ShexingScreenshotTool) as Arc<dyn Tool>);
+
+        let specs: [(&str, &str, &str); 4] = [
+            (
+                fulu_tools::SHEXING_TOOL_IDS[0],
+                "向当前前台窗口键入文本（最高权限，逐次确认）",
+                r#"{"type":"object","properties":{"text":{"type":"string","description":"要键入的文本（≤2000 字符）"}},"required":["text"]}"#,
+            ),
+            (
+                fulu_tools::SHEXING_TOOL_IDS[1],
+                "发送组合键，SendKeys 语法子集（如 ^s、%{TAB}、{ENTER}）",
+                r#"{"type":"object","properties":{"keys":{"type":"string","description":"键位串，只允许字母数字、^ % + 与 {NAME}"}},"required":["keys"]}"#,
+            ),
+            (
+                fulu_tools::SHEXING_TOOL_IDS[2],
+                "移动光标并点击（先确认坐标，误点不可撤销）",
+                r#"{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"string","enum":["left","right"]}},"required":["x","y"]}"#,
+            ),
+            (
+                fulu_tools::SHEXING_TOOL_IDS[3],
+                "截屏并写入工作区 .png（不联网、不自动进提示词）",
+                r#"{"type":"object","properties":{"path":{"type":"string","description":"相对工作区的 .png 路径"}},"required":["path"]}"#,
+            ),
+        ];
+        for (id, description, parameters) in specs {
+            let mut grant = ToolGrant::limited(id, description)
+                .with_risk(RiskClass::Destructive)
+                .with_parameters_json(parameters);
+            grant.max_calls = 20;
+            self.register.grant_tool(grant);
+        }
+        self.shexing = true;
+    }
+
+    pub fn shexing_enabled(&self) -> bool {
+        self.shexing
     }
 
     /// 启用问天（T15）：从**已接入**的外宗工具里挑搜索类后端，绑给
@@ -1027,6 +1103,13 @@ impl AltarSession {
                 "召将子符：summon.fu 已启用（minimal 档、独立预算、步数上限 {SUB_MAX_STEPS}、禁环回、不继承父符高危授权；每次分派需敕可，配额 4 次）"
             ));
         }
+        // T16：摄行是最高权限能力，确认页必须写明它已解锁、且每次动作都要点头。
+        if self.shexing_enabled() {
+            plan.notes.push(
+                "摄行：shexing.* 已显式解锁（键鼠与截屏；每一次动作都要人点头，配额 20 次/符；默认不存在）"
+                    .to_owned(),
+            );
+        }
         // T15：问天已绑后端时，确认页列出真实出网路径（Destructive 逐次确认）。
         let backends = self.search_backend_ids();
         if !backends.is_empty() {
@@ -1362,6 +1445,66 @@ mod tests {
             session.register.authorize(&strict),
             Err(fulu_register::RegisterError::PermissionTooLow { .. })
         ));
+    }
+
+    // ---- T16 摄行：默认不存在、两把钥匙、逐次确认 ----
+
+    #[test]
+    fn shexing_is_absent_by_default_and_needs_both_keys() {
+        let mut session = AltarSession::new();
+        assert!(!session.shexing_enabled());
+        assert!(
+            !session
+                .tool_ids()
+                .iter()
+                .any(|id| id.starts_with("shexing.")),
+            "默认名册里不能出现摄行：{:?}",
+            session.tool_ids()
+        );
+        // 环境变量判定：只有精确的 "1" 才算解锁，模糊值一概不算。
+        assert!(shexing_unlock_matches(Some("1")));
+        assert!(shexing_unlock_matches(Some(" 1 ")));
+        for raw in [Some("0"), Some("true"), Some("yes"), Some(""), None] {
+            assert!(!shexing_unlock_matches(raw), "不得把 {raw:?} 当解锁");
+        }
+
+        // 真正的解锁路径（跳过环境变量，直接测登记语义）。
+        session.enable_shexing_unlocked();
+        assert!(session.shexing_enabled());
+        for id in fulu_tools::SHEXING_TOOL_IDS {
+            assert!(
+                session.tool_ids().iter().any(|known| known == id),
+                "解锁后名册必须有 {id}"
+            );
+            let grant = session.register.tool(id).expect("授权必须登记");
+            assert_eq!(grant.permission, fulu_register::Permission::Limited);
+            assert_eq!(grant.risk, RiskClass::Destructive, "必须是逐次确认");
+            assert_eq!(grant.max_calls, 20, "必须有配额，防无限点击");
+        }
+        // 确认等级映射：Destructive → EveryCall（不是每符一次）。
+        assert_eq!(
+            RiskClass::Destructive.confirmation(),
+            Confirmation::EveryCall
+        );
+    }
+
+    #[test]
+    fn shexing_unlock_without_env_is_refused() {
+        // 环境变量若被开发者手动设成 1，这条断言会自动跳过（不制造假红）。
+        if shexing_unlock_matches(std::env::var("FULU_ALLOW_SHEXING").ok().as_deref()) {
+            return;
+        }
+        let mut session = AltarSession::new();
+        let error = session.enable_shexing().unwrap_err();
+        assert!(format!("{error}").contains("FULU_ALLOW_SHEXING"));
+        // 拒绝之后不能留下半开状态。
+        assert!(!session.shexing_enabled());
+        assert!(
+            !session
+                .tool_ids()
+                .iter()
+                .any(|id| id.starts_with("shexing."))
+        );
     }
 
     /// T15：外宗里挑搜索类工具——只认名字/描述命中，query 键名优先采信 schema。

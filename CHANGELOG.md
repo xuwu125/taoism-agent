@@ -11,6 +11,9 @@
 - **问天搜索（T15）**：`ask.search` 可插拔后端（`SearchBackend` trait）；fulu-app 自动从已接入外宗挑选搜索类 MCP 工具，无后端明确报错、绝不静默联网；受限级 + Destructive（逐次确认）+ 配额 8；CLI `--search`。
 - **moli 浏览器（T14）**：`moli.open` 用外部 Edge/Chrome 无头 `--dump-dom` 抽取正文文本——进程内零 TLS、零 WebView；URL 仅 http/https + 拒绝 userinfo + 域名白名单；`wait_ms` 虚拟时间预算（JS 真实执行）；受限级 + Destructive；真机集成测试（mock HTTP + Edge + JS 断言）。
 - **外宗多模态块告警（T18）**：非文本内容块逐类型统计，输出末尾显式告警（不被截断吞掉），不再静默丢弃。
+- **远程 MCP over HTTPS（T19，安全边界变更，用户已批准）**：`McpHttpsClient` 把 TLS 交给系统 `curl`（fulu 依赖树仍零 TLS）；主机白名单 `~/.fulu/remote-mcp.json`（`fulu mcp remote allow/deny/list`）；禁重定向、TLS ≥ 1.2、拒绝 IP 字面量 / localhost / userinfo；敏感请求头必须是 `${ENV:VAR}` 引用，字面量拒绝连接；8 MiB / 60s 硬上限。
+- **摄行电脑控制（T16，最高权限）**：`shexing.type / .key / .click / .screenshot` 默认**不注册**（工具不存在），需 `FULU_ALLOW_SHEXING=1` + `--shexing` 双钥匙；授权 `Limited + Destructive`（逐次确认）+ 配额 20；键位白名单拒绝注入，截屏只写工作区 `.png`；非 Windows 如实报不支持。
+- **决策与设计文档**：新增 `docs/03-决策记录与增量设计.md`——T41 七条待确认事项逐条定案、T13 provider/SSE/能力协商设计稿、T19 威胁模型、T16 风险评估。
 
 ## v0.3.0（2026-11-11）
 

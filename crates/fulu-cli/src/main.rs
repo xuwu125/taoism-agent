@@ -66,6 +66,8 @@ fn help() {
          \x20 fulu mcp risk list                  查看 fulu 自有风险覆盖表\n\
          \x20 fulu mcp risk set <工具全名> <observe|mutate|destructive>   写入覆盖（只按全名）\n\
          \x20 fulu mcp risk unset <工具全名>      撤销一条覆盖（均可用 --risk-overrides 指定文件）\n\
+         \x20 fulu mcp remote list                远程 MCP 主机白名单（默认空 = 全部拒绝）\n\
+         \x20 fulu mcp remote allow|deny <域名>    放行/撤销（只写 ~/.fulu/remote-mcp.json）\n\
          \x20 fulu skills list [根目录]            符胆：全局技能包只读展示\n\
          \x20 fulu taiji run <符图.json> --confirm  太极：按 DAG 拓扑序逐张符走完整仪轨\n\
          \x20 fulu init [--workspace <目录>]       引符：开箱基础配置（生成第一张示例符）\n\
@@ -75,6 +77,9 @@ fn help() {
          \x20                 --mcp [配置路径]  焚化时接入外宗（受限级，需沙箱 ≥ limited）\n\
          \x20                 --allow-risk <observe|mutate|destructive>  预授权高危召将\n\
          \x20                 --ask            高危召将逐次在终端里问人\n\
+         \x20                 --summon         启用召将子符（独立法坛、禁环回、不继承高危授权）\n\
+         \x20                 --search         启用问天（从已接入外宗挑搜索后端，Destructive）\n\
+         \x20                 --shexing        启用摄行（另需 FULU_ALLOW_SHEXING=1，逐次确认）\n\
          \x20                 --strict-outer-sect  不采信 server 只读自述，一概按破坏性处理\n\
          \x20                 --risk-overrides <文件>  指定 fulu 风险覆盖表（默认 ~/.fulu/outer-sect-risk.json）\n\
          \x20                 --prompt-mode <full|minimal|none>  提示词装配档位（默认 full）\n\
@@ -350,6 +355,8 @@ struct AltarOptions {
     summon: bool,
     /// T15：启用问天（从已接入外宗自动挑选搜索类后端）
     search: bool,
+    /// T16：启用摄行（电脑控制；另需环境变量 FULU_ALLOW_SHEXING=1）
+    shexing: bool,
 }
 
 fn parse_altar_options(args: &[String]) -> AltarOptions {
@@ -392,6 +399,7 @@ fn parse_altar_options(args: &[String]) -> AltarOptions {
             "--ask" => options.ask = true,
             "--summon" => options.summon = true,
             "--search" => options.search = true,
+            "--shexing" => options.shexing = true,
             "--context-ip" => options.context_ip = true,
             "--no-context" => options.no_context = true,
             "--prompt-mode" => {
@@ -586,6 +594,18 @@ fn altar(args: &[String]) -> i32 {
         println!(
             "[OK] 召将子符已启用：summon.fu（minimal 档、独立预算、步数上限 8、禁环回、不继承父符高危授权；分派需敕可）"
         );
+    }
+    // T16：摄行默认不存在；需要环境变量 + 本开关两把钥匙。
+    if options.shexing {
+        match session.enable_shexing() {
+            Ok(()) => println!(
+                "[OK] 摄行已解锁：shexing.type / .key / .click / .screenshot（每一次动作都要人点头，配额 20 次/符）"
+            ),
+            Err(error) => {
+                eprintln!("[ERR] {error}");
+                return 2;
+            }
+        }
     }
     if let Some(explicit) = &options.mcp {
         // 外宗接入发生在 dry-run 之前：工具面必须出现在待焚计划里，
@@ -1039,13 +1059,80 @@ fn mcp_risk(args: &[String]) -> i32 {
     }
 }
 
+/// `fulu mcp remote`：远程 MCP 主机白名单（T19）。
+///
+/// 只写 **fulu 自有** `~/.fulu/remote-mcp.json`；绝不改任何 MCP server 配置。
+/// 白名单为空 = 远程 MCP 全部拒绝（默认关闭）。
+fn mcp_remote(args: &[String]) -> i32 {
+    let Some(action) = args.first().map(String::as_str) else {
+        eprintln!("[ERR] 用法：fulu mcp remote <list|allow <域名>|deny <域名>> [--policy <文件>]");
+        return 2;
+    };
+    let path = args
+        .iter()
+        .position(|arg| arg == "--policy")
+        .and_then(|index| args.get(index + 1))
+        .map(PathBuf::from)
+        .or_else(|| fulu_mcp::remote_policy_paths().into_iter().next())
+        .unwrap_or_else(|| PathBuf::from(fulu_mcp::REMOTE_POLICY_FILE));
+    println!("[OK] 远程 MCP 白名单（fulu 自有配置）：{}", path.display());
+    println!("     只影响远程 MCP 放行；IP 字面量/ localhost 一律拒绝，IP 不在白名单内即不出网。");
+
+    match action {
+        "list" => {
+            let (policy, issues) = fulu_mcp::RemotePolicy::load(std::slice::from_ref(&path));
+            for issue in &issues {
+                println!("  [WARN] {issue}");
+            }
+            if policy.is_empty() {
+                println!("  （白名单为空：远程 MCP 全部拒绝——这是默认值，不是故障）");
+            }
+            for host in policy.hosts() {
+                println!("  - {host}");
+            }
+            0
+        }
+        "allow" | "deny" => {
+            let host = args.get(1).map(String::as_str).unwrap_or_default().trim();
+            if host.is_empty() || host.starts_with("--") {
+                eprintln!("[ERR] 用法：fulu mcp remote {action} <域名>");
+                return 2;
+            }
+            match fulu_mcp::set_remote_host(&path, host, action == "allow") {
+                Ok((policy, issues)) => {
+                    for issue in issues {
+                        println!("  [WARN] {issue}");
+                    }
+                    if policy.is_empty() {
+                        println!("  [OK] 白名单已清空：远程 MCP 回到默认拒绝");
+                    } else {
+                        println!("  [OK] 当前放行：{}", policy.hosts().join("、"));
+                    }
+                    0
+                }
+                Err(error) => {
+                    eprintln!("[ERR] {error}");
+                    2
+                }
+            }
+        }
+        other => {
+            eprintln!("[ERR] 未知 mcp remote 子命令：{other}");
+            2
+        }
+    }
+}
+
 fn mcp(args: &[String]) -> i32 {
     let Some(command) = args.first().map(String::as_str) else {
-        eprintln!("[ERR] 缺少 mcp 子命令：list / risk");
+        eprintln!("[ERR] 缺少 mcp 子命令：list / risk / remote");
         return 2;
     };
     if command == "risk" {
         return mcp_risk(&args[1..]);
+    }
+    if command == "remote" {
+        return mcp_remote(&args[1..]);
     }
     if command != "list" {
         eprintln!("[ERR] 未知 mcp 子命令：{command}");
