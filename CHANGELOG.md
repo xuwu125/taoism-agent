@@ -5,6 +5,7 @@
 ## v0.3.1（2026-11-11，进行中）
 
 ### 新增
+- **GUI 中止按钮 + 「取消」独立错误类型（T13 收尾）**：焚化途中可点「中止」置旗标，焚符线程每收到一个流事件查一次，置真即返回 `StreamControl::Cancel`，provider 立刻关连接、法坛落 `Cancelled` 终态并记账已收字数；按中止时顺带把正在等的敕门卡片按「敕否」答掉，否则线程阻塞在等人点头上、旗标永远读不到。语义同时上移到错误类型：新增 `RitualError::Cancelled`（「中止 · 调用方取消」）与 `AppError::Cancelled`（「中止」），`From<RitualError>` 特判保留区分——此前取消走 `RitualError::Provider`，界面只能显示成「炸炉」，与「取消是独立终态」的设计自相矛盾。界面文案改为「已中止（不是炸炉）」，不给绿色成功的错觉。**未验**：按钮的真人点击、真实 `llama-server` 的中断行为（详见 docs/02 第 34 节）。
 - **太极符图编排（T09）**：`fulu-orchestrator` 从占位骨架变为可用 DAG 编排器；`fulu taiji run <符图.json> --confirm` 每节点走完整仪轨；`system_digest` 破符语义（dry-run 后提示词被换即破符）。
 - **召将子符（T10）**：`summon.fu` 把「分派子符」做成可受箓、可敕门的工具（受限级 + Mutate + 配额 4）；子符独立 `AltarSession`（minimal 档、独立预算、步数裁剪到 8、禁环回双防线、不继承父符高危授权）、全程记账进父符缴符事件链；CLI `altar run --summon`。
 - **fs.write 受控写入（T17）**：工作区锁定 + 覆盖前强制备份（`.fulu-bak`，重名编号退避）+ 单次 256 KiB 上限 + 追加模式；受限级 + Mutate。

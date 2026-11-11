@@ -64,6 +64,8 @@ pub enum AppError {
     Io(String),
     /// 箓牒（凭据库）：取不到凭据就是拒绝执行，不退化成「用空密钥试一次」
     Vault(String),
+    /// 调用方中止：独立于 `Ritual`，否则界面只能靠文案猜「这是炸炉还是人按了中止」
+    Cancelled(String),
 }
 
 impl fmt::Display for AppError {
@@ -75,6 +77,7 @@ impl fmt::Display for AppError {
             Self::Probe(msg) => write!(f, "本地推理服务：{msg}"),
             Self::Io(msg) => write!(f, "I/O：{msg}"),
             Self::Vault(msg) => write!(f, "箓牒：{msg}"),
+            Self::Cancelled(msg) => write!(f, "中止：{msg}"),
         }
     }
 }
@@ -83,7 +86,11 @@ impl std::error::Error for AppError {}
 
 impl From<RitualError> for AppError {
     fn from(error: RitualError) -> Self {
-        Self::Ritual(error.to_string())
+        match error {
+            // 取消不降级成 Ritual 字符串：调用方需要能 match 出「这是人按了中止」。
+            RitualError::Cancelled(msg) => Self::Cancelled(msg),
+            other => Self::Ritual(other.to_string()),
+        }
     }
 }
 
@@ -1509,6 +1516,22 @@ mod tests {
         let report = inspect_fu(&text).unwrap();
         assert!(report.valid);
         assert_eq!(report.seal.len(), 64);
+    }
+
+    /// 取消必须能一路穿透到界面层：`RitualError::Cancelled` → `AppError::Cancelled`。
+    /// 否则 GUI 只能按文案猜「这是人按了中止还是炸炉」，迟早显示成故障。
+    #[test]
+    fn cancelled_ritual_error_stays_distinguishable_through_app_error() {
+        let error: AppError = fulu_runtime::RitualError::Cancelled("调用方取消".into()).into();
+        assert!(
+            matches!(error, AppError::Cancelled(ref msg) if msg.contains("取消")),
+            "取消不许降级成 Ritual 字符串：{error:?}"
+        );
+        assert!(error.to_string().starts_with("中止："), "{error}");
+        // 对照组：真炸炉仍是 Ritual，不能被误标成中止。
+        let exploded: AppError = fulu_runtime::RitualError::Provider("断流".into()).into();
+        assert!(matches!(exploded, AppError::Ritual(_)));
+        assert!(exploded.to_string().contains("炸炉"), "{exploded}");
     }
 
     #[test]

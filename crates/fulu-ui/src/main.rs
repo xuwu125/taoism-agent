@@ -18,11 +18,19 @@ use confirm::ConfirmExchange;
 use eframe::egui;
 use fulu_app::{AltarSession, ConfirmVerdict, DryRunPlan, Fu, Receipt, RiskClass};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
+/// 焚化失败。**必须区分「人按了中止」与「真炸炉」**——两者都走 `Err`，
+/// 若界面上都写成「炸炉」，用户会去查一个不存在的 bug。
+struct BurnFailure {
+    message: String,
+    cancelled: bool,
+}
+
 /// 焚化任务：后台线程持有 session，跑完连人带结果送回来。
-type BurnOutcome = (AltarSession, Result<Receipt, String>);
+type BurnOutcome = (AltarSession, Result<Receipt, BurnFailure>);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tone {
@@ -38,6 +46,9 @@ struct FuluApp {
     stream_rx: Option<Receiver<String>>,
     /// 已收到的增量正文（仅显示；判定一律看回执）
     live_text: String,
+    /// 中止旗标：焚符线程每收到一个流事件查一次，置真即返回 `StreamControl::Cancel`。
+    /// 只在**流式焚化**下生效——provider 不支持流式时会立刻报错，不会卡在这里等。
+    cancel_flag: Option<Arc<AtomicBool>>,
     /// 界面线程的 Context：供焚符线程里的敕门确认器唤醒界面。
     ctx: Option<egui::Context>,
     /// 敕门收件箱：焚符线程的 ChannelConfirmer 往这里丢「请人点头」。
@@ -142,6 +153,7 @@ impl FuluApp {
             burning: None,
             stream_rx: None,
             live_text: String::new(),
+            cancel_flag: None,
             ctx: None,
             confirm_inbox: None,
             pending_confirm: None,
@@ -309,8 +321,15 @@ impl FuluApp {
         let (tx, rx) = std::sync::mpsc::channel();
         let (delta_tx, delta_rx) = std::sync::mpsc::channel::<String>();
         let repaint = ctx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
         std::thread::spawn(move || {
             let mut sink = |event: fulu_app::StreamEvent| -> fulu_app::StreamControl {
+                // 中止：**每个事件都查一次**，不只在文本增量上查。
+                // provider 收到 `Cancel` 会立刻关连接，法坛落 `Cancelled` 终态。
+                if flag.load(Ordering::Relaxed) {
+                    return fulu_app::StreamControl::Cancel;
+                }
                 if let fulu_app::StreamEvent::TextDelta(text) = event {
                     // 发送失败说明界面已关：忽略即可，法坛不因显示层消失而中断判定。
                     let _ = delta_tx.send(text);
@@ -320,11 +339,16 @@ impl FuluApp {
             };
             let outcome = session
                 .ignite_with_stream(&fu, &plan, true, &mut sink)
-                .map_err(|error| error.to_string());
+                .map_err(|error| BurnFailure {
+                    // 取消是独立错误变体（`AppError::Cancelled`），不靠文案猜。
+                    cancelled: matches!(error, fulu_app::AppError::Cancelled(_)),
+                    message: error.to_string(),
+                });
             let _ = tx.send((session, outcome));
         });
         self.burning = Some(rx);
         self.stream_rx = Some(delta_rx);
+        self.cancel_flag = Some(cancel);
         self.live_text.clear();
         let note = if self.allow_high_risk {
             "焚符上表……（后台执行，此点起不可撤销；已预授权，不再逐次弹窗）"
@@ -332,6 +356,28 @@ impl FuluApp {
             "焚符上表……（后台执行；高危召将弹出敕门卡片，等你逐次点头）"
         };
         self.say(note, Tone::Info);
+    }
+
+    /// 中止一次正在进行的焚化。
+    ///
+    /// 边界（写死，免得用户以为按了就等于没发生）：
+    /// 1. 只置旗标，**不杀线程**——法坛要自己把 `Cancelled` 写完缴符再退出；
+    /// 2. 下一个流事件到达时才生效。模型还在「想」、一个增量都没吐时，按钮按下去
+    ///    界面立刻变「已请求中止」，但要等第一个增量才真正断开；
+    /// 3. 顺带把正在等的敕门卡片按「敕否」答掉，否则焚符线程会一直卡在等人点头；
+    /// 4. **取消不是回滚**：已经执行过的召将副作用不会消失。
+    fn request_cancel(&mut self) {
+        let Some(flag) = &self.cancel_flag else {
+            return;
+        };
+        flag.store(true, Ordering::Relaxed);
+        if let Some(exchange) = self.pending_confirm.take() {
+            let _ = exchange.1.send(ConfirmVerdict::Deny);
+        }
+        self.say(
+            "已请求中止：下一个增量到达时断开；已执行的召将不可回滚（缴符会记「取消」）",
+            Tone::Info,
+        );
     }
 
     fn poll_burn(&mut self) {
@@ -360,6 +406,7 @@ impl FuluApp {
                 self.session = Some(session);
                 self.burning = None;
                 self.stream_rx = None;
+                self.cancel_flag = None;
                 self.confirm_inbox = None;
                 self.pending_confirm = None;
                 match outcome {
@@ -389,8 +436,21 @@ impl FuluApp {
                         // T36 火光：只在此刻点一次，纯视觉，不参与任何判定。
                         self.fire_at = Some(std::time::Instant::now());
                     }
-                    Err(error) => {
-                        self.say(format!("炸炉：{error}"), Tone::Bad);
+                    Err(failure) => {
+                        if failure.cancelled {
+                            // 中止是独立终态：不写「炸炉」，也不给绿色成功的错觉。
+                            self.say(
+                                format!(
+                                    "已中止（不是炸炉）· {}｜已收 {} 字只记账不回喂；召将副作用不回滚",
+                                    failure.message,
+                                    self.live_text.chars().count()
+                                ),
+                                Tone::Info,
+                            );
+                            self.receipt = None;
+                        } else {
+                            self.say(format!("炸炉：{}", failure.message), Tone::Bad);
+                        }
                         self.plan = None;
                         self.confirm_checked = false;
                     }
@@ -399,6 +459,7 @@ impl FuluApp {
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.burning = None;
+                self.cancel_flag = None;
                 self.confirm_inbox = None;
                 self.pending_confirm = None;
                 self.say("焚符线程异常退出", Tone::Bad);
@@ -1029,6 +1090,27 @@ impl FuluApp {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("焚符中……（后台线程，界面仍可操作，但不能重复提交）");
+                    let requested = self
+                        .cancel_flag
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Relaxed));
+                    ui.add_enabled_ui(!requested, |ui| {
+                        let button = ui.button(if requested {
+                            "已请求中止……"
+                        } else {
+                            "中止"
+                        });
+                        if button
+                            .on_hover_text(
+                                "置中止旗标，法坛在下一个增量到达时断开连接并记「取消」终态。\n\
+                                 不等于回滚：已执行的召将副作用不会消失。\n\
+                                 模型还在思考、一个增量都没吐时按下，要等第一个增量才真正生效。",
+                            )
+                            .clicked()
+                        {
+                            self.request_cancel();
+                        }
+                    });
                 });
             }
 

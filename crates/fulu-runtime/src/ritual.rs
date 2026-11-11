@@ -39,6 +39,9 @@ pub enum RitualError {
     Timeout(String),
     StepLimitExceeded(u32),
     Provider(String),
+    /// 调用方主动中止（`StreamControl::Cancel`）。**不是故障**：既不并入炸炉，
+    /// 也不并入过坛，与 `TalismanState::Cancelled` 一一对应。
+    Cancelled(String),
     ToolRejected(String),
     Transition(String),
     Audit(String),
@@ -57,6 +60,7 @@ impl fmt::Display for RitualError {
             Self::Timeout(msg) => write!(f, "过坛 · 超时：{msg}"),
             Self::StepLimitExceeded(limit) => write!(f, "炸炉 · 步数达到硬上限 {limit}"),
             Self::Provider(msg) => write!(f, "炸炉 · 推理失败：{msg}"),
+            Self::Cancelled(msg) => write!(f, "中止 · 调用方取消：{msg}"),
             Self::ToolRejected(msg) => write!(f, "炸炉 · 召将失败：{msg}"),
             Self::Transition(msg) => write!(f, "仪轨迁移被拒：{msg}"),
             Self::Audit(msg) => write!(f, "缴符失败：{msg}"),
@@ -549,7 +553,7 @@ impl<'a> Altar<'a> {
                         TalismanState::Cancelled,
                         EventKind::Cancelled,
                         &detail,
-                        RitualError::Provider(detail.clone()),
+                        RitualError::Cancelled(detail.clone()),
                     );
                 }
                 Err(ProviderError::Timeout) => {
@@ -963,7 +967,52 @@ mod tests {
             error
         };
         // 取消不是成功，也不是炸炉：终态是「中止」，并且没有回执正文。
-        assert!(matches!(error, RitualError::Provider(ref msg) if msg.contains("取消")));
+        // 错误类型也必须是独立的 `Cancelled`——否则调用方只能靠解析文案区分，
+        // 迟早会把「人中止」显示成「炸炉」。
+        assert!(
+            matches!(error, RitualError::Cancelled(ref msg) if msg.contains("取消")),
+            "取消必须落独立错误变体：{error:?}"
+        );
+        assert!(
+            error.to_string().starts_with("中止"),
+            "文案不许写成炸炉：{error}"
+        );
+    }
+
+    /// 取消必须发生在**召将执行之前**：工具调用是「收齐才执行」的，
+    /// 收一半就取消时一个工具都不许跑——否则「中止」会变成「已经动过手却没记账」。
+    #[test]
+    fn cancelling_during_tool_call_delta_executes_no_tool() {
+        let (_, register, tools, mut audit) = fixture();
+        let fu = fu_with_echo();
+        let provider = StubProvider::default();
+        provider.push_reply(call_echo());
+        let mut sink = |event: StreamEvent| -> StreamControl {
+            if matches!(event, StreamEvent::ToolCallDelta { .. }) {
+                return StreamControl::Cancel;
+            }
+            StreamControl::Continue
+        };
+        let error = {
+            let mut altar = altar(&provider, &tools, &register, &mut audit);
+            altar.set_stream_sink(&mut sink);
+            let plan = altar.prepare(&fu).unwrap();
+            let error = altar.ignite(&fu, &plan, true).unwrap_err();
+            assert!(
+                !altar
+                    .audit
+                    .events()
+                    .iter()
+                    .any(|event| event.kind == EventKind::ToolResult),
+                "取消不得让已收一半的召将执行"
+            );
+            let last = altar.audit.events().last().cloned().unwrap();
+            assert_eq!(last.kind, EventKind::Cancelled);
+            assert_eq!(last.state, TalismanState::Cancelled);
+            error
+        };
+        assert!(matches!(error, RitualError::Cancelled(_)), "{error:?}");
+        assert_eq!(provider.call_count(), 1, "取消不是故障，不得自动重试");
     }
 
     #[test]
