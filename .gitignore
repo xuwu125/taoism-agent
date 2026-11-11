@@ -30,3 +30,7 @@ models/cache/
 # 本地运行产物
 fulu.log
 model_info.txt
+
+# Python 缓存（CI 会 py_compile 验收 mock）
+__pycache__/
+*.pyc

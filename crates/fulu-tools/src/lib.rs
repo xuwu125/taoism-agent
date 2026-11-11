@@ -692,22 +692,43 @@ impl Tool for MoliTool {
     }
 }
 
+/// 无头浏览器参数表（纯函数，便于测试锁住「必须用独立 profile」）。
+fn moli_headless_args(wait_ms: u64, profile: &std::path::Path) -> Vec<String> {
+    vec![
+        "--headless=new".into(),
+        "--disable-gpu".into(),
+        "--no-first-run".into(),
+        "--no-default-browser-check".into(),
+        "--dump-dom".into(),
+        format!("--virtual-time-budget={wait_ms}"),
+        format!("--user-data-dir={}", profile.display()),
+    ]
+}
+
 /// 用外部浏览器无头拉取 DOM（独立函数便于真机集成测试）。
 fn open_with_browser(browser: &Path, url: &str, wait_ms: u64) -> Result<String, ToolError> {
     use std::process::{Command, Stdio};
+    // 独立临时 profile：用户开着 Edge/Chrome 时，同 profile 的新进程会把请求
+    // **转交给已有实例后立刻退出**（exit 0、stdout 为空），拿到的就是空页面。
+    // 只有另给一个 --user-data-dir 才真的起一个无头实例；用完尽力删掉。
+    let profile = std::env::temp_dir().join(format!(
+        "fulu-moli-profile-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
     let output = Command::new(browser)
-        .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--dump-dom",
-            &format!("--virtual-time-budget={wait_ms}"),
-            url,
-        ])
+        .args(moli_headless_args(wait_ms, &profile))
+        .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null())
-        .output()
-        .map_err(|e| ToolError::Io(format!("moli 启动浏览器失败：{e}")))?;
+        .output();
+    // 先清理再判错：浏览器没起来时 profile 往往已经被创建了一半。
+    let _ = std::fs::remove_dir_all(&profile);
+    let output = output.map_err(|e| ToolError::Io(format!("moli 启动浏览器失败：{e}")))?;
     if !output.status.success() {
         return Err(ToolError::Io(format!(
             "moli 浏览器退出码 {:?}，页面拉取失败",
@@ -1706,21 +1727,46 @@ mod tests {
         assert_eq!(url, "https://Docs.Example.COM/path?q=1");
     }
 
+    /// 无头参数必须带独立 profile：本机开着 Edge 时，共用默认 profile 的新进程
+    /// 会把请求转交给已有实例并立刻退出（exit 0 + 空 stdout），moli 会**静默**
+    /// 拉回空页。这条测试锁住那个修复，防止以后被人「简化」掉。
+    #[test]
+    fn moli_headless_args_always_isolate_the_profile() {
+        let args = moli_headless_args(3_000, std::path::Path::new("fulu-moli-profile-x"));
+        assert!(args.iter().any(|a| a == "--dump-dom"), "{args:?}");
+        assert!(
+            args.iter().any(|a| a == "--virtual-time-budget=3000"),
+            "{args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("--user-data-dir=") && a.len() > "--user-data-dir=".len()),
+            "无头实例必须用独立 profile：{args:?}"
+        );
+    }
+
     /// 真机集成：本机有 Edge/Chrome 时，用本地 mock HTTP 服务走一次完整链路
     /// （无头浏览器 → DOM → 正文抽取）。没有浏览器则跳过（CI 容器常见）。
     #[test]
     fn moli_end_to_end_with_real_browser_when_available() {
         use std::io::{Read as _, Write as _};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let Some(browser) = moli_browser_candidates().into_iter().find(|p| p.is_file()) else {
             return; // 无浏览器环境：跳过而非失败
         };
         // 最小 mock HTTP 服务：一个 HTML 页面 + JS 改写 DOM。
+        //
+        // **必须循环 accept**：headless Chromium 打开一个页面会发起不止一个连接
+        // （预连接 / favicon / 重试），只接一次会让真正的页面请求落空，DOM 里就没有正文。
+        // 这正是本测试此前偶发失败（单跑过、全量偶发不过）的原因。
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_in_thread = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
             let body = "<html><body><h1>急急如律令</h1>\
                 <script>document.body.innerHTML += '<p id=\"js\">js-ok</p>';</script>\
                 </body></html>";
@@ -1728,13 +1774,40 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            let _ = stream.write_all(response.as_bytes());
+            while !stop_in_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
         });
         let url = format!("http://127.0.0.1:{port}/");
-        let dom = open_with_browser(&browser, &url, MOLI_WAIT_DEFAULT_MS).unwrap();
+        let dom = match open_with_browser(&browser, &url, MOLI_WAIT_DEFAULT_MS) {
+            Ok(dom) => dom,
+            Err(error) => {
+                // 提前失败也要把服务停掉，别留下一个空转线程。
+                stop.store(true, Ordering::Relaxed);
+                let _ = handle.join();
+                panic!("{error}");
+            }
+        };
+        stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
         let text = html_to_text(&dom);
-        assert!(text.contains("急急如律令"), "{text}");
+        assert!(
+            text.contains("急急如律令"),
+            "DOM {} 字节 / 抽文 {} 字：{text}",
+            dom.len(),
+            text.chars().count()
+        );
         assert!(text.contains("js-ok"), "JS 必须真实执行：{text}");
     }
 

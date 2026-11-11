@@ -86,8 +86,8 @@
 - [x] **T34 模型配置面板 / 会话管理 / 缴符历史回放** — 证据：`main.rs:34` 单 `Option<AltarSession>`，右栏只在焚符后一次性覆盖事件流。做法：槽位选择、权重导入提示（不静默下载）、多会话、按符印回放/筛选/清空。**已落地：`fulu_app::manifest_slots` 只读模型面板（标出 UNVERIFIED 与摘要是否固化，明确「界面不静默下载」）+ 「新开一场法坛」（清视图不动磁盘日志）+ `AltarSession::replay_audit` 读回 JSONL 并按关键字筛选（只读，不改文件）。**
 - [x] **T35 设置面板（context / prompt / skills / 覆盖表入口）** — 证据：三个库零 UI 入口；MCP 只有只读「重载外宗」。依赖 S1。**已落地：设置面板——提示词档位（full/minimal/none）、会话头 IP 开关、会话头摘要、七层装配预览（含每层字符数/截断标记）、符胆只读清单、风险覆盖表只读清单（写入仍只走 `fulu mcp risk set`）；全部不写外部配置。**
 - [~] **T36 UI 同构：符纸热区 / 太极视图 / 盖印 / 火光 / 云篆笔顺**（**部分落地**：`fulu-ui/src/paper.rs` + 法坛顶部符纸视图——九段热区版式/命中测试为纯数据（8 项单测）、未成符灰底虚线并列出缺段、校验过才盖印、焚符成功火光 0.9 秒、笔画基元条；四段可跳字段表单。**未做**：太极编排视图、云篆笔顺动画（缺字形笔画序列数据，`STROKE_PRIMITIVES` 只是六种抽象折线，不冒充字形）、符纸内直接编辑；**未验**：无真人视觉验收（T37/T38 仍是硬门槛）） — 证据：`docs/02:229-237` 设计，`docs/02:654` 实为三栏列表。做法：先出交互稿再实现；`fulu-script` 补「复文字典 + 云篆描述」才有数据源（与 T38 合并评估）。
-- [ ] **T37 中文 IME 真人验收（M0 硬门槛）** — 证据：`README.md:141`、`docs/02:502,563`。做法：用户亲自在符箓台敲中文预编辑；不达标按 9.2 切 iced。**阻塞：必须真人操作，AI 无法代做**。
-- [ ] **T38 GUI 跨平台窗口实测 + 交互级验收** — 证据：`docs/02:676`「只在 Windows 10 做了启动冒烟」。做法：三平台窗口、拖拽分栏、长符滚动、IME 面板内表现，形成用例清单。
+- [ ] **T37 中文 IME 真人验收（M0 硬门槛）** — 证据：`README.md:141`、`docs/02:502,563`。做法：用户亲自在符箓台敲中文预编辑；不达标按 9.2 切 iced。**阻塞：必须真人操作，AI 无法代做**。**清单已备**：`docs/04-真人验收清单.md` 第 3 节（P0 10 / P1 5 / P2 1 + 事件日志对照 + 不通过时先做的三件事），记录模板 `docs/acceptance/TEMPLATE.md`，无权重时可用 `tools/mock-llama.py` 先把界面链路走通。**本轮未执行任何一项**。
+- [~] **T38 GUI 跨平台窗口实测 + 交互级验收**（**用例清单已交付，实测未做**：`docs/04` 第 4 节——三平台矩阵 + 通用 14 项 + 平台特有 7 项（macOS 3 / Linux 4）+ 第 5 节符纸视觉 8 项；`docs/acceptance/TEMPLATE.md` 可直接抄；本机只有 Windows 10，macOS / Linux 缺硬件一律记「未测」，不许用 CI 编译通过顶替） — 证据：`docs/02:676`「只在 Windows 10 做了启动冒烟」。做法：三平台窗口、拖拽分栏、长符滚动、IME 面板内表现，形成用例清单。
 - [x] **T39 中文 DSL / `.fub` 紧凑二进制 / 复文字典 / 云篆** — 证据：`fulu-script/src/lib.rs:10-11` 自述「M1 换中文 DSL」未做；`docs/02:19,126-128,565`。做法：先定语法与快照测试，再谈 GUI 渲染；与 T36 联动。 **已落地：`fulu-script` 扩为四模块——`dsl.rs`（18 必填键 / 分组行纯装饰 / `符心`·`符事` 多行块，「语法非语义」：符印仍由规范 JSON 算）、`fub.rs`（magic `FUB\x01` + 版本 + 标志 + 32 字节符印 + varint；解码「重算符印再比对」，严格拒绝尾部多余字节/未知版本/字典版本不符）、`fuwen.rs`（24 条固定句式字典，最长优先，`0x01` 转义，带 `FUVEN_VERSION`）、`yunzhuan.rs`（`CloudLayout` 千分比版式 + 6 种笔画基元，无绘制代码）。新增 `fulu fu dsl|pack|unpack|info` 与 `fulu convert --to dsl|json|fub`；形态统一入口 `fulu_app::load_fu_file`（按内容识别，不看扩展名），`fu verify|seal` 与 GUI 工作区扫描同步改吃三形态（`.fub` 载入转规范文本、原文件不回写）。真机：三形态 `fu seal` 输出同一符印，`.fub` 改一字即破符。云篆**渲染**仍属 T36。**
 - [x] **T40 `credential_ref` 凭据库接入** — 证据：`fulu-register/src/lib.rs:6-7`「系统凭据库接入属 M3」、`:363` 仅字符串白名单；`docs/02:119,426,565`。做法：跨平台 keyring 抽象（Windows Credential Manager / Keychain / Secret Service）+ 文件级加密兜底（需口令）；**符内仍只存引用**。验收：明文密钥零落盘、取不到凭据即拒绝执行。 **已落地：新增 `fulu-vault`（箓牒）crate——系统后端委托 OS 工具（Windows `PasswordVault`/macOS `security`/Linux `secret-tool`，不链接平台 SDK）、文件后端 ChaCha20-Poly1305+PBKDF2-600k（AAD 绑定引用名）、`Secret` 打码+清零；「库里有该引用」= 已受箓，`dry_run` 闸门顺序 破符→凭据→授箓，`ignite` 未确认不碰凭据库、取不到即拒；CLI `fulu vault backend/list/put/get/rm`（put 只吃 stdin），provider 支持 Bearer。本机实测文件后端与系统凭据库两条路径，明文零落盘；macOS/Linux 分支未真机验。**
 
@@ -148,6 +148,9 @@ T37（真人 IME）/ T27（签名 Secrets）/ T20（1.1GB 下载）= 外部阻�
 | S2 | T13 流式落地（`sse` / `send_streaming` / `invoke_stream` / `Cancelled` 终态 / CLI `--stream` / GUI 增量区） | 完成 | 本轮 |
 | S7 | T42 iced 备选预案（决策不迁移 + GUI 依赖边界测试） | 完成 | 本轮 |
 | S7 | T43 微调底本与云端供应商决策（两项都不做，条件与顺序定死） | 完成 | 本轮 |
+| S6 | T37/T38 验收清单 + 记录模板（`docs/04` + `docs/acceptance/TEMPLATE.md` + `tools/mock-llama.py`）；**清单完成、验收本身未做** | 清单完成 / 验收未做 | 本轮 |
+| S3 | moli 无头浏览器改独立临时 profile（修「用户开着 Edge 时静默返回空 DOM」；参数抽纯函数 + 1 项测试） | 完成 | 本轮 |
 | — | 基线：340 测试零失败 / clippy 零告警 / fmt 全绿 | 完成 | 本轮 |
+| — | 基线：341 测试零失败 / clippy 零告警 / fmt 全绿（moli 真机测试连跑 10 轮稳定） | 完成 | 本轮 |
 
 > 规则：每完成一项，把上面 `[ ]` 改成 `[x]` 并在进度表补提交号；**未完成不得标已完成**（沿用「不伪装」铁律）。

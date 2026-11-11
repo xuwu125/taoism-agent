@@ -58,12 +58,14 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all -- --check
 
-      - name: Model manifest compliance
+      - name: Python scripts (manifest + acceptance mock)
         shell: bash
         run: |
           if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
           "$PY" --version
           "$PY" .github/scripts/check_model_manifest.py
+          # 验收用的本地 mock 不是产品代码，但语法必须过——不能等到验收当天才发现跑不起来
+          "$PY" -m py_compile tools/mock-llama.py
 
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
