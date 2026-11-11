@@ -53,6 +53,15 @@ impl std::error::Error for VerifyError {}
 
 /// 流式计算文件大小与 sha256，避免把 1.1 GB 读进内存。
 pub fn digest_file(path: &Path) -> Result<(u64, String), VerifyError> {
+    let (total, hasher) = digest_file_state(path)?;
+    let digest = hasher.finalize();
+    let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok((total, hex))
+}
+
+/// 同 `digest_file`，但返回**未 finalize** 的哈希状态：断点续传用它把已有
+/// 前缀续进主循环的哈希里，无需重复实现一遍读取逻辑。
+pub fn digest_file_state(path: &Path) -> Result<(u64, Sha256), VerifyError> {
     let file = std::fs::File::open(path)
         .map_err(|e| VerifyError::Io(format!("{}: {e}", path.display())))?;
     let mut reader = std::io::BufReader::new(file);
@@ -69,9 +78,7 @@ pub fn digest_file(path: &Path) -> Result<(u64, String), VerifyError> {
         hasher.update(&buffer[..read]);
         total += read as u64;
     }
-    let digest = hasher.finalize();
-    let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok((total, hex))
+    Ok((total, hasher))
 }
 
 pub fn verify_file(path: &Path, entry: &ModelEntry) -> Result<Verification, VerifyError> {

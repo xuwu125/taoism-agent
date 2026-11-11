@@ -7,13 +7,16 @@
 //!   公网 HTTPS 下载与摘要固化仍列为 M2.1 待办（见 TODO.md T20/T21）。
 
 pub mod manifest;
+pub mod seal;
 pub mod verify;
 
 pub use manifest::{
     EMBEDDED_MANIFEST, ManifestError, ModelEntry, ModelManifest, ModelPolicy, ModelSampling,
 };
+pub use seal::{SealError, SealProposal, apply_seal, metadata_url, parse_tree_metadata};
 pub use verify::{
-    ImportReport, Verification, VerifyError, VerifyStatus, digest_file, import_file, verify_file,
+    ImportReport, Verification, VerifyError, VerifyStatus, digest_file, digest_file_state,
+    import_file, verify_file,
 };
 
 use std::path::PathBuf;

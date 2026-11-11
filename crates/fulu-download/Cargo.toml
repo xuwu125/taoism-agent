@@ -1,0 +1,21 @@
+[package]
+name = "fulu-download"
+description = "最小 HTTPS/1.1 GET 客户端：TLS 白名单唯一例外的落点（model seal/fetch 专用，不进符箓执行路径）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# TLS 白名单唯一例外（docs/02 第 8.5 节）：rustls 三件套均为 MIT / Apache-2.0 / ISC；
+# ring 的许可在 deny.toml [license.clarify] 里按官方 LICENSE 文件显式澄清。
+# 根证书用 webpki-roots 内嵌的 Mozilla 根集（CDLA-Permissive-2.0），不读系统证书库，
+# 信任锚固定、可审计、不随系统状态漂移。
+rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+# 仅测试用：生成自签证书，在本机回环上起真实 rustls TLS 服务。
+rcgen = "0.13"

@@ -22,6 +22,12 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 zeroize = "1"
 
+# TLS 白名单唯一例外（docs/02 第 8.5 / 39 节）：只服务 fulu-download（model seal/fetch）。
+# 其余任何 crate 不得引入 TLS；provider/moli/MCP 的回环链路保持明文。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+
 # 内部 crate：依赖方向严格单向，见 docs/02 第 5 节。
 # 一律写成「path + version」：只写 path 会被 cargo-deny 判成 `*` 通配依赖（bans 规则 deny），
 # 且 version 也让本地路径依赖在打包/发布时仍是合法版本要求。
@@ -30,6 +36,7 @@ fulu-script = { path = "crates/fulu-script", version = "0.1.0" }
 fulu-register = { path = "crates/fulu-register", version = "0.1.0" }
 fulu-provider = { path = "crates/fulu-provider", version = "0.1.0" }
 fulu-model = { path = "crates/fulu-model", version = "0.1.0" }
+fulu-download = { path = "crates/fulu-download", version = "0.1.0" }
 fulu-runtime = { path = "crates/fulu-runtime", version = "0.1.0" }
 fulu-orchestrator = { path = "crates/fulu-orchestrator", version = "0.1.0" }
 fulu-tools = { path = "crates/fulu-tools", version = "0.1.0" }

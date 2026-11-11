@@ -218,7 +218,10 @@ mod tests {
 
     #[test]
     fn no_fabricated_digests() {
-        // M0 未下载权重，所有精确字节数与摘要必须为空，而不是编造的值。
+        // 固化前守卫：所有精确字节数与摘要必须为空，而不是编造的值。
+        // 注意：`model seal --confirm` 用 HF LFS 官方元数据固化后，本测试需要随之
+        // 放宽为「每个已固化条目的值都必须来自 seal 的输出」——那时值不再是 null，
+        // 但依然不许手写猜测值。
         for entry in manifest().entries {
             assert!(entry.bytes.is_none(), "{} 的字节数尚未固化", entry.slot);
             assert!(entry.sha256.is_none(), "{} 的 sha256 尚未固化", entry.slot);

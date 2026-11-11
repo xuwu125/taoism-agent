@@ -18,13 +18,16 @@
 ## 权重在哪里
 
 - **不进 Git**：`*.gguf` / `*.safetensors` 已在 `.gitignore` 中排除。截至 M2（2026-11-10）**没有下载、没有打包任何权重**。
-- **轻量包（默认）**：安装包不含权重。离线导入用 `fulu model import <本地文件>`；`fulu model fetch` 目前只是**显式许可 + 校验闸门**（需 `--i-understand-license`，且清单 `bytes`/`sha256` 固化后才可能放行）。公网 HTTPS 下载需要 TLS 依赖，列为 **M2.1 待办**，本轮不发起任何网络请求。缺权重时明确报错，不静默联网。
+- **轻量包（默认）**：安装包不含权重。两条获取路径（M2.1 已落地）：
+  1. 在线：`fulu model seal [槽位] --confirm` 从 HF 元数据固化 `bytes`/`sha256`（KB 级请求，自动备份清单），再 `fulu model fetch [槽位] --i-understand-license [--proxy http://127.0.0.1:7890] [--resume]` 下载并双校验落位；两步都需显式命令，未固化时 `fetch` 在发起任何网络请求前拒绝。
+  2. 离线：`fulu model import <本地文件> [槽位]`。
+  下载链路是 TLS 白名单唯一例外（`fulu-download`，rustls + 内嵌 Mozilla 根集），provider/moli/MCP 回环链路仍为明文。缺权重时明确报错，不静默联网。
 - **离线 bundle（Release 可选资产）**：包含权重 + `THIRD_PARTY_NOTICES.md` + LFM LICENSE 原文，供完全离线部署；由 `workflow_dispatch` 手动触发，不随每次 tag 自动上传 1.1 GB。
 - 缓存位置：Windows `%LOCALAPPDATA%\taoism-agent\models\<slot>\`，macOS `~/Library/Application Support/taoism-agent/models/<slot>/`，Linux `$XDG_DATA_HOME/taoism-agent/models/<slot>/`（回退 `~/.local/share`）。
 
 ## 校验策略（诚实边界）
 
-清单里的 `bytes` 与 `sha256` 目前均为 `null`：官方只公布标称体积，精确字节数与实际摘要要在下载 / Release 固化后才能确定，**本轮不编造**。
+清单里的 `bytes` 与 `sha256` 在权重首次下载前保持 `null`：固化值**只来自 HF LFS 元数据**（`fulu model seal`），绝不手工猜测；未固化时校验结果一律 `UNVERIFIED`。
 
 - `fulu model verify <file>`：文件存在时计算真实 SHA256 与字节数；若清单已登记摘要则逐项比对；若未登记，结果明确标记 `UNVERIFIED`（只报告实测值），**绝不输出「校验通过」**。
 - `fulu model import <file>`：离线复制到缓存目录，同样把 unverified 状态写入结果。Rust 侧**不加载权重**，只校验文件并登记状态；实际推理由用户启动的外部 `llama-server` 负责（M3 接进程生命周期管理）。

@@ -5,7 +5,12 @@
 //! `altar run` 需要 `--confirm`，`model fetch` 需要 `--i-understand-license`。
 
 use fulu_app::{AltarSession, ENDPOINT_ENV, PromptMode, RiskClass};
-use fulu_model::{ModelManifest, VerifyStatus, cache_dir, import_file, verify_file};
+use fulu_download::{DownloadConfig, DownloadError, Downloaded, ProxyAddr, ResponseHead};
+use fulu_model::{
+    ModelManifest, VerifyStatus, apply_seal, cache_dir, digest_file_state, import_file,
+    metadata_url, model_path, parse_tree_metadata, verify_file,
+};
+use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -56,7 +61,9 @@ fn help() {
          \x20 fulu model verify <文件> [槽位]      离线校验权重文件\n\
          \x20 fulu model import <文件> [槽位]      离线导入权重到缓存目录\n\
          \x20 fulu model serve                    探活本地 llama-server（不启动进程）\n\
-         \x20 fulu model fetch --i-understand-license   网络下载闸门（本轮仍拒绝，见提示）\n\
+         \x20 fulu model seal [槽位] --confirm     从上游元数据固化 bytes/sha256（显式联网，元数据 KB 级）\n\
+         \x20 fulu model fetch [槽位] --i-understand-license [--proxy URL] [--resume]\n\
+         \x20                                     下载权重并校验（清单已固化才放行）\n\
          \x20 fulu fu sample                      输出示例符文 (.fu)\n\
         \x20 fulu fu verify <文件>               校验符文并打印符印（JSON / DSL / .fub 均可）\n\
         \x20 fulu fu seal <文件>                 只打印符印（符印一律重算，不抄文件头）\n\
@@ -148,6 +155,7 @@ fn model(args: &[String]) -> i32 {
         "list" => model_list(),
         "verify" | "import" => model_file_command(command, args),
         "serve" => model_serve(),
+        "seal" => model_seal(args),
         "fetch" => model_fetch(args),
         other => {
             eprintln!("[ERR] 未知 model 子命令：{other}");
@@ -247,34 +255,466 @@ fn model_serve() -> i32 {
     }
 }
 
-/// 网络下载的显式闸门。清单未固化摘要时，下载了也无法校验，因此拒绝。
-fn model_fetch(args: &[String]) -> i32 {
+/// 清单文件定位（写回用）：`FULU_MANIFEST` 环境变量优先，其次当前目录下
+/// `models/manifest.json`。固化和 fetch 必须读**文件清单**而不是内嵌清单——
+/// 内嵌清单是编译期快照，seal 写回后不会自动更新。
+fn manifest_file_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("FULU_MANIFEST") {
+        return Some(PathBuf::from(path));
+    }
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join("models").join("manifest.json"))
+}
+
+/// 第一个非旗标参数（槽位）。`--proxy` 的值会被跳过。
+fn positional_slot(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--proxy" {
+            let _ = iter.next();
+            continue;
+        }
+        if arg.starts_with("--") {
+            continue;
+        }
+        return Some(arg.clone());
+    }
+    None
+}
+
+/// 代理来源：`--proxy URL` 显式指定，其次 `FULU_PROXY` 环境变量。两者都没有 = 直连。
+fn resolve_proxy(args: &[String]) -> Result<Option<ProxyAddr>, i32> {
+    let specified = args
+        .iter()
+        .position(|arg| arg == "--proxy")
+        .map(|index| args.get(index + 1).cloned())
+        .or_else(|| std::env::var("FULU_PROXY").ok().map(Some));
+    match specified {
+        Some(Some(value)) => match ProxyAddr::parse(&value) {
+            Ok(proxy) => Ok(Some(proxy)),
+            Err(error) => {
+                eprintln!("[ERR] {error}");
+                Err(2)
+            }
+        },
+        Some(None) => {
+            eprintln!("[ERR] --proxy 需要一个值，例如 --proxy http://127.0.0.1:7890");
+            Err(2)
+        }
+        None => Ok(None),
+    }
+}
+
+/// 只有传输层的瞬态错误才值得重试；协议/校验类错误重试也是重放坏数据。
+fn transient_download_error(error: &DownloadError) -> bool {
+    matches!(
+        error,
+        DownloadError::Io(_) | DownloadError::Connect(_) | DownloadError::Timeout
+    )
+}
+
+fn license_notice() {
     println!("[WARN] 权重许可：LFM Open License v1.0（Apache 2.0 + Section 5）");
     println!("  年营收 ≥ 1000 万美元的实体商用需另购授权；分发须附 LICENSE、NOTICE 与署名。");
     println!("  代码 MIT 不覆盖权重；详见 THIRD_PARTY_NOTICES.md 与 models/README.md。");
+}
+
+fn noop_response(_head: &ResponseHead) -> Result<(), DownloadError> {
+    Ok(())
+}
+
+fn noop_progress(_received: u64, _total: Option<u64>) -> Result<(), DownloadError> {
+    Ok(())
+}
+
+/// `fulu model seal [槽位] --confirm [--proxy URL]`
+///
+/// 从 HF tree API 取 LFS 官方元数据（sha256 + 精确字节数，KB 级），显式 `--confirm`
+/// 后回写 `models/manifest.json`。这是 T20「不编造校验值」的合规固化入口：
+/// 写进清单的每个字节都来自上游，写不进的一律保持 UNVERIFIED。
+fn model_seal(args: &[String]) -> i32 {
+    license_notice();
+    // 分发器传进来的 args[0] 是 "seal" 命令字本身，槽位解析要跳过它。
+    let args = args.get(1..).unwrap_or(&[]);
+    let slot = positional_slot(args).unwrap_or_else(|| "default".to_owned());
+    let confirm = args.iter().any(|arg| arg == "--confirm");
+    let proxy = match resolve_proxy(args) {
+        Ok(proxy) => proxy,
+        Err(code) => return code,
+    };
+
+    let Some(manifest_path) = manifest_file_path() else {
+        eprintln!("[ERR] 无法定位清单文件；可在仓库根目录运行，或用 FULU_MANIFEST 指定路径。");
+        return 1;
+    };
+    let mut manifest = match ModelManifest::load(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    let Some(entry) = manifest.entry(&slot).cloned() else {
+        eprintln!("[ERR] 未知槽位：{slot}");
+        return 2;
+    };
+
+    let url = metadata_url(&entry.repo);
+    println!("[..] 将请求元数据（不含权重）：{url}");
+    if let Some(proxy) = &proxy {
+        println!("[..] 经代理 {}:{}", proxy.host, proxy.port);
+    } else {
+        println!("[..] 直连（如需代理：--proxy http://127.0.0.1:7890 或环境变量 FULU_PROXY）");
+    }
+
+    let config = DownloadConfig {
+        proxy,
+        max_body: Some(4 * 1024 * 1024),
+        read_timeout: std::time::Duration::from_secs(30),
+        ..DownloadConfig::default()
+    };
+    let mut body = Vec::new();
+    let downloaded = match fulu_download::fetch(
+        &config,
+        &url,
+        &[],
+        &mut |chunk| {
+            body.extend_from_slice(chunk);
+            Ok(())
+        },
+        &mut noop_response,
+        &mut noop_progress,
+    ) {
+        Ok(downloaded) => downloaded,
+        Err(error) => {
+            eprintln!("[ERR] 元数据请求失败：{error}");
+            return 1;
+        }
+    };
+    if downloaded.status != 200 {
+        eprintln!(
+            "[ERR] 元数据接口返回 HTTP {}：{}",
+            downloaded.status, downloaded.final_url
+        );
+        return 1;
+    }
+    let text = match String::from_utf8(body) {
+        Ok(text) => text,
+        Err(_) => {
+            eprintln!("[ERR] 元数据不是合法 UTF-8");
+            return 1;
+        }
+    };
+    let proposal = match parse_tree_metadata(&text, &entry.file) {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+
+    println!("[OK] 上游官方元数据：");
+    println!("  文件     : {}", proposal.path);
+    println!(
+        "  精确字节 : {}（约 {:.2} GB）",
+        proposal.bytes,
+        proposal.bytes as f64 / 1e9
+    );
+    println!("  sha256   : {}", proposal.sha256);
+    if entry.verification_ready() {
+        println!("  当前清单 : 已固化（sha256/bytes 已登记）");
+    }
+
+    if !confirm {
+        println!("  [未写入] 确认上述值后追加 --confirm 固化清单。");
+        return 0;
+    }
+
+    let backup = manifest_path.with_extension("json.bak");
+    if let Err(error) = std::fs::copy(&manifest_path, &backup) {
+        eprintln!("[ERR] 无法备份清单到 {}：{error}", backup.display());
+        return 1;
+    }
+    if let Err(error) = apply_seal(&mut manifest, &slot, &proposal) {
+        eprintln!("[ERR] {error}");
+        return 1;
+    }
+    let written = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string());
+    match written {
+        Ok(text) => {
+            if let Err(error) = std::fs::write(&manifest_path, text + "\n") {
+                eprintln!("[ERR] 写回清单失败：{error}");
+                return 1;
+            }
+        }
+        Err(error) => {
+            eprintln!("[ERR] 序列化清单失败：{error}");
+            return 1;
+        }
+    }
+    println!("[OK] 已固化槽位 {slot}（备份：{}）", backup.display());
+    println!(
+        "      下一步：fulu model fetch {slot} --i-understand-license [--proxy http://127.0.0.1:7890]"
+    );
+    0
+}
+
+/// 断点状态：已落盘字节数 + 续算中的 sha256 + 追加写入的文件句柄。
+struct FetchState {
+    file: std::fs::File,
+    hasher: Sha256,
+    written: u64,
+    part_path: PathBuf,
+}
+
+impl FetchState {
+    /// `reuse=true` 时复用已有 .part（前缀哈希续算），否则删掉重头开始。
+    fn open(part_path: &Path, reuse: bool) -> Result<Self, String> {
+        if part_path.exists() && reuse {
+            let (written, hasher) =
+                digest_file_state(part_path).map_err(|error| error.to_string())?;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(part_path)
+                .map_err(|error| error.to_string())?;
+            Ok(Self {
+                file,
+                hasher,
+                written,
+                part_path: part_path.to_path_buf(),
+            })
+        } else {
+            if part_path.exists() {
+                std::fs::remove_file(part_path).map_err(|error| error.to_string())?;
+            }
+            let file = std::fs::File::create(part_path).map_err(|error| error.to_string())?;
+            Ok(Self {
+                file,
+                hasher: Sha256::new(),
+                written: 0,
+                part_path: part_path.to_path_buf(),
+            })
+        }
+    }
+
+    fn sink(&mut self, chunk: &[u8]) -> Result<(), DownloadError> {
+        use std::io::Write as _;
+        self.file
+            .write_all(chunk)
+            .map_err(|error| DownloadError::Io(error.to_string()))?;
+        self.hasher.update(chunk);
+        self.written += chunk.len() as u64;
+        Ok(())
+    }
+
+    /// 服务器忽略 Range（返回 200）时：截断重来，哈希状态一并归零。
+    fn reset(&mut self) -> Result<(), DownloadError> {
+        self.file = std::fs::File::create(&self.part_path)
+            .map_err(|error| DownloadError::Io(error.to_string()))?;
+        self.hasher = Sha256::new();
+        self.written = 0;
+        Ok(())
+    }
+
+    fn finish_digest(&mut self) -> String {
+        let digest = self.hasher.finalize_reset();
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+/// `fulu model fetch [槽位] --i-understand-license [--proxy URL] [--resume]`
+///
+/// 闸门口径（不放松）：许可义务显式确认 + 清单已固化 + 槽位可运行。
+/// 下载落到 `<缓存>/<槽位>/<file>.part`，全程流式 + sha256 续算；
+/// 校验双通过才原子改名放行，任何不符都会留下可续传的断点并如实报错。
+fn model_fetch(args: &[String]) -> i32 {
+    license_notice();
+    // 分发器传进来的 args[0] 是 "fetch" 命令字本身，跳过它再解析旗标。
+    let args = args.get(1..).unwrap_or(&[]);
     if !args.iter().any(|arg| arg == "--i-understand-license") {
         eprintln!("[ERR] 未确认许可义务。如需继续请显式追加 --i-understand-license。");
         return 2;
     }
-    let Ok(manifest) = manifest_or_fail() else {
+    let slot = positional_slot(args).unwrap_or_else(|| "default".to_owned());
+    let resume = args.iter().any(|arg| arg == "--resume");
+    let proxy = match resolve_proxy(args) {
+        Ok(proxy) => proxy,
+        Err(code) => return code,
+    };
+
+    let Some(manifest_path) = manifest_file_path() else {
+        eprintln!("[ERR] 无法定位清单文件；可在仓库根目录运行，或用 FULU_MANIFEST 指定路径。");
         return 1;
     };
-    let Ok(entry) = manifest.default_entry() else {
-        eprintln!("[ERR] 清单缺少唯一默认槽位");
-        return 1;
+    let manifest = match ModelManifest::load(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    let Some(entry) = manifest.entry(&slot).cloned() else {
+        eprintln!("[ERR] 未知槽位：{slot}");
+        return 2;
     };
     if !entry.verification_ready() {
         eprintln!(
-            "[ERR] 槽位 {} 的 bytes / sha256 尚未固化，下载后无法校验，拒绝执行（不编造摘要）。",
-            entry.slot
+            "[ERR] 槽位 {slot} 的 bytes / sha256 尚未固化，下载后无法校验，拒绝执行（不编造摘要）。"
         );
-        eprintln!("      离线路径：`fulu model import <可信本地权重文件> [槽位]`");
-        eprintln!("      HTTPS 下载需引入 TLS 依赖，列为 M2.1 待办；本轮不发起任何公网请求。");
+        eprintln!("      先执行 `fulu model seal {slot} --confirm` 固化清单，再回来 fetch。");
         return 2;
     }
-    eprintln!("[ERR] HTTPS 下载链路尚未接入（内置 HTTP 客户端仅允许回环地址）。");
-    eprintln!("      本轮不发起公网请求；请用 `model import` 完成离线导入。");
-    2
+    if !entry.runnable {
+        eprintln!("[ERR] 槽位 {slot} 是不可运行的微调底座，不提供运行权重下载。");
+        return 2;
+    }
+
+    let destination = model_path(&entry);
+    if let Some(parent) = destination.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("[ERR] 创建缓存目录失败：{error}");
+        return 1;
+    }
+    let part_path = destination.with_file_name(format!("{}.part", entry.file));
+
+    let config = DownloadConfig {
+        proxy,
+        max_body: None, // 上限由清单 bytes 精确校验兜底
+        ..DownloadConfig::default()
+    };
+    println!(
+        "[..] 开始下载 {}（清单标称 {}）",
+        entry.source_url, entry.approx_size
+    );
+    println!("[..] 目标：{}", destination.display());
+
+    let max_attempts = 3;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        // 首轮只在 --resume 时复用历史断点；调用内的重试轮总是复用本轮落盘。
+        let reuse = resume || attempt > 1;
+        let state = match FetchState::open(&part_path, reuse) {
+            Ok(state) => std::cell::RefCell::new(state),
+            Err(error) => {
+                eprintln!("[ERR] 读取断点失败：{error}");
+                return 1;
+            }
+        };
+        let resumed_from = state.borrow().written;
+        if resumed_from > 0 {
+            println!("[..] 断点续传：已落盘 {resumed_from} 字节，从该处继续");
+        }
+
+        let mut headers: Vec<(&str, String)> = Vec::new();
+        if resumed_from > 0 {
+            headers.push(("Range", format!("bytes={resumed_from}-")));
+        }
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+
+        let mut last_progress: u64 = 0;
+        let result: Result<Downloaded, DownloadError> = fulu_download::fetch(
+            &config,
+            &entry.source_url,
+            &header_refs,
+            &mut |chunk| state.borrow_mut().sink(chunk),
+            &mut |head: &ResponseHead| {
+                let mut guard = state.borrow_mut();
+                match head.status {
+                    206 => Ok(()), // 续传确认，保持断点
+                    200 => {
+                        if guard.written > 0 {
+                            eprintln!("[..] 服务器忽略断点请求（返回 200），从头重新下载");
+                        }
+                        guard.reset()
+                    }
+                    code => Err(DownloadError::HttpStatus(code, String::new())),
+                }
+            },
+            &mut |received, total| {
+                if received >= last_progress + 64 * 1024 * 1024 {
+                    last_progress = received;
+                    match total {
+                        Some(total) => eprintln!(
+                            "[..] {:.1}%（{} / {} 字节）",
+                            received as f64 / total as f64 * 100.0,
+                            received,
+                            total
+                        ),
+                        None => eprintln!("[..] 已收 {received} 字节"),
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        match result {
+            Ok(downloaded) => {
+                let mut guard = state.borrow_mut();
+                let digest = guard.finish_digest();
+                let expected_bytes = entry.bytes.unwrap_or_default();
+                if guard.written != expected_bytes {
+                    let message = format!(
+                        "字节数不符：清单期望 {expected_bytes}，实收 {}（HTTP {}，{}）",
+                        guard.written, downloaded.status, downloaded.final_url
+                    );
+                    eprintln!("[ERR] {message}");
+                    let _ = std::fs::remove_file(&part_path);
+                    return 1;
+                }
+                if digest != entry.sha256.as_deref().unwrap_or_default() {
+                    eprintln!(
+                        "[ERR] sha256 不符：清单期望 {}，实测 {digest}；断点文件已删除，不留下无法校验的数据",
+                        entry.sha256.as_deref().unwrap_or_default()
+                    );
+                    let _ = std::fs::remove_file(&part_path);
+                    return 1;
+                }
+                if let Err(error) = std::fs::rename(&part_path, &destination) {
+                    eprintln!("[ERR] 落位失败：{error}");
+                    return 1;
+                }
+                if !downloaded.redirect_hops.is_empty() {
+                    println!(
+                        "[..] 重定向 {} 跳（全部 https）：",
+                        downloaded.redirect_hops.len()
+                    );
+                    for hop in &downloaded.redirect_hops {
+                        println!("      → {hop}");
+                    }
+                }
+                println!("[OK] 下载完成并通过校验：{}", destination.display());
+                println!("  字节   : {}", guard.written);
+                println!("  sha256 : {digest}");
+                println!("  许可   : {}（{}）", entry.license, entry.license_url);
+                return 0;
+            }
+            Err(error) => {
+                let remaining = max_attempts - attempt;
+                if remaining > 0 && transient_download_error(&error) {
+                    let wait = attempt as u64 * 2;
+                    eprintln!(
+                        "[WARN] 第 {attempt} 次尝试失败（{error}），{wait} 秒后断点续传重试…"
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(wait));
+                    continue;
+                }
+                eprintln!("[ERR] 下载失败：{error}");
+                if part_path.exists() {
+                    eprintln!(
+                        "      断点保留在 {}，可用 --resume 续传",
+                        part_path.display()
+                    );
+                }
+                return 1;
+            }
+        }
+    }
 }
 
 fn model_file_command(command: &str, args: &[String]) -> i32 {
@@ -2403,5 +2843,113 @@ mod tests {
     fn binary_output_without_a_destination_is_refused() {
         // 往终端里灌二进制是灾难：必须要求 -o。
         assert_eq!(write_or_print(None, &[0u8, 1, 2], true), 2);
+    }
+
+    #[test]
+    fn positional_slot_skips_flags_and_proxy_value() {
+        let args = ["--proxy", "http://127.0.0.1:7890", "default", "--resume"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(positional_slot(&args).as_deref(), Some("default"));
+        let flags_only = ["--i-understand-license", "--resume"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(positional_slot(&flags_only), None);
+    }
+
+    #[test]
+    fn dispatcher_command_word_is_stripped_before_slot_parsing() {
+        // 回归：`model fetch default --i-understand-license` 曾把 "fetch" 当槽位名。
+        let args = ["fetch", "lowmem", "--i-understand-license"]
+            .map(String::from)
+            .to_vec();
+        let rest = args.get(1..).unwrap_or(&args);
+        assert_eq!(positional_slot(rest).as_deref(), Some("lowmem"));
+        let args = ["seal"].map(String::from).to_vec();
+        let rest = args.get(1..).unwrap_or(&args);
+        assert_eq!(positional_slot(rest), None);
+    }
+
+    #[test]
+    fn resolve_proxy_prefers_flag_over_env_and_validates() {
+        let ok = ["--proxy", "http://127.0.0.1:7890"]
+            .map(String::from)
+            .to_vec();
+        let proxy = resolve_proxy(&ok).expect("解析成功").expect("取到代理");
+        assert_eq!(proxy.port, 7890);
+        let bad = ["--proxy", "ftp://x:1"].map(String::from).to_vec();
+        assert_eq!(resolve_proxy(&bad), Err(2));
+        let missing_value = ["--proxy"].map(String::from).to_vec();
+        assert_eq!(resolve_proxy(&missing_value), Err(2));
+        let none: Vec<String> = Vec::new();
+        // 本测试进程未设 FULU_PROXY 时应无代理；若外层环境带了 FULU_PROXY，
+        // 只要求它是可解析的，不区分来源。
+        match std::env::var("FULU_PROXY") {
+            Err(_) => assert_eq!(resolve_proxy(&none), Ok(None)),
+            Ok(value) => assert!(resolve_proxy(&none).is_ok(), "env={value}"),
+        }
+    }
+
+    #[test]
+    fn only_transport_errors_are_transient() {
+        assert!(transient_download_error(&DownloadError::Timeout));
+        assert!(transient_download_error(&DownloadError::Io("断开".into())));
+        assert!(transient_download_error(&DownloadError::Connect(
+            "拒连".into()
+        )));
+        assert!(!transient_download_error(&DownloadError::HttpStatus(
+            429,
+            String::new()
+        )));
+        assert!(!transient_download_error(&DownloadError::Protocol(
+            "坏分块".into()
+        )));
+        assert!(!transient_download_error(&DownloadError::RedirectInsecure(
+            "http".into()
+        )));
+    }
+
+    #[test]
+    fn fetch_state_resume_hashes_prefix_and_reset_zeroes() {
+        let dir = std::env::temp_dir().join(format!("fulu-fetch-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("model.gguf.part");
+        std::fs::write(&part, b"prefix-bytes").unwrap();
+
+        let mut state = FetchState::open(&part, true).expect("续传打开");
+        assert_eq!(state.written, 12);
+        state.sink(b"-suffix").expect("续写");
+        let digest = state.finish_digest();
+        let mut expected = Sha256::new();
+        expected.update(b"prefix-bytes-suffix");
+        let expected = expected.finalize();
+        assert_eq!(
+            digest,
+            expected
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+
+        // reset 归零：文件截断、哈希清空。
+        state.reset().expect("截断");
+        assert_eq!(state.written, 0);
+        state.sink(b"fresh").expect("重写");
+        let mut expected_fresh = Sha256::new();
+        expected_fresh.update(b"fresh");
+        let expected_fresh = expected_fresh.finalize();
+        assert_eq!(
+            state.finish_digest(),
+            expected_fresh
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+
+        // 不复用：旧断点被删除、从头开始。
+        std::fs::write(&part, b"stale").unwrap();
+        let state = FetchState::open(&part, false).expect("重头打开");
+        assert_eq!(state.written, 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

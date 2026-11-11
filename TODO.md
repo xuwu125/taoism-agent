@@ -63,8 +63,8 @@
 
 # S4 · M2.1 权重与真机推理（**需用户授权 / 外部依赖**）
 
-- [ ] **T20 权重 `bytes`/`sha256` 固化** — 证据：`models/manifest.json` 8 个 `null`；`fulu-model/src/manifest.rs:220-227` 单测锁定「不编造」。做法：下载后用流式 SHA256 实测回填，**绝不填猜测值**；清单闸门脚本随之更新。阻塞：1.1 GB 公网下载需用户明确批准。
-- [ ] **T21 HTTPS 公网下载链路** — 证据：`cli/main.rs:221-248` 闸门桩；`provider/src/http.rs` 不支持 HTTPS；`models/README.md:21`、`docs/02:561`。做法：引入 TLS 依赖（白名单唯一例外）、断点续传、落到 `models/cache/`、下载后校验再放行；放行条件全部保留。阻塞：用户批准 + T20 的校验值来源。
+- [ ] **T20 权重 `bytes`/`sha256` 固化** — 证据：`models/manifest.json` 8 个 `null`；`fulu-model/src/manifest.rs` 单测锁定「不编造」。做法：固化机制已落地——`fulu model seal [槽位] --confirm` 从 HF LFS 官方元数据取 sha256/size 回写清单（`fulu-model::seal` 纯函数：非 LFS 拒绝、64 位十六进制校验、冲突拒绝改写）；剩余动作仅是**执行**一次 seal + fetch（1.1 GB 公网下载需用户明确批准）。阻塞：用户批准。
+- [x] **T21 HTTPS 公网下载链路** — 做法：新 crate `fulu-download`（rustls + webpki-roots，TLS 白名单唯一例外；重定向强制 https、CONNECT 代理、流式落盘 + sha256、断点续传、瞬态错误限 3 次重试）；`fulu model fetch --i-understand-license` 三道闸门（许可 / 清单已固化 / 槽位可运行）在发起任何网络请求前拦截；sha256+字节数双校验通过才原子改名。证据：`crates/fulu-download`（12 单测 + 9 真实 TLS 集成）、docs/02 第 39 节。**未验：对 HF 的真实下载未执行（1.1 GB 需用户批准）；当前清单 sha256 仍 null，fetch 被闸门正确拦截。**
 - [ ] **T22 `llama-server` 进程生命周期管理** — 证据：`docs/02:562`「由用户手动完成，尚未进 Rust」；`provider/src/local.rs:26,62`。做法：按需拉起（仅回环端口）、健康检查、闲置退出、异常清理（Drop/超时）；**不静默启动**，须显式命令或明确配置。阻塞：本机需有 `llama-server` 二进制。
 - [ ] **T23 真机端到端验收** — 证据：`docs/02:817,822` 敕门卡片真人端到端待权重；`README.md:7`。做法：真模型 + 真 MCP + GUI 逐次弹窗完整跑一遍；记录模型效果**不承诺**。依赖 T20–T22。
 - [x] **T24 模型 bundle 分发合规**（2026-11-11，`docs/02` 第 38 节）：`gen_compliance_notes.py` 四模式闸门（缺字段拒、`--require-bundle` 对 null sha256 拒、防「权重误标 MIT」）、8 条 unittest 进 CI；release.yml 三处接线（build Compliance gate、compliance-notes 锚点幂等写回、model-bundle 下载前 sha256 硬闸门 + 下载后比对 + 上传前再闸），原 echo 已删。**当前清单 sha256 为 null → bundle 被硬拒绝，这正是未固化校验值时的正确行为**。**未验**：Actions 实跑与 gh 写回（本机无 gh）

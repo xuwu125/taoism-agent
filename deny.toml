@@ -26,6 +26,9 @@ allow = [
     # 见 THIRD_PARTY_NOTICES.md 第 3 节。
     "Ubuntu-font-1.0",
     "MPL-2.0",
+    # webpki-roots（fulu-download 的内嵌 Mozilla 根证书集）：CDLA-Permissive-2.0，
+    # 数据类许可，允许再分发且附归属即可；见 THIRD_PARTY_NOTICES.md 第 5 节。
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]
