@@ -11,9 +11,10 @@ use fulu_mcp::{McpServerInfo, RiskOverrides, RiskSource};
 use fulu_model::{ModelManifest, VerifyStatus, model_path, status, verify_file};
 use fulu_orchestrator::NodeExecutor;
 use fulu_prompt::{CORE_TEXT, LayerCaps, LayerId, PromptDraft, assemble};
-use fulu_provider::{Health, LocalLfmProvider};
+use fulu_provider::{BearerToken, Health, LocalLfmProvider};
 use fulu_register::{Register, ToolGrant};
 use fulu_skills::{default_roots, digest_matches, discover_global};
+use fulu_vault::{CredentialRef, Vault};
 
 mod summon;
 pub use summon::{
@@ -59,6 +60,8 @@ pub enum AppError {
     Ritual(String),
     Probe(String),
     Io(String),
+    /// 箓牒（凭据库）：取不到凭据就是拒绝执行，不退化成「用空密钥试一次」
+    Vault(String),
 }
 
 impl fmt::Display for AppError {
@@ -69,6 +72,7 @@ impl fmt::Display for AppError {
             Self::Ritual(msg) => write!(f, "法坛：{msg}"),
             Self::Probe(msg) => write!(f, "本地推理服务：{msg}"),
             Self::Io(msg) => write!(f, "I/O：{msg}"),
+            Self::Vault(msg) => write!(f, "箓牒：{msg}"),
         }
     }
 }
@@ -568,6 +572,8 @@ pub struct AltarSession {
     search_backends: Vec<String>,
     /// 摄行（T16）：默认 false，工具**不存在**于名册与风火轮。
     shexing: bool,
+    /// 箓牒（T40）：凭据库。`None` = 未装，此时**任何非 local 引用都会被拒绝**。
+    vault: Option<Box<dyn Vault>>,
 }
 
 impl Default for AltarSession {
@@ -606,6 +612,7 @@ impl AltarSession {
             summon: None,
             search_backends: Vec::new(),
             shexing: false,
+            vault: None,
         }
     }
 
@@ -765,6 +772,73 @@ impl AltarSession {
 
     pub fn shexing_enabled(&self) -> bool {
         self.shexing
+    }
+
+    /// 装箓牒（T40）。
+    ///
+    /// 规则很直白：**箓牒里登记了某条引用，就等于这一条已受箓**——所以装库的同时
+    /// 把这些引用记进名册。反过来，库里没有的引用，`authorize` 仍然会驳回。
+    ///
+    /// 返回已入箓的引用清单（只有名字，没有密钥）。
+    pub fn use_vault(&mut self, vault: Box<dyn Vault>) -> Result<Vec<String>, AppError> {
+        let references = vault.list().map_err(|e| AppError::Vault(e.to_string()))?;
+        for reference in &references {
+            self.register.grant_credential(reference);
+        }
+        self.vault = Some(vault);
+        Ok(references)
+    }
+
+    /// 当前箓牒后端名；未装时为 `None`（不是「未知」）。
+    pub fn vault_backend(&self) -> Option<&'static str> {
+        self.vault.as_ref().map(|vault| vault.backend())
+    }
+
+    /// provider 是否已装上 Bearer 令牌（**只回答有没有，不回答是什么**）。
+    pub fn provider_auth_enabled(&self) -> bool {
+        self.provider.auth_enabled()
+    }
+
+    /// 箓牒里的引用清单（原样返回后端结果，不做二次缓存）。
+    pub fn vault_entries(&self) -> Result<Vec<String>, AppError> {
+        match &self.vault {
+            Some(vault) => vault.list().map_err(|e| AppError::Vault(e.to_string())),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 解析敕令凭据。返回 `(Bearer 令牌, 引用)`：
+    /// 本地引用给 `(None, None)`；其余引用**必须**取到，否则报错（绝不返回空令牌）。
+    fn resolve_credential(
+        &self,
+        fu: &Talisman,
+    ) -> Result<(Option<BearerToken>, Option<CredentialRef>), AppError> {
+        let reference =
+            CredentialRef::parse(&fu.credential_ref).map_err(|e| AppError::Vault(e.to_string()))?;
+        if reference.is_local() {
+            return Ok((None, None));
+        }
+        let Some(vault) = self.vault.as_ref() else {
+            return Err(AppError::Vault(format!(
+                "符要求敕令 {reference}，但本会话没装箓牒；先执行 `fulu vault put {reference}` 并重开会话\
+                 （或用 FULU_VAULT_PASSPHRASE 走文件级加密后端）"
+            )));
+        };
+        let secret = vault
+            .get(&reference)
+            .map_err(|e| AppError::Vault(e.to_string()))?;
+        // Secret 在这里就交给 BearerToken 并原值 drop（内部清零），不留副本。
+        Ok((Some(BearerToken::new(secret.expose())), Some(reference)))
+    }
+
+    /// dry-run 里那一行「敕令」说明：能不能取到，必须在确认页上写清楚。
+    fn credential_note(&self, fu: &Talisman) -> Result<String, AppError> {
+        match self.resolve_credential(fu)? {
+            (_, None) => Ok("敕令：lu://default/local（本地模型无需凭据）".to_owned()),
+            (_, Some(reference)) => Ok(format!(
+                "敕令：{reference} 已从箓牒取出（焚化时作为 Bearer 注入；符、日志、缴符均无明文）"
+            )),
+        }
     }
 
     /// 启用问天（T15）：从**已接入**的外宗工具里挑搜索类后端，绑给
@@ -1130,6 +1204,14 @@ impl AltarSession {
 
     /// 成符 → 盖印 → 待焚。零网络请求。
     pub fn dry_run(&mut self, fu: &Talisman) -> Result<DryRunPlan, AppError> {
+        // 顺序是刻意的：**破符 → 凭据 → 授箓 → 其余**。
+        // 结构都不对的符，谈凭据与授权没有意义；而凭据问题比笼统的「未受箓」更好定位——
+        // 在 T40 的规则下「箓牒里有这条引用」就等于已受箓，所以先查凭据能直接给出补救命令。
+        let violations = fu.validate();
+        if !violations.is_empty() {
+            return Err(AppError::Script(violations.to_string()));
+        }
+        let credential_line = self.credential_note(fu)?;
         let assembled = self.ensure_prompt(fu);
         let mut altar = self.altar(fu, &assembled);
         let mut plan = altar.prepare(fu)?;
@@ -1189,6 +1271,8 @@ impl AltarSession {
                 backends.join("、")
             ));
         }
+        // T40：敕令凭据在确认页之前就已确认「取得到」，这里把结论写进计划。
+        plan.notes.push(credential_line);
         self.log_session_context(&plan.seal)?;
         Ok(plan)
     }
@@ -1200,6 +1284,20 @@ impl AltarSession {
         plan: &DryRunPlan,
         confirmed: bool,
     ) -> Result<Receipt, AppError> {
+        // T40：**没确认就不碰凭据库**。取密钥这件事只在用户已经点头之后才发生。
+        // 取不到即返回错误，绝不把「空令牌」发出去当认证。
+        if confirmed {
+            let (token, reference) = self.resolve_credential(fu)?;
+            self.provider.set_auth_token(token);
+            if let Some(reference) = reference {
+                let _ = self.audit.append(
+                    &plan.seal,
+                    TalismanState::Igniting,
+                    EventKind::Credential,
+                    &format!("敕令 {reference} 已从箓牒解析并注入，未写入任何明文"),
+                );
+            }
+        }
         let assembled = self.ensure_prompt(fu);
         let mut altar = self.altar(fu, &assembled);
         let result = altar.ignite(fu, plan, confirmed);
@@ -1721,5 +1819,198 @@ mod tests {
         assert!(session.dry_run(&fu).is_err(), "非内容寻址引用必须破符");
         fu.skill_refs = vec!["sha256:not-a-digest".into()];
         assert!(session.dry_run(&fu).is_err(), "假摘要必须破符");
+    }
+
+    // ---- T40 箓牒：凭据库 ----
+
+    /// 记账用的凭据库：包一层内存库，数一数 `get` 被调了几次。
+    struct CountingVault {
+        inner: fulu_vault::MemoryVault,
+        /// 与测试共享的计数器：凭据库被搬进会话后，测试仍能看见它被摸了几次。
+        gets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingVault {
+        fn new(
+            reference: &str,
+            secret: &str,
+        ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let gets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    inner: fulu_vault::MemoryVault::with_entry(reference, secret),
+                    gets: gets.clone(),
+                },
+                gets,
+            )
+        }
+    }
+
+    impl fulu_vault::Vault for CountingVault {
+        fn backend(&self) -> &'static str {
+            "counting（测试）"
+        }
+
+        fn get(
+            &self,
+            reference: &fulu_vault::CredentialRef,
+        ) -> Result<fulu_vault::Secret, fulu_vault::VaultError> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(reference)
+        }
+
+        fn put(
+            &self,
+            reference: &fulu_vault::CredentialRef,
+            secret: &fulu_vault::Secret,
+        ) -> Result<(), fulu_vault::VaultError> {
+            self.inner.put(reference, secret)
+        }
+
+        fn delete(
+            &self,
+            reference: &fulu_vault::CredentialRef,
+        ) -> Result<(), fulu_vault::VaultError> {
+            self.inner.delete(reference)
+        }
+
+        fn list(&self) -> Result<Vec<String>, fulu_vault::VaultError> {
+            self.inner.list()
+        }
+    }
+
+    /// 云端符：provider 不是本地回环，因此 `credential_ref` 也必须是真凭据引用。
+    /// （本地 provider 会被 core 强制要求 `lu://default/local`，这是既有语义。）
+    fn cloud_fu() -> Talisman {
+        let mut fu = Talisman::sample();
+        fu.head.provider_ref = "lu://cloud/openai-compatible".into();
+        fu.credential_ref = "lu://default/cloud".into();
+        fu
+    }
+
+    #[test]
+    fn local_talismans_never_touch_a_vault() {
+        let mut session = AltarSession::new();
+        assert!(session.vault_backend().is_none(), "默认不装箓牒");
+        let plan = session
+            .dry_run(&Talisman::sample())
+            .expect("本地符无需凭据");
+        assert!(
+            plan.notes.iter().any(|n| n.contains("本地模型无需凭据")),
+            "确认页必须写明凭据来源：{:?}",
+            plan.notes
+        );
+        assert!(session.vault_entries().expect("未装也应可查").is_empty());
+    }
+
+    #[test]
+    fn cloud_talisman_without_a_vault_is_refused_before_burning() {
+        let mut session = AltarSession::new();
+        match session.dry_run(&cloud_fu()) {
+            Err(AppError::Vault(detail)) => {
+                assert!(detail.contains("没装箓牒"), "理由要说清楚：{detail}");
+                assert!(detail.contains("fulu vault put"), "必须指路：{detail}");
+            }
+            other => panic!("未装箓牒时云端符必须被拒，实际：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_entries_become_granted_credentials() {
+        let mut session = AltarSession::new();
+        let granted = session
+            .use_vault(Box::new(fulu_vault::MemoryVault::with_entry(
+                "lu://default/cloud",
+                "sk-1",
+            )))
+            .expect("装库");
+        assert_eq!(granted, vec!["lu://default/cloud".to_owned()]);
+        assert!(session.vault_backend().is_some());
+        // 已入箓 → 授箓核验通过 → dry-run 能走到底
+        let plan = session.dry_run(&cloud_fu()).expect("已入箓应可 dry-run");
+        assert!(
+            plan.notes.iter().any(|n| n.contains("已从箓牒取出")),
+            "确认页必须写明凭据已就位：{:?}",
+            plan.notes
+        );
+    }
+
+    #[test]
+    fn sealed_credential_is_injected_only_after_confirmation() {
+        use std::sync::atomic::Ordering;
+        let mut session = AltarSession::new();
+        let (vault, gets) = CountingVault::new("lu://default/cloud", "sk-vault-1");
+        session.use_vault(Box::new(vault)).expect("装库");
+        let fu = cloud_fu();
+        let plan = session.dry_run(&fu).expect("dry-run 通过");
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "dry-run 取一次，用来判断取不取得到"
+        );
+
+        // 未确认：一个字都不多摸凭据库、不装令牌
+        assert!(session.ignite(&fu, &plan, false).is_err());
+        assert_eq!(gets.load(Ordering::SeqCst), 1, "未确认时不得再碰凭据库");
+        assert_eq!(
+            session
+                .audit()
+                .events()
+                .iter()
+                .filter(|e| e.kind == EventKind::Credential)
+                .count(),
+            0,
+            "未确认前不得有凭据事件"
+        );
+
+        // 已确认：令牌注入 provider（随后因未设端点失败，但凭据这一步已经发生）
+        assert!(
+            session.ignite(&fu, &plan, true).is_err(),
+            "未设端点必然失败"
+        );
+        assert!(session.provider_auth_enabled(), "确认后应已注入 Bearer");
+        assert_eq!(gets.load(Ordering::SeqCst), 2, "确认后恰好再取一次");
+        let credential_events: Vec<_> = session
+            .audit()
+            .events()
+            .iter()
+            .filter(|e| e.kind == EventKind::Credential)
+            .collect();
+        assert_eq!(credential_events.len(), 1);
+        let detail = &credential_events[0].detail;
+        assert!(detail.contains("lu://default/cloud"));
+        assert!(
+            !detail.contains("sk-vault-1"),
+            "缴符里绝不能出现明文：{detail}"
+        );
+    }
+
+    #[test]
+    fn missing_entry_is_refused_even_when_the_vault_is_installed() {
+        let mut session = AltarSession::new();
+        session
+            .use_vault(Box::new(fulu_vault::MemoryVault::with_entry(
+                "lu://default/other",
+                "sk-1",
+            )))
+            .expect("装库");
+        // 库里没有 cloud 这条：授箓核验就该驳回，轮不到焚化
+        assert!(session.dry_run(&cloud_fu()).is_err());
+    }
+
+    #[test]
+    fn malformed_reference_is_caught_by_the_gate_not_ignored() {
+        let mut session = AltarSession::new();
+        session
+            .use_vault(Box::new(fulu_vault::MemoryVault::new()))
+            .expect("装库");
+        let mut fu = Talisman::sample();
+        // core 只校验 `lu://` 前缀；具体段格式由箓牒这一层挡住。
+        fu.head.provider_ref = "lu://cloud/openai-compatible".into();
+        fu.credential_ref = "lu://Default/cloud".into();
+        match session.dry_run(&fu) {
+            Err(AppError::Vault(detail)) => assert!(detail.contains("不合法")),
+            other => panic!("畸形引用必须被拒，实际：{other:?}"),
+        }
     }
 }

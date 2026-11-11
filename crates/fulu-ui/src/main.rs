@@ -85,6 +85,10 @@ struct FuluApp {
     skills_issues: Vec<String>,
     risk_lines: Vec<String>,
     risk_issues: Vec<String>,
+    /// T40 箓牒：后端名与已入箓条数的摘要（永不显示密钥）
+    vault_note: String,
+    vault_lines: Vec<String>,
+    vault_issues: Vec<String>,
 }
 
 impl FuluApp {
@@ -148,6 +152,9 @@ impl FuluApp {
             skills_issues: Vec::new(),
             risk_lines: Vec::new(),
             risk_issues: Vec::new(),
+            vault_note: String::new(),
+            vault_lines: Vec::new(),
+            vault_issues: Vec::new(),
         };
         app.refresh_files();
         app.reload_models();
@@ -561,7 +568,26 @@ impl FuluApp {
             return;
         }
         session.set_workspace(workspace);
+        // T40：装箓牒。取不到凭据不会静默降级——云端符在 dry-run 阶段就会被拒。
+        match fulu_vault::open_default() {
+            Ok(vault) => {
+                let backend = vault.backend();
+                match session.use_vault(vault) {
+                    Ok(references) => {
+                        self.vault_note = format!("{backend}：{} 条已入箓", references.len());
+                    }
+                    Err(error) => {
+                        self.vault_note = format!("{backend}：索引不可读（{error}）");
+                    }
+                }
+            }
+            Err(error) => {
+                self.vault_note = format!("未装箓牒（{error}）——云端符会被拒绝执行");
+            }
+        }
         self.session = Some(session);
+        self.vault_lines.clear();
+        self.vault_issues.clear();
         self.audit_lines.clear();
         self.replay_lines.clear();
         self.receipt = None;
@@ -663,6 +689,33 @@ impl FuluApp {
         let (lines, issues) = fulu_app::risk_overrides_listing();
         self.risk_lines = lines;
         self.risk_issues = issues;
+    }
+
+    /// 箓牒：只列引用名与后端；密钥在任何视图里都不出现。
+    fn refresh_vault(&mut self) {
+        let mut lines = Vec::new();
+        let mut issues = Vec::new();
+        match self.session.as_ref() {
+            None => issues.push("尚未开法坛".to_owned()),
+            Some(session) => {
+                match session.vault_backend() {
+                    Some(backend) => lines.push(format!("后端：{backend}")),
+                    None => issues.push("未装箓牒；云端符会被拒绝执行".to_owned()),
+                }
+                match session.vault_entries() {
+                    Ok(entries) if entries.is_empty() => lines.push("已登记：0 条".to_owned()),
+                    Ok(entries) => {
+                        lines.push(format!("已登记（引用名，非密钥）：{} 条", entries.len()));
+                        for entry in entries {
+                            lines.push(format!("  {entry}"));
+                        }
+                    }
+                    Err(error) => issues.push(format!("清单读取失败：{error}")),
+                }
+            }
+        }
+        self.vault_lines = lines;
+        self.vault_issues = issues;
     }
 
     // ------------------------------------------------------------------
@@ -1171,6 +1224,7 @@ impl FuluApp {
                         self.refresh_prompt();
                         self.refresh_skills();
                         self.refresh_risk();
+                        self.refresh_vault();
                     }
                     if ui.button("会话头").clicked() {
                         self.refresh_context();
@@ -1183,6 +1237,9 @@ impl FuluApp {
                     }
                     if ui.button("覆盖表").clicked() {
                         self.refresh_risk();
+                    }
+                    if ui.button("箓牒").clicked() {
+                        self.refresh_vault();
                     }
                 });
 
@@ -1264,9 +1321,25 @@ impl FuluApp {
                         );
                     }
                 }
+                if !self.vault_note.is_empty() {
+                    ui.label(egui::RichText::new(&self.vault_note).small().strong());
+                }
+                if !self.vault_lines.is_empty() || !self.vault_issues.is_empty() {
+                    ui.label("箓牒（凭据库；存入请用 fulu vault put，本面板不写）：");
+                    for line in &self.vault_lines {
+                        ui.monospace(line);
+                    }
+                    for issue in &self.vault_issues {
+                        ui.label(
+                            egui::RichText::new(format!("[WARN] {issue}"))
+                                .small()
+                                .color(egui::Color32::from_rgb(180, 120, 40)),
+                        );
+                    }
+                }
                 ui.label(
                     egui::RichText::new(
-                        "本面板只读 + 本地开关；不写任何外部配置，不安装/升级技能。",
+                        "本面板只读 + 本地开关；不写任何外部配置，不安装/升级技能，也不回显密钥。",
                     )
                     .small()
                     .weak(),

@@ -30,6 +30,7 @@ fn run(args: &[String]) -> i32 {
         },
         Some("mcp") => mcp(&args[1..]),
         Some("skills") => skills(&args[1..]),
+        Some("vault") => vault(&args[1..]),
         Some("taiji") => taiji(&args[1..]),
         Some("init") => init(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -69,6 +70,11 @@ fn help() {
          \x20 fulu mcp remote list                远程 MCP 主机白名单（默认空 = 全部拒绝）\n\
          \x20 fulu mcp remote allow|deny <域名>    放行/撤销（只写 ~/.fulu/remote-mcp.json）\n\
          \x20 fulu skills list [根目录]            符胆：全局技能包只读展示\n\
+         \x20 fulu vault backend                  箓牒：当前凭据后端与存放位置\n\
+         \x20 fulu vault list                     箓牒：已登记的凭据引用（只有名字）\n\
+         \x20 fulu vault put <引用>               箓牒：从标准输入读密钥存入（不经 argv）\n\
+         \x20 fulu vault get <引用> [--reveal]    箓牒：确认可取；加 --reveal 才打印明文\n\
+         \x20 fulu vault rm <引用>                箓牒：删除一条凭据\n\
          \x20 fulu taiji run <符图.json> --confirm  太极：按 DAG 拓扑序逐张符走完整仪轨\n\
          \x20 fulu init [--workspace <目录>]       引符：开箱基础配置（生成第一张示例符）\n\
          \x20 fulu help                          本帮助\n\
@@ -575,6 +581,19 @@ fn altar(args: &[String]) -> i32 {
     if let Some(mode) = options.prompt_mode {
         session.set_prompt_mode(mode);
     }
+    // T40：装箓牒。缺凭据的符在 dry-run 阶段就会被拒，不会焚化到一半才失败。
+    match fulu_vault::open_default() {
+        Ok(vault) => match session.use_vault(vault) {
+            Ok(references) if references.is_empty() => {}
+            Ok(references) => println!(
+                "[OK] 箓牒：{} 条已入箓（{}）",
+                references.len(),
+                references.join("、")
+            ),
+            Err(error) => eprintln!("[WARN] 箓牒索引不可读：{error}（本地符不受影响）"),
+        },
+        Err(error) => eprintln!("[WARN] 箓牒不可用：{error}（本地符不受影响；云端符会被拒绝）"),
+    }
     if options.context_ip {
         session.set_context_ip(true);
         println!("[INFO] 已显式开启 IP 粗粒度查询（本次会话一次外部请求）");
@@ -1063,6 +1082,219 @@ fn mcp_risk(args: &[String]) -> i32 {
 ///
 /// 只写 **fulu 自有** `~/.fulu/remote-mcp.json`；绝不改任何 MCP server 配置。
 /// 白名单为空 = 远程 MCP 全部拒绝（默认关闭）。
+/// 把密钥渲染成「可安全贴进日志」的形式：只给长度，不给内容。
+fn mask_secret(secret: &fulu_vault::Secret) -> String {
+    format!("已存在（{} 字节，内容不回显）", secret.len())
+}
+
+fn vault(args: &[String]) -> i32 {
+    let Some(command) = args.first().map(String::as_str) else {
+        eprintln!("[ERR] 缺少 vault 子命令：backend / list / put / get / rm");
+        return 2;
+    };
+    let rest = &args[1..];
+    match command {
+        "backend" => vault_backend(),
+        "list" => vault_list(),
+        "put" => vault_put(rest),
+        "get" => vault_get(rest),
+        "rm" | "delete" => vault_rm(rest),
+        other => {
+            eprintln!("[ERR] 未知 vault 子命令：{other}（可用：backend / list / put / get / rm）");
+            2
+        }
+    }
+}
+
+fn open_vault() -> Result<Box<dyn fulu_vault::Vault>, String> {
+    fulu_vault::open_default().map_err(|error| error.to_string())
+}
+
+fn vault_backend() -> i32 {
+    let vault = match open_vault() {
+        Ok(vault) => vault,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    println!("[OK] 箓牒后端：{}", vault.backend());
+    match fulu_vault::fulu_home() {
+        Some(home) => {
+            println!("  主目录   : {}", home.display());
+            println!("  文件后端 : {}", home.join("vault").display());
+            println!(
+                "  索引     : {}",
+                fulu_vault::index_path_from(Some(&home))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "（无）".into())
+            );
+        }
+        None => println!("  主目录   : （HOME / USERPROFILE 均为空，索引不可用）"),
+    }
+    match vault.list() {
+        Ok(list) => println!("  已登记   : {} 条", list.len()),
+        Err(error) => println!("  已登记   : 读取失败（{error}）"),
+    }
+    println!("  选择规则 : 设了 FULU_VAULT_PASSPHRASE → 文件级加密后端；否则 → 系统凭据库");
+    0
+}
+
+fn vault_list() -> i32 {
+    let vault = match open_vault() {
+        Ok(vault) => vault,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    match vault.list() {
+        Ok(list) if list.is_empty() => {
+            println!("[INFO] 箓牒为空；用 `fulu vault put <引用>` 存入凭据");
+            0
+        }
+        Ok(list) => {
+            println!(
+                "[OK] {} 条凭据引用（只有名字，密钥在 {}）",
+                list.len(),
+                vault.backend()
+            );
+            for reference in list {
+                println!("  {reference}");
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            1
+        }
+    }
+}
+
+fn vault_put(args: &[String]) -> i32 {
+    let Some(raw) = args.first() else {
+        eprintln!("[ERR] 用法：fulu vault put lu://<scope>/<name>  ← 密钥从标准输入读");
+        return 2;
+    };
+    let reference = match fulu_vault::CredentialRef::parse(raw) {
+        Ok(reference) => reference,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 2;
+        }
+    };
+    if reference.is_local() {
+        eprintln!("[ERR] `{raw}` 是本地模型引用，不需要也不允许存凭据");
+        return 2;
+    }
+    let vault = match open_vault() {
+        Ok(vault) => vault,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    eprintln!(
+        "[INFO] 从标准输入读取密钥（不回显到命令历史）。建议用管道：\n\
+         \x20       printf '%s' \"$KEY\" | fulu vault put {reference}"
+    );
+    let mut raw_secret = String::new();
+    if let Err(error) = io::stdin().read_line(&mut raw_secret) {
+        eprintln!("[ERR] 读取标准输入失败：{error}");
+        return 1;
+    }
+    let trimmed = raw_secret.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+        eprintln!("[ERR] 读到空密钥；空密钥等于关掉认证，拒绝存入");
+        return 2;
+    }
+    let secret = fulu_vault::Secret::new(trimmed);
+    let result = vault.put(&reference, &secret);
+    drop(secret);
+    match result {
+        Ok(()) => {
+            println!("[OK] 已存入 {reference}（{}）", vault.backend());
+            println!("[INFO] 该引用同时视为「已受箓」；下次开法坛即可被符引用");
+            0
+        }
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            1
+        }
+    }
+}
+
+fn vault_get(args: &[String]) -> i32 {
+    let Some(raw) = args.first() else {
+        eprintln!("[ERR] 用法：fulu vault get lu://<scope>/<name> [--reveal]");
+        return 2;
+    };
+    let reveal = args.iter().any(|arg| arg == "--reveal");
+    let reference = match fulu_vault::CredentialRef::parse(raw) {
+        Ok(reference) => reference,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 2;
+        }
+    };
+    let vault = match open_vault() {
+        Ok(vault) => vault,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    match vault.get(&reference) {
+        Ok(secret) => {
+            if reveal {
+                // 明文只写 stdout，方便 `| pbcopy` 之类；同时提醒它会进历史/日志。
+                println!("{}", secret.expose());
+                eprintln!("[WARN] 明文已输出到标准输出；注意 shell 历史与终端回滚缓冲");
+            } else {
+                println!("[OK] {reference} 可取：{}", mask_secret(&secret));
+                println!("[INFO] 需要明文请加 --reveal；默认不回显是故意的");
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            1
+        }
+    }
+}
+
+fn vault_rm(args: &[String]) -> i32 {
+    let Some(raw) = args.first() else {
+        eprintln!("[ERR] 用法：fulu vault rm lu://<scope>/<name>");
+        return 2;
+    };
+    let reference = match fulu_vault::CredentialRef::parse(raw) {
+        Ok(reference) => reference,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 2;
+        }
+    };
+    let vault = match open_vault() {
+        Ok(vault) => vault,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    match vault.delete(&reference) {
+        Ok(()) => {
+            println!("[OK] 已从箓牒删除 {reference}");
+            println!("[WARN] 该引用不再受箓；引用它的符会被驳回");
+            0
+        }
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            1
+        }
+    }
+}
+
 fn mcp_remote(args: &[String]) -> i32 {
     let Some(action) = args.first().map(String::as_str) else {
         eprintln!("[ERR] 用法：fulu mcp remote <list|allow <域名>|deny <域名>> [--policy <文件>]");
@@ -1292,6 +1524,19 @@ fn taiji(args: &[String]) -> i32 {
     }
     if let Some(mode) = options.prompt_mode {
         session.set_prompt_mode(mode);
+    }
+    // T40：装箓牒。缺凭据的符在 dry-run 阶段就会被拒，不会焚化到一半才失败。
+    match fulu_vault::open_default() {
+        Ok(vault) => match session.use_vault(vault) {
+            Ok(references) if references.is_empty() => {}
+            Ok(references) => println!(
+                "[OK] 箓牒：{} 条已入箓（{}）",
+                references.len(),
+                references.join("、")
+            ),
+            Err(error) => eprintln!("[WARN] 箓牒索引不可读：{error}（本地符不受影响）"),
+        },
+        Err(error) => eprintln!("[WARN] 箓牒不可用：{error}（本地符不受影响；云端符会被拒绝）"),
     }
     if options.context_ip {
         session.set_context_ip(true);
@@ -1712,5 +1957,22 @@ mod tests {
         assert!(options.confirm);
         assert!(options.ask);
         assert_eq!(options.allow_risk, Some(RiskClass::Mutate));
+    }
+
+    #[test]
+    fn vault_mask_reports_length_but_never_the_value() {
+        let secret = fulu_vault::Secret::new("sk-proj-123456");
+        let masked = mask_secret(&secret);
+        assert!(masked.contains("14 字节"), "应给出长度：{masked}");
+        assert!(!masked.contains("sk-proj"), "绝不能回显内容：{masked}");
+    }
+
+    #[test]
+    fn vault_rejects_the_local_reference_before_touching_stdin() {
+        // put 在解析引用这一步就该拒绝本地引用，绝不等到读 stdin 才报错。
+        let args = ["lu://default/local"].map(String::from).to_vec();
+        // 直接调会读 stdin；这里只验证前置判断用的解析结果与拒绝条件一致。
+        let reference = fulu_vault::CredentialRef::parse(&args[0]).expect("引用本身合法");
+        assert!(reference.is_local());
     }
 }

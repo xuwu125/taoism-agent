@@ -13,7 +13,9 @@ pub mod local;
 pub mod stub;
 
 pub use http::{Endpoint, HttpError, HttpResponse, MAX_RESPONSE_BYTES};
-pub use local::{Health, LocalLfmProvider, build_request_body, normalize_tool_calls, parse_reply};
+pub use local::{
+    BearerToken, Health, LocalLfmProvider, build_request_body, normalize_tool_calls, parse_reply,
+};
 pub use stub::{StubProvider, text_reply};
 
 use fulu_core::Sampling;

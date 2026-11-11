@@ -40,6 +40,8 @@ pub enum EventKind {
     Rejected,
     Exploded,
     TimedOut,
+    /// 敕令凭据从箓牒解析（只记引用名，永不记明文）
+    Credential,
 }
 
 impl EventKind {
@@ -61,6 +63,7 @@ impl EventKind {
             Self::Rejected => "驳回",
             Self::Exploded => "炸炉",
             Self::TimedOut => "过坛",
+            Self::Credential => "凭据",
         }
     }
 }

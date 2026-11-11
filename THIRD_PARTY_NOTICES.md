@@ -36,7 +36,8 @@
 | `egui` / `eframe` 0.37 | MIT OR Apache-2.0 | 原生自绘 GUI（glow 后端，非 WebView） |
 | `epaint_default_fonts` 0.37（由 eframe `default_fonts` 特性引入，**字体字节内嵌进二进制**） | (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0 | egui 内置兜底字体 |
 | `serde` / `serde_json` | MIT OR Apache-2.0 | 清单与符文序列化 |
-| `sha2` | MIT OR Apache-2.0 | 符印与权重摘要 |
+| `sha2` | MIT OR Apache-2.0 | 符印与权重摘要；箓牒文件后端的 KDF |
+| `chacha20poly1305` 0.10 / `pbkdf2` 0.12 / `zeroize` 1（RustCrypto） | MIT OR Apache-2.0 | **仅**用于箓牒（`fulu-vault`）的文件级加密兜底：AEAD 加密凭据、PBKDF2 派生密钥、密钥清零；不参与任何网络握手，与 TLS 无关 |
 | `llama.cpp` / `llama-server`（外部运行时，M2 起按需分发） | MIT | 本地 GGUF 推理服务 |
 
 `cargo deny` 在 CI 中检查 Rust 依赖许可白名单；它**不覆盖模型权重**，权重由本文件与 `models/README.md` 管控。

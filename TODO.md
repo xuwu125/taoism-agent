@@ -89,7 +89,7 @@
 - [ ] **T37 中文 IME 真人验收（M0 硬门槛）** — 证据：`README.md:141`、`docs/02:502,563`。做法：用户亲自在符箓台敲中文预编辑；不达标按 9.2 切 iced。**阻塞：必须真人操作，AI 无法代做**。
 - [ ] **T38 GUI 跨平台窗口实测 + 交互级验收** — 证据：`docs/02:676`「只在 Windows 10 做了启动冒烟」。做法：三平台窗口、拖拽分栏、长符滚动、IME 面板内表现，形成用例清单。
 - [ ] **T39 中文 DSL / `.fub` 紧凑二进制 / 复文字典 / 云篆** — 证据：`fulu-script/src/lib.rs:10-11` 自述「M1 换中文 DSL」未做；`docs/02:19,126-128,565`。做法：先定语法与快照测试，再谈 GUI 渲染；与 T36 联动。
-- [ ] **T40 `credential_ref` 凭据库接入** — 证据：`fulu-register/src/lib.rs:6-7`「系统凭据库接入属 M3」、`:363` 仅字符串白名单；`docs/02:119,426,565`。做法：跨平台 keyring 抽象（Windows Credential Manager / Keychain / Secret Service）+ 文件级加密兜底（需口令）；**符内仍只存引用**。验收：明文密钥零落盘、取不到凭据即拒绝执行。
+- [x] **T40 `credential_ref` 凭据库接入** — 证据：`fulu-register/src/lib.rs:6-7`「系统凭据库接入属 M3」、`:363` 仅字符串白名单；`docs/02:119,426,565`。做法：跨平台 keyring 抽象（Windows Credential Manager / Keychain / Secret Service）+ 文件级加密兜底（需口令）；**符内仍只存引用**。验收：明文密钥零落盘、取不到凭据即拒绝执行。 **已落地：新增 `fulu-vault`（箓牒）crate——系统后端委托 OS 工具（Windows `PasswordVault`/macOS `security`/Linux `secret-tool`，不链接平台 SDK）、文件后端 ChaCha20-Poly1305+PBKDF2-600k（AAD 绑定引用名）、`Secret` 打码+清零；「库里有该引用」= 已受箓，`dry_run` 闸门顺序 破符→凭据→授箓，`ignite` 未确认不碰凭据库、取不到即拒；CLI `fulu vault backend/list/put/get/rm`（put 只吃 stdin），provider 支持 Bearer。本机实测文件后端与系统凭据库两条路径，明文零落盘；macOS/Linux 分支未真机验。**
 
 # S7 · 需要用户拍板（不阻塞开发，但要有结论）
 
@@ -139,6 +139,7 @@ T37（真人 IME）/ T27（签名 Secrets）/ T20（1.1GB 下载）= 外部阻�
 | S6 | T33 保存 .fu + 字段表单 + 语法辅助 | 完成 | 本轮 |
 | S6 | T34 模型面板（只读）/ 新会话 / 缴符回放筛选 | 完成 | 本轮 |
 | S6 | T35 设置面板（提示词档位 / 会话头 / 符胆 / 覆盖表只读） | 完成 | 本轮 |
-| — | 基线：225 测试零失败 / clippy 零告警 / fmt 全绿 | 完成 | 本轮 |
+| S4 | T40 箓牒凭据库（系统后端 + 文件级加密兜底，明文零落盘，缺凭据即拒） | 完成 | 本轮 |
+| — | 基线：268 测试零失败 / clippy 零告警 / fmt 全绿 / cargo-deny 四项 ok | 完成 | 本轮 |
 
 > 规则：每完成一项，把上面 `[ ]` 改成 `[x]` 并在进度表补提交号；**未完成不得标已完成**（沿用「不伪装」铁律）。

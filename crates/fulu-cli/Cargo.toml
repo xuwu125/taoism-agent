@@ -17,3 +17,4 @@ fulu-context.workspace = true
 fulu-prompt.workspace = true
 fulu-mcp.workspace = true
 fulu-skills.workspace = true
+fulu-vault.workspace = true

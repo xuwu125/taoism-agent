@@ -15,6 +15,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+# T40 箓牒的文件级加密兜底：AEAD（ChaCha20-Poly1305）+ KDF（PBKDF2-HMAC-SHA256）。
+# 手写密码学是错的，因此这里引入 RustCrypto 纯 Rust 实现（MIT / Apache-2.0，无 C 依赖）。
+# 边界：只用于「系统凭据库不可用」时的加密落盘，不参与任何网络握手；详见 docs/03 第 6 节。
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+zeroize = "1"
 
 # 内部 crate：依赖方向严格单向，见 docs/02 第 5 节。
 # 一律写成「path + version」：只写 path 会被 cargo-deny 判成 `*` 通配依赖（bans 规则 deny），
@@ -34,6 +40,7 @@ fulu-app = { path = "crates/fulu-app", version = "0.1.0" }
 fulu-mcp = { path = "crates/fulu-mcp", version = "0.1.0" }
 fulu-context = { path = "crates/fulu-context", version = "0.1.0" }
 fulu-prompt = { path = "crates/fulu-prompt", version = "0.1.0" }
+fulu-vault = { path = "crates/fulu-vault", version = "0.1.0" }
 
 [profile.release]
 opt-level = "z"

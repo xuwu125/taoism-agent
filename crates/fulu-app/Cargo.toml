@@ -21,3 +21,4 @@ fulu-orchestrator.workspace = true
 fulu-skills.workspace = true
 fulu-context.workspace = true
 fulu-prompt.workspace = true
+fulu-vault.workspace = true

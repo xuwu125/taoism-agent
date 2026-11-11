@@ -13,3 +13,4 @@ path = "src/main.rs"
 [dependencies]
 eframe.workspace = true
 fulu-app.workspace = true
+fulu-vault.workspace = true

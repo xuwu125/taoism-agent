@@ -20,6 +20,32 @@ pub struct Health {
     pub detail: String,
 }
 
+/// 回环服务的 Bearer 令牌（`llama-server --api-key` 那一侧）。
+///
+/// **`Debug` 打码**：这个类型的唯一目的就是别让 `{:?}` 顺手把密钥写进日志。
+#[derive(Clone, PartialEq, Eq)]
+pub struct BearerToken(String);
+
+impl BearerToken {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+}
+
+impl std::fmt::Debug for BearerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BearerToken(***)")
+    }
+}
+
 /// 本地推理服务适配器。端点由 `fulu-model` 的进程管理给出，默认不预设端口。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalLfmProvider {
@@ -31,6 +57,9 @@ pub struct LocalLfmProvider {
     pub context_tokens: u32,
     /// 单次 HTTP 读写超时；法坛另有整符超时，二者取更小者。
     pub timeout: Duration,
+    /// 服务端启用了 `--api-key` 时从这里取；`None` = 不带认证头。
+    /// 令牌由 `fulu-app` 从箓牒解析后注入，provider 自己**不碰凭据库**。
+    pub auth: Option<BearerToken>,
 }
 
 impl LocalLfmProvider {
@@ -41,7 +70,17 @@ impl LocalLfmProvider {
             min_runtime: min_runtime.to_owned(),
             context_tokens,
             timeout: Duration::from_secs(30),
+            auth: None,
         }
+    }
+
+    /// 注入/清除 Bearer 令牌。空令牌视同 `None`——绝不发出 `Authorization: Bearer `。
+    pub fn set_auth_token(&mut self, token: Option<BearerToken>) {
+        self.auth = token.filter(|token| !token.is_empty());
+    }
+
+    pub fn auth_enabled(&self) -> bool {
+        self.auth.is_some()
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -131,14 +170,19 @@ impl Provider for LocalLfmProvider {
     fn invoke(&self, request: &InvocationRequest) -> Result<InvocationReply, ProviderError> {
         let endpoint = self.parsed_endpoint()?;
         let payload = build_request_body(request)?;
-        let response = http::request(
-            &endpoint,
-            "POST",
-            "/v1/chat/completions",
-            Some(payload.as_bytes()),
-            self.timeout,
-        )
-        .map_err(map_http_error)?;
+        // 认证头只在显式注入令牌时才出现：本地无口令的 llama-server 不该收到空 Bearer。
+        let bearer = self
+            .auth
+            .as_ref()
+            .map(|token| format!("Bearer {}", token.expose()));
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(value) = &bearer {
+            headers.push(("Authorization", value.as_str()));
+        }
+        let http_request =
+            http::HttpRequest::post("/v1/chat/completions", payload.as_bytes(), self.timeout)
+                .with_headers(&headers);
+        let response = http::send(&endpoint, &http_request).map_err(map_http_error)?;
         response
             .require_success()
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -568,5 +612,95 @@ mod tests {
             Err(ProviderError::NotConfigured(_))
         ));
         assert!(provider.health().is_err());
+    }
+
+    /// 起一个只收一次请求的假服务，把**请求头原文**交回来。
+    fn capture_headers_once(response_body: String) -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定回环端口");
+        let port = listener.local_addr().expect("取端口").port();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("接受连接");
+            let mut buffer = vec![0_u8; 8192];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            sender
+                .send(String::from_utf8_lossy(&buffer[..read]).into_owned())
+                .ok();
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = stream.write_all(raw.as_bytes());
+            let _ = stream.flush();
+        });
+        (port, receiver)
+    }
+
+    #[test]
+    fn bearer_token_is_sent_only_when_explicitly_injected() {
+        let chat = r#"{"choices":[{"message":{"content":"好"}}]}"#;
+        let (port, headers) = capture_headers_once(chat.to_owned());
+        let mut provider =
+            LocalLfmProvider::from_model("lfm3-1.7b-q4km", 8192, "llama.cpp >= b11960");
+        provider
+            .set_endpoint(&format!("http://127.0.0.1:{port}"))
+            .expect("端点合法");
+        provider.set_auth_token(Some(BearerToken::new("sk-vault-1")));
+        provider.invoke(&sample_request()).expect("应成功");
+        let raw = headers
+            .recv_timeout(Duration::from_secs(5))
+            .expect("应收到请求");
+        let lowered = raw.to_ascii_lowercase();
+        assert!(
+            lowered.contains("authorization: bearer sk-vault-1"),
+            "注入令牌后必须带上认证头：{raw}"
+        );
+    }
+
+    #[test]
+    fn no_authorization_header_without_a_token() {
+        let chat = r#"{"choices":[{"message":{"content":"好"}}]}"#;
+        let (port, headers) = capture_headers_once(chat.to_owned());
+        let mut provider =
+            LocalLfmProvider::from_model("lfm3-1.7b-q4km", 8192, "llama.cpp >= b11960");
+        provider
+            .set_endpoint(&format!("http://127.0.0.1:{port}"))
+            .expect("端点合法");
+        provider.invoke(&sample_request()).expect("应成功");
+        let raw = headers
+            .recv_timeout(Duration::from_secs(5))
+            .expect("应收到请求");
+        assert!(
+            !raw.to_ascii_lowercase().contains("authorization"),
+            "无令牌时不得出现 Authorization（尤其是空的 Bearer）：{raw}"
+        );
+    }
+
+    #[test]
+    fn empty_or_blank_tokens_are_treated_as_absent() {
+        let mut provider = LocalLfmProvider::from_model("m", 1024, "r");
+        provider.set_auth_token(Some(BearerToken::new("")));
+        assert!(!provider.auth_enabled());
+        provider.set_auth_token(Some(BearerToken::new("   ")));
+        assert!(!provider.auth_enabled());
+        provider.set_auth_token(Some(BearerToken::new("k")));
+        assert!(provider.auth_enabled());
+        provider.set_auth_token(None);
+        assert!(!provider.auth_enabled());
+    }
+
+    #[test]
+    fn token_debug_is_redacted_even_inside_the_provider() {
+        let mut provider = LocalLfmProvider::from_model("m", 1024, "r");
+        provider.set_auth_token(Some(BearerToken::new("sk-proj-secret")));
+        let rendered = format!("{provider:?}");
+        assert!(
+            !rendered.contains("sk-proj-secret"),
+            "provider 的 Debug 泄漏了令牌"
+        );
+        assert!(rendered.contains("BearerToken(***)"));
     }
 }
