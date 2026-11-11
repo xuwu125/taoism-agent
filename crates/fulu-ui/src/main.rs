@@ -64,6 +64,27 @@ struct FuluApp {
     ime_open: bool,
     ime_input: String,
     ime_log: Vec<String>,
+
+    // ---- T33 保存与字段表单 ----
+    save_name: String,
+    overwrite_ok: bool,
+    /// 解析成功后的字段表单（编辑它 → 「应用表单」按规范格式重写正文）。
+    form: Option<Fu>,
+
+    // ---- T34 模型 / 会话 / 回放 ----
+    model_lines: Vec<String>,
+    model_ids: Vec<String>,
+    replay_lines: Vec<String>,
+    replay_filter: String,
+
+    // ---- T35 设置面板 ----
+    show_settings: bool,
+    context_text: String,
+    prompt_text: String,
+    skills_lines: Vec<String>,
+    skills_issues: Vec<String>,
+    risk_lines: Vec<String>,
+    risk_issues: Vec<String>,
 }
 
 impl FuluApp {
@@ -113,8 +134,23 @@ impl FuluApp {
             ime_open: false,
             ime_input: String::new(),
             ime_log: Vec::new(),
+            save_name: "sample.fu".into(),
+            overwrite_ok: false,
+            form: None,
+            model_lines: Vec::new(),
+            model_ids: Vec::new(),
+            replay_lines: Vec::new(),
+            replay_filter: String::new(),
+            show_settings: false,
+            context_text: String::new(),
+            prompt_text: String::new(),
+            skills_lines: Vec::new(),
+            skills_issues: Vec::new(),
+            risk_lines: Vec::new(),
+            risk_issues: Vec::new(),
         };
         app.refresh_files();
+        app.reload_models();
         app
     }
 
@@ -393,6 +429,240 @@ impl FuluApp {
         }
         self.refresh_files();
         self.say(format!("工作区已设为 {}", root.display()), Tone::Good);
+    }
+
+    // ------------------------------------------------------------------
+    // T33：保存 .fu 与字段表单
+    // ------------------------------------------------------------------
+
+    /// 重新读模型清单（只读；不触发任何下载）。
+    fn reload_models(&mut self) {
+        match fulu_app::manifest_slots() {
+            Ok(slots) => {
+                self.model_ids = slots.iter().map(|slot| slot.model_id.clone()).collect();
+                self.model_lines = slots
+                    .iter()
+                    .map(|slot| {
+                        format!(
+                            "{}{}｜{}｜{}｜{}｜上下文 {} tokens｜{}",
+                            if slot.is_default { "★ " } else { "  " },
+                            slot.slot,
+                            slot.model_id,
+                            slot.quant,
+                            slot.approx_size,
+                            slot.context_tokens,
+                            if slot.digest_pinned {
+                                "摘要已固化"
+                            } else {
+                                "UNVERIFIED（清单未固化 sha256）"
+                            }
+                        )
+                    })
+                    .collect();
+            }
+            Err(error) => {
+                self.model_lines = vec![format!("清单读取失败：{error}")];
+                self.model_ids.clear();
+            }
+        }
+    }
+
+    /// 保存当前正文为工作区内的 `.fu`。
+    ///
+    /// 保存的是**规范格式**（`fulu_app::dump_fu`）：注释与自定义排版会丢。
+    /// 因此这里不做「静默覆盖」——同名文件必须勾选覆盖才写。
+    fn save_fu(&mut self) {
+        let raw = self.save_name.trim().to_owned();
+        if raw.is_empty() {
+            self.say("文件名不能为空", Tone::Bad);
+            return;
+        }
+        if raw.contains('/') || raw.contains('\\') || raw.contains("..") {
+            self.say("文件名不能含路径分隔符或 ..（只能存到工作区根）", Tone::Bad);
+            return;
+        }
+        let name = if raw.ends_with(".fu") {
+            raw
+        } else {
+            format!("{raw}.fu")
+        };
+        let fu = match fulu_app::parse_fu(&self.fu_text) {
+            Ok(fu) => fu,
+            Err(error) => {
+                self.say(format!("破符，未保存：{error}"), Tone::Bad);
+                return;
+            }
+        };
+        let text = match fulu_app::dump_fu(&fu) {
+            Ok(text) => text,
+            Err(error) => {
+                self.say(format!("规范化失败，未保存：{error}"), Tone::Bad);
+                return;
+            }
+        };
+        let path = PathBuf::from(&self.workspace).join(&name);
+        if path.exists() && !self.overwrite_ok {
+            self.say(
+                format!("{name} 已存在：勾选「允许覆盖」后再保存"),
+                Tone::Bad,
+            );
+            return;
+        }
+        match std::fs::write(&path, &text) {
+            Ok(()) => {
+                self.refresh_files();
+                self.form = Some(fu);
+                self.say(
+                    format!(
+                        "已保存 → {}（{} 字节；规范格式，注释不保留）",
+                        path.display(),
+                        text.len()
+                    ),
+                    Tone::Good,
+                );
+            }
+            Err(error) => self.say(format!("写入失败：{error}"), Tone::Bad),
+        }
+    }
+
+    /// 把字段表单按规范格式写回正文。改字段等于改符，必须重新盖印。
+    fn apply_form(&mut self) {
+        let Some(form) = self.form.clone() else {
+            self.say("还没有可应用的字段表单：先校验或保存一次", Tone::Bad);
+            return;
+        };
+        match fulu_app::dump_fu(&form) {
+            Ok(text) => {
+                self.fu_text = text;
+                self.invalidate();
+                self.form = Some(form);
+                self.say(
+                    "已按表单重写正文（规范格式，注释不保留）；请重新盖印",
+                    Tone::Info,
+                );
+            }
+            Err(error) => self.say(format!("表单生成失败：{error}"), Tone::Bad),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // T34：会话管理与缴符回放
+    // ------------------------------------------------------------------
+
+    /// 新开一场法坛（保留端点与工作区，清空缴符视图）。
+    fn new_session(&mut self) {
+        let endpoint = self.endpoint.trim().to_owned();
+        let workspace = PathBuf::from(&self.workspace);
+        let mut session = AltarSession::new();
+        if !endpoint.is_empty()
+            && let Err(error) = session.set_endpoint(&endpoint)
+        {
+            self.say(format!("端点沿用时被拒：{error}"), Tone::Bad);
+            return;
+        }
+        session.set_workspace(workspace);
+        self.session = Some(session);
+        self.audit_lines.clear();
+        self.replay_lines.clear();
+        self.receipt = None;
+        self.plan = None;
+        self.loaded = None;
+        self.seal = None;
+        self.confirm_checked = false;
+        self.say("已新开一场法坛（缴符视图已清空，磁盘日志未动）", Tone::Good);
+    }
+
+    /// 读回缴符 JSONL 并按关键字筛选（回放；只读，不改文件）。
+    fn load_replay(&mut self) {
+        let path = Path::new(&self.workspace).join("fulu-audit.jsonl");
+        let Some(session) = self.session.as_ref() else {
+            self.say("法坛不可用", Tone::Bad);
+            return;
+        };
+        match session.replay_audit(&path) {
+            Ok(lines) => {
+                let total = lines.len();
+                let needle = self.replay_filter.trim().to_lowercase();
+                let kept: Vec<String> = if needle.is_empty() {
+                    lines
+                } else {
+                    lines
+                        .into_iter()
+                        .filter(|line| line.to_lowercase().contains(&needle))
+                        .collect()
+                };
+                self.say(
+                    format!(
+                        "回放：{total} 行，命中 {} 行（{}）",
+                        kept.len(),
+                        path.display()
+                    ),
+                    Tone::Info,
+                );
+                self.replay_lines = kept;
+            }
+            Err(error) => self.say(format!("回放失败：{error}"), Tone::Bad),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // T35：设置面板（会话头 / 提示词 / 符胆 / 覆盖表）
+    // ------------------------------------------------------------------
+
+    fn refresh_context(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        self.context_text = session
+            .context_summary()
+            .unwrap_or_else(|| "（会话头已关闭或采集失败；全项容错，不影响焚符）".into());
+    }
+
+    fn refresh_prompt(&mut self) {
+        let fu = match fulu_app::parse_fu(&self.fu_text) {
+            Ok(fu) => fu,
+            Err(error) => {
+                self.say(format!("破符，无法预览提示词：{error}"), Tone::Bad);
+                return;
+            }
+        };
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let assembled = session.prompt_preview(&fu);
+        let mut header = format!(
+            "档位 {:?}｜共 {} 字符{}",
+            assembled.mode,
+            assembled.total_chars,
+            if assembled.total_truncated {
+                "（有层被截断）"
+            } else {
+                ""
+            }
+        );
+        for section in &assembled.sections {
+            header.push_str(&format!(
+                "｜{:?} {} 字符{}",
+                section.layer,
+                section.chars,
+                if section.truncated { "(截断)" } else { "" }
+            ));
+        }
+        // 只展示前 8000 字符：装配结果可长，界面不做「全量渲染」拖慢帧率。
+        let preview: String = assembled.text.chars().take(8000).collect();
+        self.prompt_text = format!("{header}\n\n{preview}");
+    }
+
+    fn refresh_skills(&mut self) {
+        let (lines, issues) = fulu_app::skills_listing();
+        self.skills_lines = lines;
+        self.skills_issues = issues;
+    }
+
+    fn refresh_risk(&mut self) {
+        let (lines, issues) = fulu_app::risk_overrides_listing();
+        self.risk_lines = lines;
+        self.risk_issues = issues;
     }
 
     // ------------------------------------------------------------------
@@ -688,8 +958,320 @@ impl FuluApp {
                     }
                 ));
             }
+
+            ui.separator();
+            self.save_and_form(ui);
+            self.model_and_session(ui);
+            self.settings(ui);
             let _ = ctx;
         });
+    }
+
+    /// T33：保存 .fu + 字段表单 + 语法辅助。
+    fn save_and_form(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("符文保存与字段表单（T33）")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("文件名");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.save_name)
+                            .hint_text("sample.fu")
+                            .desired_width(200.0),
+                    );
+                    ui.checkbox(&mut self.overwrite_ok, "允许覆盖");
+                    if ui.button("保存到工作区").clicked() {
+                        self.save_fu();
+                    }
+                    if ui.button("校验并载入表单").clicked() {
+                        match fulu_app::parse_fu(&self.fu_text) {
+                            Ok(fu) => {
+                                self.form = Some(fu);
+                                self.say("字段表单已载入（改完点「应用表单」）", Tone::Info);
+                            }
+                            Err(error) => self.say(format!("破符：{error}"), Tone::Bad),
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "保存按规范格式重写：注释、字段顺序、空行都会丢——只认字段。",
+                    )
+                    .small()
+                    .weak(),
+                );
+
+                ui.separator();
+                ui.label("语法辅助（插入到正文末尾，自己再挪位置）");
+                ui.horizontal_wrapped(|ui| {
+                    for (label, snippet) in [
+                        ("目标", "goal:\n  description: \"要做的事\"\n  success_criteria: \"怎样算完成\"\n"),
+                        ("符脚", "output:\n  schema: \"text\"\n  max_iterations: 3\n  until: \"达成目标\"\n"),
+                        ("技能引用", "skill_refs:\n  - \"sha256:在这里粘贴摘要\"\n"),
+                        ("工具白名单", "  - fs.read\n"),
+                    ] {
+                        if ui.button(label).clicked() {
+                            if !self.fu_text.ends_with('\n') {
+                                self.fu_text.push('\n');
+                            }
+                            self.fu_text.push_str(snippet);
+                            self.invalidate();
+                            self.say(format!("已插入「{label}」片段，请自行调整位置"), Tone::Info);
+                        }
+                    }
+                });
+
+                if self.form.is_some() {
+                    ui.separator();
+                    let slots = self.model_ids.clone();
+                    let mut apply = false;
+                    if let Some(form) = self.form.as_mut() {
+                        egui::Grid::new("fu_form")
+                            .num_columns(2)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("符名");
+                                ui.text_edit_singleline(&mut form.name);
+                                ui.end_row();
+
+                                ui.label("请神（model_id）");
+                                egui::ComboBox::from_id_salt("model_id_pick")
+                                    .selected_text(form.deity.model_id.clone())
+                                    .show_ui(ui, |ui| {
+                                        for id in &slots {
+                                            ui.selectable_value(
+                                                &mut form.deity.model_id,
+                                                id.clone(),
+                                                id,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("沙箱");
+                                egui::ComboBox::from_id_salt("sandbox_pick")
+                                    .selected_text(format!("{:?}", form.harness.sandbox))
+                                    .show_ui(ui, |ui| {
+                                        for level in [
+                                            fulu_app::Sandbox::Strict,
+                                            fulu_app::Sandbox::Limited,
+                                            fulu_app::Sandbox::Full,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut form.harness.sandbox,
+                                                level,
+                                                format!("{level:?}"),
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("步数上限");
+                                ui.add(
+                                    egui::DragValue::new(&mut form.harness.max_steps)
+                                        .range(1..=64),
+                                );
+                                ui.end_row();
+
+                                ui.label("token 预算");
+                                ui.add(
+                                    egui::DragValue::new(&mut form.harness.budget_tokens)
+                                        .range(256..=200_000),
+                                );
+                                ui.end_row();
+
+                                ui.label("目标描述");
+                                ui.text_edit_multiline(&mut form.goal.description);
+                                ui.end_row();
+
+                                ui.label("完成判据");
+                                ui.text_edit_multiline(&mut form.goal.success_criteria);
+                                ui.end_row();
+                            });
+                        if ui.button("应用表单 → 重写正文").clicked() {
+                            apply = true;
+                        }
+                    }
+                    if apply {
+                        self.apply_form();
+                    }
+                }
+            });
+    }
+
+    /// T34：模型清单（只读）+ 会话管理 + 缴符回放。
+    fn model_and_session(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("模型与会话 · 缴符回放（T34）")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("重载模型清单").clicked() {
+                        self.reload_models();
+                    }
+                    if ui.button("新开一场法坛").clicked() {
+                        self.new_session();
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "清单只读；权重导入请用 fulu model import，界面不静默下载",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("model_lines")
+                    .max_height(90.0)
+                    .show(ui, |ui| {
+                        if self.model_lines.is_empty() {
+                            ui.label("（清单为空）");
+                        }
+                        for line in &self.model_lines {
+                            ui.monospace(line);
+                        }
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("回放筛选");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.replay_filter)
+                            .hint_text("符印 / 工具名 / 事件类型")
+                            .desired_width(240.0),
+                    );
+                    if ui.button("读取缴符 JSONL").clicked() {
+                        self.load_replay();
+                    }
+                    if ui.button("清空视图").clicked() {
+                        self.replay_lines.clear();
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("replay_lines")
+                    .max_height(140.0)
+                    .show(ui, |ui| {
+                        if self.replay_lines.is_empty() {
+                            ui.label("（未读取；工作区里的 fulu-audit.jsonl 由「导出缴符」生成）");
+                        }
+                        for line in &self.replay_lines {
+                            ui.monospace(line);
+                        }
+                    });
+            });
+    }
+
+    /// T35：设置面板——会话头 / 提示词分层 / 符胆 / 风险覆盖表（全部只读或本地开关）。
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("设置：会话头 / 提示词 / 符胆 / 覆盖表（T35）")
+            .default_open(self.show_settings)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("刷新全部").clicked() {
+                        self.refresh_context();
+                        self.refresh_prompt();
+                        self.refresh_skills();
+                        self.refresh_risk();
+                    }
+                    if ui.button("会话头").clicked() {
+                        self.refresh_context();
+                    }
+                    if ui.button("提示词分层").clicked() {
+                        self.refresh_prompt();
+                    }
+                    if ui.button("符胆").clicked() {
+                        self.refresh_skills();
+                    }
+                    if ui.button("覆盖表").clicked() {
+                        self.refresh_risk();
+                    }
+                });
+
+                // 提示词档位：与 CLI `--prompt-mode` 同一套枚举。
+                ui.horizontal(|ui| {
+                    ui.label("提示词档位");
+                    let current = self.session.as_ref().map(|s| s.prompt_mode());
+                    for (label, mode) in [
+                        ("full", fulu_app::PromptMode::Full),
+                        ("minimal", fulu_app::PromptMode::Minimal),
+                        ("none", fulu_app::PromptMode::None),
+                    ] {
+                        let selected = current == Some(mode);
+                        if ui.selectable_label(selected, label).clicked()
+                            && let Some(session) = self.session.as_mut()
+                        {
+                            session.set_prompt_mode(mode);
+                            self.say(format!("提示词档位已改为 {label}"), Tone::Info);
+                        }
+                    }
+                    ui.separator();
+                    let mut ip = self
+                        .session
+                        .as_ref()
+                        .map(|s| s.context_ip())
+                        .unwrap_or(false);
+                    if ui.checkbox(&mut ip, "会话头含 IP 所在地").changed()
+                        && let Some(session) = self.session.as_mut()
+                    {
+                        session.set_context_ip(ip);
+                        self.say(
+                            "会话头 IP 开关已改（粗粒度，仅进会话头与缴符事件）",
+                            Tone::Info,
+                        );
+                    }
+                });
+
+                if !self.context_text.is_empty() {
+                    ui.label("会话头：");
+                    egui::ScrollArea::vertical()
+                        .id_salt("ctx_text")
+                        .max_height(90.0)
+                        .show(ui, |ui| {
+                            ui.monospace(&self.context_text);
+                        });
+                }
+                if !self.prompt_text.is_empty() {
+                    ui.label("七层装配预览：");
+                    egui::ScrollArea::vertical()
+                        .id_salt("prompt_text")
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            ui.monospace(&self.prompt_text);
+                        });
+                }
+                if !self.skills_lines.is_empty() || !self.skills_issues.is_empty() {
+                    ui.label("符胆（只展示不管理）：");
+                    for line in &self.skills_lines {
+                        ui.monospace(line);
+                    }
+                    for issue in &self.skills_issues {
+                        ui.label(
+                            egui::RichText::new(format!("[WARN] {issue}"))
+                                .small()
+                                .color(egui::Color32::from_rgb(180, 120, 40)),
+                        );
+                    }
+                }
+                if !self.risk_lines.is_empty() || !self.risk_issues.is_empty() {
+                    ui.label("风险覆盖表（写入请用 fulu mcp risk set）：");
+                    for line in &self.risk_lines {
+                        ui.monospace(line);
+                    }
+                    for issue in &self.risk_issues {
+                        ui.label(
+                            egui::RichText::new(format!("[WARN] {issue}"))
+                                .small()
+                                .color(egui::Color32::from_rgb(180, 120, 40)),
+                        );
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "本面板只读 + 本地开关；不写任何外部配置，不安装/升级技能。",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
     }
 }
 

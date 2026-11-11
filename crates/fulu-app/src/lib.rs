@@ -43,6 +43,7 @@ use std::sync::{Arc, OnceLock};
 
 /// 门面重导出：UI 只依赖 `fulu-app`，不直连 `fulu-core` / `fulu-runtime`。
 /// 契约是「UI 不构造运行时对象」，持有门面返回的值是允许的。
+pub use fulu_core::Sandbox;
 pub use fulu_core::Talisman as Fu;
 pub use fulu_runtime::{
     ConfirmRequest, ConfirmVerdict, Confirmer as Gatekeeper, DryRunPlan, Receipt,
@@ -185,6 +186,75 @@ pub fn inspect_fu(text: &str) -> Result<FuReport, AppError> {
 
 pub fn sample_fu_text() -> Result<String, AppError> {
     encode_fu(&Talisman::sample()).map_err(|e| AppError::Script(e.to_string()))
+}
+
+/// 把符文按**规范格式**写回 `.fu` 文本（T33）。
+///
+/// 规范格式只认字段：注释、字段顺序、空行都会按 `fulu-script` 的规则重排。
+/// GUI 必须把这句话显示给用户——「保存」不等于「原样保存」，否则用户会以为
+/// 自己写的注释还在。
+pub fn dump_fu(fu: &Fu) -> Result<String, AppError> {
+    encode_fu(fu).map_err(|e| AppError::Script(e.to_string()))
+}
+
+/// 模型槽位摘要（T34 模型面板；**只读**，不触发下载）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestSlot {
+    pub slot: String,
+    pub model_id: String,
+    pub quant: String,
+    pub context_tokens: u32,
+    pub approx_size: String,
+    pub runnable: bool,
+    pub is_default: bool,
+    /// 清单是否已固化 sha256（未固化 = 校验只能是 UNVERIFIED）。
+    pub digest_pinned: bool,
+}
+
+pub fn manifest_slots() -> Result<Vec<ManifestSlot>, AppError> {
+    let manifest = ModelManifest::embedded().map_err(|e| AppError::Manifest(e.to_string()))?;
+    Ok(manifest
+        .entries
+        .iter()
+        .map(|entry| ManifestSlot {
+            slot: entry.slot.clone(),
+            model_id: entry.model_id.clone(),
+            quant: entry.quant.clone(),
+            context_tokens: entry.default_context_tokens,
+            approx_size: entry.approx_size.clone(),
+            runnable: entry.runnable,
+            is_default: entry.is_default,
+            digest_pinned: entry.sha256.is_some(),
+        })
+        .collect())
+}
+
+/// 全局技能包只读清单（T35；沿用「只展示不管理」）。
+pub fn skills_listing() -> (Vec<String>, Vec<String>) {
+    let (skills, issues) = discover_global(&default_roots());
+    let lines = skills
+        .iter()
+        .map(|skill| {
+            format!(
+                "{}  v{}  {} 字节  sha256:{}…",
+                skill.name,
+                skill.version,
+                skill.bytes,
+                &skill.sha256[..12.min(skill.sha256.len())]
+            )
+        })
+        .collect();
+    (lines, issues)
+}
+
+/// 风险覆盖表只读清单（T35；写入仍只走 `fulu mcp risk set`，GUI 不越权写）。
+pub fn risk_overrides_listing() -> (Vec<String>, Vec<String>) {
+    let (overrides, issues) = RiskOverrides::load(&fulu_mcp::risk_override_paths());
+    let lines = overrides
+        .entries()
+        .map(|(id, risk)| format!("{id}  {}", fulu_mcp::risk_key(*risk)))
+        .collect();
+    (lines, issues)
 }
 
 /// 从文本解析一张符：GUI 编辑器里的内容走这条，不落盘也能校验。
@@ -1200,6 +1270,20 @@ impl AltarSession {
             .map_err(|e| AppError::Io(e.to_string()))
     }
 
+    /// 读回缴符 JSONL（T34 历史回放）：**只读**，绝不改写文件。
+    ///
+    /// 每行原样返回——界面按符印/关键字筛选即可，不在门面里做二次解析，
+    /// 免得「回放」变成另一套与写入不一致的格式理解。
+    pub fn replay_audit(&self, path: &Path) -> Result<Vec<String>, AppError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| AppError::Io(format!("{}：{e}", path.display())))?;
+        Ok(text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     fn altar(&mut self, fu: &Talisman, assembled: &AssembledPrompt) -> Altar<'_> {
         let note = self.prompt_note(assembled);
         // 逐字段借用：确认器要借给法坛，缴符日志同时要可变借用。
@@ -1445,6 +1529,49 @@ mod tests {
             session.register.authorize(&strict),
             Err(fulu_register::RegisterError::PermissionTooLow { .. })
         ));
+    }
+
+    // ---- T33/T34：保存、模型清单、缴符回放 ----
+
+    #[test]
+    fn dump_fu_round_trips_and_is_stable() {
+        let fu = Talisman::sample();
+        let text = dump_fu(&fu).unwrap();
+        let back = parse_fu(&text).unwrap();
+        assert_eq!(back, fu, "规范格式必须能原样解析回来");
+        assert_eq!(dump_fu(&back).unwrap(), text, "二次规范化必须完全一致");
+    }
+
+    #[test]
+    fn manifest_slots_mirror_the_embedded_manifest() {
+        let slots = manifest_slots().unwrap();
+        let manifest = ModelManifest::embedded().unwrap();
+        assert_eq!(slots.len(), manifest.entries.len());
+        for (slot, entry) in slots.iter().zip(manifest.entries.iter()) {
+            assert_eq!(slot.slot, entry.slot);
+            assert_eq!(slot.model_id, entry.model_id);
+            // 「是否已固化摘要」必须与清单一致：未固化就是 false，不允许乐观默认。
+            assert_eq!(slot.digest_pinned, entry.sha256.is_some());
+        }
+        assert!(slots.iter().any(|slot| slot.is_default && slot.runnable));
+    }
+
+    #[test]
+    fn replay_audit_reads_lines_without_touching_the_file() {
+        let dir = std::env::temp_dir().join(format!("fulu-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fulu-audit.jsonl");
+        let body = "{\"seq\":1}\n\n{\"seq\":2}\n";
+        std::fs::write(&path, body).unwrap();
+        let session = AltarSession::new();
+        let lines = session.replay_audit(&path).unwrap();
+        assert_eq!(lines.len(), 2, "空行必须被忽略");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            body,
+            "回放不得改文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- T16 摄行：默认不存在、两把钥匙、逐次确认 ----

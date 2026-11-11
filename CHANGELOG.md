@@ -1,6 +1,6 @@
 # 变更日志
 
-本项目采用「里程碑 + 补记」双轨：架构文档 `docs/02` 第 13–23 节记录设计决策与验证，本文件只记可交付的版本变化。
+本项目采用「里程碑 + 补记」双轨：架构文档 `docs/02` 第 13–25 节记录设计决策与验证，本文件只记可交付的版本变化。
 
 ## v0.3.1（2026-11-11，进行中）
 
@@ -15,6 +15,7 @@
 - **摄行电脑控制（T16，最高权限）**：`shexing.type / .key / .click / .screenshot` 默认**不注册**（工具不存在），需 `FULU_ALLOW_SHEXING=1` + `--shexing` 双钥匙；授权 `Limited + Destructive`（逐次确认）+ 配额 20；键位白名单拒绝注入，截屏只写工作区 `.png`；非 Windows 如实报不支持。
 - **决策与设计文档**：新增 `docs/03-决策记录与增量设计.md`——T41 七条待确认事项逐条定案、T13 provider/SSE/能力协商设计稿、T19 威胁模型、T16 风险评估。
 - **M4 发布流水线（T26–T31）**：Windows MSI（WiX 3，perUser）、macOS DMG（Fulu.app + hdiutil）、Linux DEB 与 AppImage（best-effort）；签名有凭据才签、缺凭据写 `UNSIGNED-<target>.txt` 并告警；新增 SBOM（CycloneDX）与 `cargo audit` job；CI 补 Intel macOS 与 ARM64 Linux（CLI build-only）；清单闸门在 CI 内不再允许静默跳过，且 `source_url` 走域名白名单。安装包步骤待 CI 实跑验证（本机无 WiX/hdiutil/dpkg）。
+- **符箓台完善（S6 / T33–T35）**：新增存符（`.fu` 先 `parse_fu` 再 `dump_fu`，同名需显式允许覆盖，UI 明示「规范格式重写会丢注释与字段顺序」）、字段表单（改字段即 `invalidate()` 破符）、模型与法坛面板（清单逐档展示，`digest_pinned=false` 标 `UNVERIFIED`；新开法坛保留端点；缴符回放 + 关键字筛选）、只读设置面板（提示词档位 / IP 开关 / 会话头 / 七层预览 / 符胆 / 技能 / 风险覆盖表）。门面新增 `dump_fu`、`manifest_slots`、`skills_listing`、`risk_overrides_listing`、`AltarSession::replay_audit`，GUI 不直接拼业务逻辑、不写全局配置。GUI 交互无自动化测试，布局与手感待真人验证。
 
 ## v0.3.0（2026-11-11）
 
