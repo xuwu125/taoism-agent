@@ -3,7 +3,10 @@
 //! 它是 `Provider` trait 的可注入实现，让法坛运行时可以完全无头地测试
 //! 预算、超时、工具循环与异常态，而不依赖真实权重或推理服务。
 
-use crate::{Capabilities, InvocationReply, InvocationRequest, Provider, ProviderError, Usage};
+use crate::{
+    Capabilities, InvocationReply, InvocationRequest, Provider, ProviderError, StreamControl,
+    StreamEvent, Usage,
+};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,6 +39,12 @@ impl StubProvider {
             calls: AtomicUsize::new(0),
             delay: Duration::ZERO,
         }
+    }
+
+    /// 造一个「不支持流式」的桩，用来测「装了 sink 但不该静默退化」这条路径。
+    pub fn disable_streaming(mut self) -> Self {
+        self.capabilities.streaming = false;
+        self
     }
 
     pub fn with_delay(mut self, delay: Duration) -> Self {
@@ -92,6 +101,53 @@ impl Provider for StubProvider {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| Ok(text_reply("（桩：未配置回复）", 0, 0)))
+    }
+
+    /// 桩的「流式」：把已排队的整段回复切成若干段吐出去。
+    ///
+    /// 目的不是模拟真实生成速度，而是让法坛的流式路径（取消、半途断流、
+    /// 事件记账）能在**不需要权重、不开 socket** 的情况下被测到。
+    fn invoke_stream(
+        &self,
+        request: &InvocationRequest,
+        sink: &mut dyn FnMut(StreamEvent) -> StreamControl,
+    ) -> Result<InvocationReply, ProviderError> {
+        const CHUNK_CHARS: usize = 8;
+        let reply = self.invoke(request)?;
+        let chars: Vec<char> = reply.text.chars().collect();
+        for (index, chunk) in chars.chunks(CHUNK_CHARS).enumerate() {
+            let text: String = chunk.iter().collect();
+            if sink(StreamEvent::TextDelta(text)) == StreamControl::Cancel {
+                return Err(ProviderError::Cancelled(format!(
+                    "调用方在第 {index} 段之后取消"
+                )));
+            }
+        }
+        for (index, call) in reply.tool_calls.iter().enumerate() {
+            let index = u16::try_from(index).unwrap_or(u16::MAX);
+            let control = sink(StreamEvent::ToolCallDelta {
+                index,
+                id: Some(call.id.clone()),
+                name: Some(call.name.clone()),
+                arguments_chunk: call.arguments_json.clone(),
+            });
+            if control == StreamControl::Cancel {
+                return Err(ProviderError::Cancelled(
+                    "调用方在工具调用增量处取消".into(),
+                ));
+            }
+        }
+        if sink(StreamEvent::Usage(reply.usage.clone())) == StreamControl::Cancel {
+            return Err(ProviderError::Cancelled("调用方在 usage 处取消".into()));
+        }
+        sink(StreamEvent::Done {
+            finish_reason: if reply.tool_calls.is_empty() {
+                "stop".to_owned()
+            } else {
+                "tool_calls".to_owned()
+            },
+        });
+        Ok(reply)
     }
 }
 

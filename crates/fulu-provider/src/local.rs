@@ -6,9 +6,11 @@
 //!   统一 `ToolCall`，绝不外泄到符文、Harness 或 UI；
 //! - 缺权重 / 服务未启动时给出明确指引，不静默联网、不伪装成推理成功。
 
-use crate::http::{self, Endpoint, HttpError};
+use crate::http::{self, Endpoint, HttpError, StreamDirective};
+use crate::sse::{SseError, StreamAssembler, StreamParts};
 use crate::{
-    Capabilities, InvocationReply, InvocationRequest, Provider, ProviderError, ToolCall, Usage,
+    Capabilities, InvocationReply, InvocationRequest, Provider, ProviderError, StreamControl,
+    StreamEvent, ToolCall, Usage,
 };
 use serde_json::{Map, Value, json};
 use std::time::Duration;
@@ -191,10 +193,130 @@ impl Provider for LocalLfmProvider {
             .map_err(|e| ProviderError::Protocol(e.to_string()))?;
         parse_reply(&text, request)
     }
+
+    /// 真流式：边收边把增量交给 `sink`，收齐后仍返回**完整**回执。
+    ///
+    /// 三条硬规矩都在这里落地：
+    /// 1. 工具调用只归并、不执行——执行仍是 `fulu-runtime` 的事，且必须全部收齐；
+    /// 2. 半途断流**不拼半个回执**：没有 `[DONE]` 一律判协议错误；
+    /// 3. `Cancel` 立刻停止读取并关闭连接，返回 `Cancelled`，已收到的字由调用方留存。
+    fn invoke_stream(
+        &self,
+        request: &InvocationRequest,
+        sink: &mut dyn FnMut(StreamEvent) -> StreamControl,
+    ) -> Result<InvocationReply, ProviderError> {
+        let endpoint = self.parsed_endpoint()?;
+        let payload = build_request_body_with_stream(request, true)?;
+        let bearer = self
+            .auth
+            .as_ref()
+            .map(|token| format!("Bearer {}", token.expose()));
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(value) = &bearer {
+            headers.push(("Authorization", value.as_str()));
+        }
+        let http_request =
+            http::HttpRequest::post("/v1/chat/completions", payload.as_bytes(), self.timeout)
+                .with_headers(&headers);
+
+        let mut assembler = StreamAssembler::new();
+        let mut sse_error: Option<SseError> = None;
+        let mut cancelled = false;
+        let sink = &mut *sink;
+        let stats = {
+            let mut on_line = |line: &[u8]| -> StreamDirective {
+                if sse_error.is_some() {
+                    return StreamDirective::Stop;
+                }
+                match assembler.feed_line(line) {
+                    Ok(feed) => {
+                        for event in feed.events {
+                            if sink(event) == StreamControl::Cancel {
+                                cancelled = true;
+                                return StreamDirective::Stop;
+                            }
+                        }
+                        if feed.done {
+                            StreamDirective::Stop
+                        } else {
+                            StreamDirective::Continue
+                        }
+                    }
+                    Err(error) => {
+                        sse_error = Some(error);
+                        StreamDirective::Stop
+                    }
+                }
+            };
+            http::send_streaming(&endpoint, &http_request, &mut on_line).map_err(|error| {
+                // chunked 被截断时底层只看到「流意外结束」；对调用方要说清是
+                // **没等到 [DONE]**，否则容易被当成「响应格式小毛病」重试。
+                match error {
+                    HttpError::MalformedResponse(detail) => ProviderError::Protocol(format!(
+                        "流在结束标记 [DONE] 之前中断（{detail}）；不回拼半份回执"
+                    )),
+                    other => map_http_error(other),
+                }
+            })?
+        };
+
+        if let Some(error) = sse_error {
+            return Err(error.into());
+        }
+        if cancelled {
+            return Err(ProviderError::Cancelled(format!(
+                "调用方在 {} 字节后取消（已收 {} 行）",
+                stats.body_bytes, stats.lines
+            )));
+        }
+        if !assembler.is_done() {
+            return Err(ProviderError::Protocol(format!(
+                "流在结束标记 [DONE] 之前中断（已收 {} 字节 / {} 行），不回拼半份回执",
+                stats.body_bytes, stats.lines
+            )));
+        }
+        finish_stream(assembler.into_parts()?, request)
+    }
+}
+
+/// 把流式拼装结果归一成与非流式**同构**的回执。
+///
+/// 归一逻辑与 `parse_reply` 共用：服务端没给 `usage` 就按字符数估算并标 `estimated`；
+/// 结构里没有工具调用时再看正文里有没有 LFM2 风格的 Pythonic 调用。
+fn finish_stream(
+    parts: StreamParts,
+    request: &InvocationRequest,
+) -> Result<InvocationReply, ProviderError> {
+    let mut tool_calls = parts.tool_calls;
+    if tool_calls.is_empty() {
+        tool_calls = extract_embedded_calls(&parts.text);
+    }
+    let usage = match parts.usage {
+        Some(usage) => usage,
+        None => Usage {
+            prompt_tokens: estimate_tokens(&request.system) + estimate_tokens(&request.user),
+            completion_tokens: estimate_tokens(&parts.text),
+            estimated: true,
+        },
+    };
+    Ok(InvocationReply {
+        text: parts.text,
+        tool_calls,
+        usage,
+    })
 }
 
 /// 构造 OpenAI 兼容请求体。采样参数由整数毫单位换算；0 值不下发，交给服务端默认。
 pub fn build_request_body(request: &InvocationRequest) -> Result<String, ProviderError> {
+    build_request_body_with_stream(request, false)
+}
+
+/// `stream` 只影响 `stream` 字段与 `stream_options`，其余一个字节都不变——
+/// 免得流式与非流式发出的请求在语义上有差异。
+pub fn build_request_body_with_stream(
+    request: &InvocationRequest,
+    stream: bool,
+) -> Result<String, ProviderError> {
     let tools: Value = serde_json::from_str(&request.tools_json)
         .map_err(|e| ProviderError::Protocol(format!("工具定义不是合法 JSON：{e}")))?;
     let mut body = Map::new();
@@ -206,7 +328,12 @@ pub fn build_request_body(request: &InvocationRequest) -> Result<String, Provide
             {"role": "user", "content": request.user}
         ]),
     );
-    body.insert("stream".into(), json!(false));
+    body.insert("stream".into(), json!(stream));
+    if stream {
+        // 要求服务端在最后一个 chunk 带 usage；不支持该参数的服务端会忽略它，
+        // 届时按字符数估算并标 estimated。
+        body.insert("stream_options".into(), json!({"include_usage": true}));
+    }
     body.insert("max_tokens".into(), json!(request.budget_tokens));
     if request.sampling.temperature_milli > 0 {
         body.insert(
@@ -531,6 +658,31 @@ mod tests {
             budget_tokens: 2048,
             context_tokens: 8192,
         }
+    }
+
+    #[test]
+    fn streaming_body_only_adds_stream_flags_and_nothing_else() {
+        let request = sample_request();
+        let plain: Value = serde_json::from_str(&build_request_body(&request).unwrap()).unwrap();
+        let streamed: Value =
+            serde_json::from_str(&build_request_body_with_stream(&request, true).unwrap()).unwrap();
+        assert_eq!(plain["stream"], json!(false), "默认必须是非流式");
+        assert!(
+            plain.get("stream_options").is_none(),
+            "非流式不该带 stream_options"
+        );
+        assert_eq!(streamed["stream"], json!(true));
+        assert_eq!(
+            streamed["stream_options"],
+            json!({"include_usage": true}),
+            "要服务端在最后一块给 usage，才不用猜 token"
+        );
+        let mut left = plain.as_object().unwrap().clone();
+        let mut right = streamed.as_object().unwrap().clone();
+        left.remove("stream");
+        right.remove("stream");
+        right.remove("stream_options");
+        assert_eq!(left, right, "除流式两项外，请求体必须逐字段一致");
     }
 
     #[test]

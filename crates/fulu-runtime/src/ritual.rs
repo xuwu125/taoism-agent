@@ -10,7 +10,7 @@
 
 use fulu_audit::{AuditEvent, AuditLog, EventKind};
 use fulu_core::{Talisman, TalismanState, can_transition};
-use fulu_provider::{InvocationRequest, Provider, ProviderError};
+use fulu_provider::{InvocationRequest, Provider, ProviderError, StreamControl, StreamEvent};
 use fulu_register::{Authorization, Confirmation, Register, RegisterError, RiskClass};
 use fulu_script::{digest_hex, seal_hex};
 use fulu_tools::{ToolArguments, ToolRegistry};
@@ -194,6 +194,11 @@ pub struct Altar<'a> {
     confirmed_once: BTreeSet<String>,
     /// 每个工具被拒的次数，用于及时止损
     denials: BTreeMap<String, u32>,
+    /// 流式增量去向。`None` = 非流式调用（默认）。
+    ///
+    /// 只在**显示层**用：增量不参与预算、不参与收敛判定、不改仪轨——
+    /// 它只是让人早点看到字，而不是把「边流边执行」偷渡进来。
+    stream_sink: Option<&'a mut dyn FnMut(StreamEvent) -> StreamControl>,
 }
 
 impl<'a> Altar<'a> {
@@ -216,6 +221,7 @@ impl<'a> Altar<'a> {
             confirmer: None,
             confirmed_once: BTreeSet::new(),
             denials: BTreeMap::new(),
+            stream_sink: None,
         }
     }
 
@@ -236,6 +242,11 @@ impl<'a> Altar<'a> {
 
     pub fn set_skill_verifier(&mut self, verifier: &'a dyn SkillVerifier) {
         self.skill_verifier = Some(verifier);
+    }
+
+    /// 装上流式增量接收器。**不装就不流**（默认非流式，行为与以前完全一致）。
+    pub fn set_stream_sink(&mut self, sink: &'a mut dyn FnMut(StreamEvent) -> StreamControl) {
+        self.stream_sink = Some(sink);
     }
 
     /// 符胆校验：只在装了校验器时生效，失败即破符并留痕，不静默跳过。
@@ -498,8 +509,49 @@ impl<'a> Altar<'a> {
                 budget_tokens: remaining,
                 context_tokens: self.provider.capabilities().max_context_tokens,
             };
-            let reply = match self.provider.invoke(&request) {
+            // 流式只在显示层：增量已由 sink 接走，返回值仍是一份完整回执，
+            // 后面的预算 / 工具核验 / 收敛判定一个字都不改。
+            let mut partial_chars = 0_usize;
+            let provider = self.provider;
+            let reply = {
+                let streamed = match self.stream_sink.as_mut() {
+                    Some(sink) if provider.capabilities().streaming => {
+                        let mut forward = |event: StreamEvent| -> StreamControl {
+                            if let StreamEvent::TextDelta(text) = &event {
+                                partial_chars += text.chars().count();
+                            }
+                            sink(event)
+                        };
+                        Some(provider.invoke_stream(&request, &mut forward))
+                    }
+                    // 装了 sink 但 provider 不支持流式：**不静默退化**，直接报错，
+                    // 免得界面以为自己在看增量，其实拿到一整块。
+                    Some(_) => Some(Err(ProviderError::NotImplemented(
+                        "该 provider 不支持流式；请去掉 --stream 或换本地 provider",
+                    ))),
+                    None => None,
+                };
+                match streamed {
+                    Some(result) => result,
+                    None => provider.invoke(&request),
+                }
+            };
+            let reply = match reply {
                 Ok(reply) => reply,
+                Err(ProviderError::Cancelled(reason)) => {
+                    let detail = if partial_chars == 0 {
+                        format!("焚化被取消（{reason}）")
+                    } else {
+                        format!("焚化被取消（{reason}）；已收 {partial_chars} 字符，仅记账不回喂")
+                    };
+                    return self.abort(
+                        &seal,
+                        TalismanState::Cancelled,
+                        EventKind::Cancelled,
+                        &detail,
+                        RitualError::Provider(detail.clone()),
+                    );
+                }
                 Err(ProviderError::Timeout) => {
                     return self.abort(
                         &seal,
@@ -519,7 +571,13 @@ impl<'a> Altar<'a> {
                     );
                 }
                 Err(other) => {
-                    let message = other.to_string();
+                    let mut message = other.to_string();
+                    if partial_chars > 0 {
+                        // 半途断流不许装成功：把已收字数如实记账，再按炸炉处理。
+                        message.push_str(&format!(
+                            "（流式中断：已收 {partial_chars} 字符，仅记账不回喂模型）"
+                        ));
+                    }
                     return self.abort(
                         &seal,
                         TalismanState::Exploded,
@@ -847,6 +905,81 @@ mod tests {
                 .any(|note| note.contains("未发起任何网络请求"))
         );
         audit.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn streaming_is_display_only_and_never_changes_the_receipt() {
+        let (fu, register, tools, mut audit) = fixture();
+        let provider = StubProvider::default();
+        provider.push_reply(text_reply("这是摘要", 10, 20));
+        let mut collected = String::new();
+        let mut events = 0_usize;
+        let mut sink = |event: StreamEvent| -> StreamControl {
+            events += 1;
+            if let StreamEvent::TextDelta(text) = event {
+                collected.push_str(&text);
+            }
+            StreamControl::Continue
+        };
+        let receipt = {
+            let mut altar = altar(&provider, &tools, &register, &mut audit);
+            altar.set_stream_sink(&mut sink);
+            let plan = altar.prepare(&fu).unwrap();
+            altar.ignite(&fu, &plan, true).unwrap()
+        };
+        // 流式与非流式的回执必须一致：字、用量、收敛、终态一个都不能变。
+        assert_eq!(receipt.text, "这是摘要");
+        assert_eq!(receipt.usage_total, 30);
+        assert!(receipt.converged);
+        assert_eq!(receipt.state, TalismanState::Archived);
+        assert_eq!(collected, "这是摘要");
+        assert!(
+            events >= 3,
+            "至少应有文本增量 + usage + done，实收 {events}"
+        );
+    }
+
+    #[test]
+    fn cancelling_mid_stream_lands_in_cancelled_and_records_it() {
+        let (fu, register, tools, mut audit) = fixture();
+        let provider = StubProvider::default();
+        provider.push_reply(text_reply("一二三四五六七八九十", 10, 20));
+        let mut sink = |event: StreamEvent| -> StreamControl {
+            if matches!(event, StreamEvent::TextDelta(_)) {
+                // 第一段就取消：验证「取消即停」而不是把剩下的一起收完。
+                return StreamControl::Cancel;
+            }
+            StreamControl::Continue
+        };
+        let error = {
+            let mut altar = altar(&provider, &tools, &register, &mut audit);
+            altar.set_stream_sink(&mut sink);
+            let plan = altar.prepare(&fu).unwrap();
+            let error = altar.ignite(&fu, &plan, true).unwrap_err();
+            let last = altar.audit.events().last().cloned().unwrap();
+            assert_eq!(last.kind, EventKind::Cancelled);
+            assert_eq!(last.state, TalismanState::Cancelled);
+            assert!(last.detail.contains("已收"), "应如实记账已收字数");
+            error
+        };
+        // 取消不是成功，也不是炸炉：终态是「中止」，并且没有回执正文。
+        assert!(matches!(error, RitualError::Provider(ref msg) if msg.contains("取消")));
+    }
+
+    #[test]
+    fn a_provider_without_streaming_is_refused_instead_of_silently_degrading() {
+        let (fu, register, tools, mut audit) = fixture();
+        let provider = StubProvider::default().disable_streaming();
+        let mut sink = |_event: StreamEvent| -> StreamControl { StreamControl::Continue };
+        let mut altar = altar(&provider, &tools, &register, &mut audit);
+        altar.set_stream_sink(&mut sink);
+        let plan = altar.prepare(&fu).unwrap();
+        let error = altar.ignite(&fu, &plan, true).unwrap_err();
+        assert!(
+            matches!(error, RitualError::Provider(ref msg) if msg.contains("不支持流式")),
+            "应显式报错：{error:?}"
+        );
+        assert_eq!(provider.call_count(), 0, "不得退化成非流式调用");
     }
 
     #[test]

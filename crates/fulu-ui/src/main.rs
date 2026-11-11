@@ -34,6 +34,10 @@ enum Tone {
 struct FuluApp {
     session: Option<AltarSession>,
     burning: Option<Receiver<BurnOutcome>>,
+    /// T13：焚化途中的增量接收端（与最终回执分开两条通道，免得半份正文被当成回执）
+    stream_rx: Option<Receiver<String>>,
+    /// 已收到的增量正文（仅显示；判定一律看回执）
+    live_text: String,
     /// 界面线程的 Context：供焚符线程里的敕门确认器唤醒界面。
     ctx: Option<egui::Context>,
     /// 敕门收件箱：焚符线程的 ChannelConfirmer 往这里丢「请人点头」。
@@ -136,6 +140,8 @@ impl FuluApp {
         let mut app = Self {
             session: Some(session),
             burning: None,
+            stream_rx: None,
+            live_text: String::new(),
             ctx: None,
             confirm_inbox: None,
             pending_confirm: None,
@@ -294,17 +300,32 @@ impl FuluApp {
             session.set_risk_ceiling(Some(RiskClass::Destructive));
         } else {
             let (confirm_tx, confirm_rx) = std::sync::mpsc::channel();
-            session.set_confirmer(Box::new(confirm::ChannelConfirmer::new(confirm_tx, ctx)));
+            session.set_confirmer(Box::new(confirm::ChannelConfirmer::new(
+                confirm_tx,
+                ctx.clone(),
+            )));
             self.confirm_inbox = Some(Arc::new(Mutex::new(confirm_rx)));
         }
         let (tx, rx) = std::sync::mpsc::channel();
+        let (delta_tx, delta_rx) = std::sync::mpsc::channel::<String>();
+        let repaint = ctx.clone();
         std::thread::spawn(move || {
+            let mut sink = |event: fulu_app::StreamEvent| -> fulu_app::StreamControl {
+                if let fulu_app::StreamEvent::TextDelta(text) = event {
+                    // 发送失败说明界面已关：忽略即可，法坛不因显示层消失而中断判定。
+                    let _ = delta_tx.send(text);
+                    repaint.request_repaint();
+                }
+                fulu_app::StreamControl::Continue
+            };
             let outcome = session
-                .ignite(&fu, &plan, true)
+                .ignite_with_stream(&fu, &plan, true, &mut sink)
                 .map_err(|error| error.to_string());
             let _ = tx.send((session, outcome));
         });
         self.burning = Some(rx);
+        self.stream_rx = Some(delta_rx);
+        self.live_text.clear();
         let note = if self.allow_high_risk {
             "焚符上表……（后台执行，此点起不可撤销；已预授权，不再逐次弹窗）"
         } else {
@@ -314,6 +335,12 @@ impl FuluApp {
     }
 
     fn poll_burn(&mut self) {
+        // 先把增量抽干：这一帧就能看到新字，且不会因为最终回执还没到而卡住。
+        if let Some(deltas) = &self.stream_rx {
+            for delta in deltas.try_iter() {
+                self.live_text.push_str(&delta);
+            }
+        }
         let Some(rx) = &self.burning else { return };
         match rx.try_recv() {
             Ok((session, outcome)) => {
@@ -332,6 +359,7 @@ impl FuluApp {
                     .collect();
                 self.session = Some(session);
                 self.burning = None;
+                self.stream_rx = None;
                 self.confirm_inbox = None;
                 self.pending_confirm = None;
                 match outcome {
@@ -1044,6 +1072,18 @@ impl FuluApp {
                     });
             }
 
+            // 焚化途中的增量：明确标注「不是回执」，免得半份正文被当结果。
+            if self.burning.is_some() && !self.live_text.is_empty() {
+                ui.heading("焚化中（增量，非回执）");
+                ui.label("这些字只用于看进度；工具调用仍须收齐后过箓与敕门，判定一律以回执为准。");
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .id_salt("live_text")
+                    .show(ui, |ui| {
+                        ui.monospace(&self.live_text);
+                    });
+                ui.separator();
+            }
             if let Some(receipt) = &self.receipt {
                 ui.heading("回执");
                 ui.monospace(format!("状态       : {}", receipt.state.label()));

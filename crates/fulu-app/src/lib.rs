@@ -46,6 +46,8 @@ use std::sync::{Arc, OnceLock};
 /// 契约是「UI 不构造运行时对象」，持有门面返回的值是允许的。
 pub use fulu_core::Sandbox;
 pub use fulu_core::Talisman as Fu;
+/// 流式事件类型由门面转出，CLI / GUI 不必直接依赖 `fulu-provider`。
+pub use fulu_provider::{StreamControl, StreamEvent};
 pub use fulu_runtime::{
     ConfirmRequest, ConfirmVerdict, Confirmer as Gatekeeper, DryRunPlan, Receipt,
 };
@@ -1330,6 +1332,30 @@ impl AltarSession {
         plan: &DryRunPlan,
         confirmed: bool,
     ) -> Result<Receipt, AppError> {
+        self.ignite_inner(fu, plan, confirmed, None)
+    }
+
+    /// 带流式显示的焚化。**只是显示**：不改变预算、工具核验、收敛判定与缴符主链。
+    ///
+    /// 单独一个入口而不是给 `ignite` 加 `Option` 参数，是为了让「不流式」这条
+    /// 默认路径在类型上就与流式无关——老调用方一个字都不用改。
+    pub fn ignite_with_stream(
+        &mut self,
+        fu: &Talisman,
+        plan: &DryRunPlan,
+        confirmed: bool,
+        sink: &mut dyn FnMut(StreamEvent) -> StreamControl,
+    ) -> Result<Receipt, AppError> {
+        self.ignite_inner(fu, plan, confirmed, Some(sink))
+    }
+
+    fn ignite_inner(
+        &mut self,
+        fu: &Talisman,
+        plan: &DryRunPlan,
+        confirmed: bool,
+        stream: Option<&mut dyn FnMut(StreamEvent) -> StreamControl>,
+    ) -> Result<Receipt, AppError> {
         // T40：**没确认就不碰凭据库**。取密钥这件事只在用户已经点头之后才发生。
         // 取不到即返回错误，绝不把「空令牌」发出去当认证。
         if confirmed {
@@ -1346,6 +1372,9 @@ impl AltarSession {
         }
         let assembled = self.ensure_prompt(fu);
         let mut altar = self.altar(fu, &assembled);
+        if let Some(sink) = stream {
+            altar.set_stream_sink(sink);
+        }
         let result = altar.ignite(fu, plan, confirmed);
         // T10：无论成败，把分派经过与子符回执摘要落进父符缴符事件链。
         // 主链完整性已由法坛保证；此处尽力而为，不让记账失败掩盖焚化结果。

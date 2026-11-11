@@ -257,8 +257,20 @@ impl<'a> HttpRequest<'a> {
     }
 }
 
-/// 发一次请求并读完整响应。每次新建连接（`Connection: close`），避免连接复用状态。
-pub fn send(endpoint: &Endpoint, request: &HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
+/// 已读到响应头、连接还不算读完的那种「半个响应」。
+struct ResponseHead {
+    status: u16,
+    headers: Vec<(String, String)>,
+    reader: BufReader<TcpStream>,
+}
+
+/// 建立连接、写请求头、读回状态行与响应头。`send` 与 `send_streaming` 共用这一半，
+/// 免得两处各写一遍「怎么发一个 HTTP 请求」。
+fn open(
+    endpoint: &Endpoint,
+    request: &HttpRequest<'_>,
+    accept: &str,
+) -> Result<ResponseHead, HttpError> {
     let address = format!("{}:{}", endpoint.host, endpoint.port);
     let socket = address
         .to_socket_addrs()
@@ -275,7 +287,7 @@ pub fn send(endpoint: &Endpoint, request: &HttpRequest<'_>) -> Result<HttpRespon
 
     let payload = request.body.unwrap_or(&[]);
     let mut header = format!(
-        "{} {} HTTP/1.1\r\nHost: {address}\r\nUser-Agent: taoism-agent/fulu\r\nAccept: application/json\r\nConnection: close\r\n",
+        "{} {} HTTP/1.1\r\nHost: {address}\r\nUser-Agent: taoism-agent/fulu\r\nAccept: {accept}\r\nConnection: close\r\n",
         request.method, request.path
     );
     for (name, value) in request.headers {
@@ -298,8 +310,6 @@ pub fn send(endpoint: &Endpoint, request: &HttpRequest<'_>) -> Result<HttpRespon
     }
     let status = parse_status_line(&line)?;
 
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
     let mut headers: Vec<(String, String)> = Vec::new();
     loop {
         line.clear();
@@ -313,20 +323,38 @@ pub fn send(endpoint: &Endpoint, request: &HttpRequest<'_>) -> Result<HttpRespon
                 truncate(line.trim(), 120)
             )));
         };
-        let key = key.trim().to_ascii_lowercase();
-        let value = value.trim().to_owned();
-        match key.as_str() {
-            "content-length" => {
-                content_length = value.parse().ok();
-            }
-            "transfer-encoding" if value.to_ascii_lowercase().contains("chunked") => {
-                chunked = true;
-            }
-            _ => {}
-        }
-        headers.push((key, value));
+        headers.push((key.trim().to_ascii_lowercase(), value.trim().to_owned()));
     }
+    Ok(ResponseHead {
+        status,
+        headers,
+        reader,
+    })
+}
 
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let lowered = name.to_ascii_lowercase();
+    headers
+        .iter()
+        .find(|(key, _)| *key == lowered)
+        .map(|(_, value)| value.as_str())
+}
+
+fn body_kind(headers: &[(String, String)]) -> (bool, Option<usize>) {
+    let chunked = header_value(headers, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+    let length = header_value(headers, "content-length").and_then(|value| value.parse().ok());
+    (chunked, length)
+}
+
+/// 发一次请求并读完整响应。每次新建连接（`Connection: close`），避免连接复用状态。
+pub fn send(endpoint: &Endpoint, request: &HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
+    let ResponseHead {
+        status,
+        headers,
+        mut reader,
+    } = open(endpoint, request, "application/json")?;
+    let (chunked, content_length) = body_kind(&headers);
     let body_bytes = if chunked {
         read_chunked(&mut reader)?
     } else if let Some(length) = content_length {
@@ -334,12 +362,217 @@ pub fn send(endpoint: &Endpoint, request: &HttpRequest<'_>) -> Result<HttpRespon
     } else {
         read_to_close(&mut reader)?
     };
-
     Ok(HttpResponse {
         status,
         headers,
         body: body_bytes,
     })
+}
+
+/// 调用方对每一行的回执。`Stop` 之后**立即关闭连接**，不再读一个字节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDirective {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamStats {
+    pub status: u16,
+    /// 交出去的行数（含空行）。
+    pub lines: usize,
+    pub body_bytes: usize,
+    /// 是否因 `Stop` 提前收手；`false` 表示对端正常结束。
+    pub stopped_early: bool,
+}
+
+/// 按行增量读响应体。**只在回环地址上使用**，与 `send` 共用同一套端点校验。
+///
+/// 为什么要单独一条读法：`send` 是「读完再解析」，流式的意义恰恰是「边收边给」。
+/// 这里不引入异步，靠 `BufReader` + 分块读取把「一行到了就交出去」做出来。
+pub fn send_streaming(
+    endpoint: &Endpoint,
+    request: &HttpRequest<'_>,
+    on_line: &mut dyn FnMut(&[u8]) -> StreamDirective,
+) -> Result<StreamStats, HttpError> {
+    let ResponseHead {
+        status,
+        headers,
+        mut reader,
+    } = open(endpoint, request, "text/event-stream")?;
+    let (chunked, content_length) = body_kind(&headers);
+    if !(200..300).contains(&status) {
+        let body = if chunked {
+            read_chunked(&mut reader)?
+        } else if let Some(length) = content_length {
+            read_fixed(&mut reader, length)?
+        } else {
+            read_to_close(&mut reader)?
+        };
+        return Err(HttpError::HttpStatus(
+            status,
+            String::from_utf8_lossy(&body).into_owned(),
+        ));
+    }
+
+    let mut splitter = LineSplitter::default();
+    let stopped_early = if chunked {
+        pump_chunked(&mut reader, &mut splitter, on_line)?
+    } else if let Some(length) = content_length {
+        pump_fixed(&mut reader, length, &mut splitter, on_line)?
+    } else {
+        pump_to_close(&mut reader, &mut splitter, on_line)?
+    };
+    // 对端可能不写结尾换行：最后一截也要交出去，否则最后一个事件会被吞掉。
+    if !stopped_early && !splitter.buffer.is_empty() {
+        let last = std::mem::take(&mut splitter.buffer);
+        splitter.delivered += 1;
+        if on_line(&last) == StreamDirective::Stop {
+            return Ok(StreamStats {
+                status,
+                lines: splitter.delivered,
+                body_bytes: splitter.total,
+                stopped_early: true,
+            });
+        }
+    }
+    Ok(StreamStats {
+        status,
+        lines: splitter.delivered,
+        body_bytes: splitter.total,
+        stopped_early,
+    })
+}
+
+/// 把字节流切成行。**单行上限与整轮上限都在这里卡住**，上层不必再防。
+#[derive(Debug, Default)]
+struct LineSplitter {
+    buffer: Vec<u8>,
+    total: usize,
+    delivered: usize,
+}
+
+impl LineSplitter {
+    /// 返回 `true` 表示调用方要求 `Stop`。
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        on_line: &mut dyn FnMut(&[u8]) -> StreamDirective,
+    ) -> Result<bool, HttpError> {
+        let mut rest = bytes;
+        while let Some(position) = rest.iter().position(|byte| *byte == b'\n') {
+            let (head, tail) = rest.split_at(position);
+            self.buffer.extend_from_slice(head);
+            let mut line = std::mem::take(&mut self.buffer);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.total = self.total.saturating_add(line.len());
+            check_limit(self.total)?;
+            if line.len() > MAX_LINE_BYTES {
+                return Err(HttpError::MalformedResponse(format!(
+                    "流式单行超过 {MAX_LINE_BYTES} 字节（实收 {}）",
+                    line.len()
+                )));
+            }
+            self.delivered += 1;
+            if on_line(&line) == StreamDirective::Stop {
+                return Ok(true);
+            }
+            rest = &tail[1..];
+        }
+        self.buffer.extend_from_slice(rest);
+        if self.buffer.len() > MAX_LINE_BYTES {
+            return Err(HttpError::MalformedResponse(format!(
+                "流式单行超过 {MAX_LINE_BYTES} 字节（尚未换行）"
+            )));
+        }
+        Ok(false)
+    }
+}
+
+/// 单行上限：与 `sse::MAX_EVENT_BYTES` 同源，避免「http 层放行、sse 层再拦」。
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+fn pump_chunked(
+    reader: &mut BufReader<TcpStream>,
+    splitter: &mut LineSplitter,
+    on_line: &mut dyn FnMut(&[u8]) -> StreamDirective,
+) -> Result<bool, HttpError> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let mut size_line = String::new();
+        if read_line(reader, &mut size_line)? == 0 {
+            return Err(HttpError::MalformedResponse("chunked 流意外结束".into()));
+        }
+        let size_text = size_line.trim().split(';').next().unwrap_or("").trim();
+        if size_text.is_empty() {
+            continue;
+        }
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|_| HttpError::MalformedResponse(format!("chunk 长度不合法：{size_text}")))?;
+        if size == 0 {
+            let mut trailer = String::new();
+            let _ = read_line(reader, &mut trailer)?;
+            return Ok(false);
+        }
+        let mut remaining = size;
+        while remaining > 0 {
+            let want = remaining.min(buffer.len());
+            let read = reader.read(&mut buffer[..want]).map_err(io_error)?;
+            if read == 0 {
+                return Err(HttpError::MalformedResponse("chunk 内容被截断".into()));
+            }
+            remaining -= read;
+            check_limit(splitter.total.saturating_add(read))?;
+            if splitter.push(&buffer[..read], on_line)? {
+                return Ok(true);
+            }
+        }
+        let mut crlf = [0_u8; 2];
+        reader.read_exact(&mut crlf).map_err(io_error)?;
+    }
+}
+
+fn pump_fixed(
+    reader: &mut BufReader<TcpStream>,
+    length: usize,
+    splitter: &mut LineSplitter,
+    on_line: &mut dyn FnMut(&[u8]) -> StreamDirective,
+) -> Result<bool, HttpError> {
+    check_limit(length)?;
+    let mut buffer = [0_u8; 8192];
+    let mut remaining = length;
+    while remaining > 0 {
+        let want = remaining.min(buffer.len());
+        let read = reader.read(&mut buffer[..want]).map_err(io_error)?;
+        if read == 0 {
+            return Err(HttpError::MalformedResponse("流式响应体被截断".into()));
+        }
+        remaining -= read;
+        if splitter.push(&buffer[..read], on_line)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn pump_to_close(
+    reader: &mut BufReader<TcpStream>,
+    splitter: &mut LineSplitter,
+    on_line: &mut dyn FnMut(&[u8]) -> StreamDirective,
+) -> Result<bool, HttpError> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).map_err(io_error)?;
+        if read == 0 {
+            return Ok(false);
+        }
+        check_limit(splitter.total.saturating_add(read))?;
+        if splitter.push(&buffer[..read], on_line)? {
+            return Ok(true);
+        }
+    }
 }
 
 /// 兼容入口：无自定义请求头的简单调用（provider 自身用）。

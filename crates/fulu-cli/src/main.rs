@@ -67,6 +67,7 @@ fn help() {
          \x20 fulu convert <输入> --to <dsl|json|fub> [-o 输出]  按内容或 magic 自动识别输入\n\
          \x20 fulu altar dry-run <文件.fu>        成符→盖印→待焚（零网络）\n\
          \x20 fulu altar run <文件.fu> --confirm 显式确认后焚化→回执→缴符\n\
+         \x20 fulu altar run <文件.fu> --confirm --stream  边收边显示（不改仪轨与判定）\n\
          \x20 fulu context show [--no-ip]         会话头：硬件与 IP 所在地（粗粒度，全容错）\n\
          \x20 fulu prompt show                    分层系统提示词装配预览（与焚符同一装配器）\n\
          \x20 fulu mcp list [配置路径] [--attach] 外宗箓：只读展示；--attach 真正握手并列工具\n\
@@ -369,6 +370,8 @@ struct AltarOptions {
     search: bool,
     /// T16：启用摄行（电脑控制；另需环境变量 FULU_ALLOW_SHEXING=1）
     shexing: bool,
+    /// T13：流式显示增量（只影响显示，不影响仪轨与判定）
+    stream: bool,
 }
 
 fn parse_altar_options(args: &[String]) -> AltarOptions {
@@ -412,6 +415,7 @@ fn parse_altar_options(args: &[String]) -> AltarOptions {
             "--summon" => options.summon = true,
             "--search" => options.search = true,
             "--shexing" => options.shexing = true,
+            "--stream" => options.stream = true,
             "--context-ip" => options.context_ip = true,
             "--no-context" => options.no_context = true,
             "--prompt-mode" => {
@@ -544,6 +548,38 @@ impl<I: ConfirmIo> fulu_app::Gatekeeper for CliGate<I> {
             Some(answer) if Self::is_yes(&answer) => ConfirmVerdict::Allow,
             Some(_) => ConfirmVerdict::Deny,
         }
+    }
+}
+
+/// 终端流式输出：增量直接写 stdout 并 flush，工具调用增量只报名字。
+///
+/// **不做任何判定**：这个闭包永远返回 `Continue`，取消能力留给将来的界面
+/// （终端里按 Ctrl+C 是杀进程，不是「取消一次调用」）。
+fn cli_stream_sink() -> impl FnMut(fulu_app::StreamEvent) -> fulu_app::StreamControl {
+    use std::io::Write;
+    move |event| {
+        match event {
+            fulu_app::StreamEvent::TextDelta(text) => {
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+            fulu_app::StreamEvent::ToolCallDelta { name, .. } => {
+                if let Some(name) = name {
+                    print!("\n[..] 工具调用增量：{name}（收齐后才核验与敕门）\n");
+                }
+            }
+            fulu_app::StreamEvent::Usage(usage) => {
+                print!(
+                    "\n[..] 流内 usage：{} tokens（estimated={}）\n",
+                    usage.total(),
+                    usage.estimated
+                );
+            }
+            fulu_app::StreamEvent::Done { finish_reason } => {
+                print!("\n[..] 流结束：{finish_reason}\n");
+            }
+        }
+        fulu_app::StreamControl::Continue
     }
 }
 
@@ -724,11 +760,25 @@ fn altar(args: &[String]) -> i32 {
     }
 
     println!("[..] 焚符上表（此点起不可撤销）");
-    let receipt = match session.ignite(&fu, &plan, true) {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            eprintln!("[ERR] {error}");
-            return 1;
+    let receipt = if options.stream {
+        println!("[INFO] 流式显示已开启：增量只给人看，工具调用仍须收齐后过箓与敕门才执行");
+        let mut sink = cli_stream_sink();
+        let result = session.ignite_with_stream(&fu, &plan, true, &mut sink);
+        println!();
+        match result {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                eprintln!("[ERR] {error}");
+                return 1;
+            }
+        }
+    } else {
+        match session.ignite(&fu, &plan, true) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                eprintln!("[ERR] {error}");
+                return 1;
+            }
         }
     };
     println!("[OK] 回执 · {}", receipt.state.label());
@@ -2220,6 +2270,7 @@ mod tests {
             "--ask",
             "--allow-risk",
             "mutate",
+            "--stream",
         ]
         .map(String::from)
         .to_vec();
@@ -2227,6 +2278,9 @@ mod tests {
         assert!(options.confirm);
         assert!(options.ask);
         assert_eq!(options.allow_risk, Some(RiskClass::Mutate));
+        // T13：--stream 只影响显示，默认关闭（老命令行为一个字不变）。
+        assert!(options.stream);
+        assert!(!parse_altar_options(&args[1..5]).stream);
     }
 
     #[test]

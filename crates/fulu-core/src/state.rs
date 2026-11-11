@@ -30,6 +30,8 @@ pub enum TalismanState {
     Exploded,
     /// 过坛 · 超时
     TimedOut,
+    /// 中止 · 调用方在焚化途中主动取消（不是故障，也不回拼半份回执）
+    Cancelled,
 }
 
 impl TalismanState {
@@ -37,7 +39,12 @@ impl TalismanState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Archived | Self::Broken | Self::Rejected | Self::Exploded | Self::TimedOut
+            Self::Archived
+                | Self::Broken
+                | Self::Rejected
+                | Self::Exploded
+                | Self::TimedOut
+                | Self::Cancelled
         )
     }
 
@@ -59,6 +66,7 @@ impl TalismanState {
             Self::Rejected => "驳回",
             Self::Exploded => "炸炉",
             Self::TimedOut => "过坛",
+            Self::Cancelled => "中止",
         }
     }
 }
@@ -97,7 +105,12 @@ pub fn can_transition(from: TalismanState, to: TalismanState) -> Result<(), Tran
     if from.is_terminal() {
         return Err(TransitionError::Terminal(from));
     }
-    if from == S::Igniting && to != S::Answered && to != S::Exploded && to != S::TimedOut {
+    if from == S::Igniting
+        && to != S::Answered
+        && to != S::Exploded
+        && to != S::TimedOut
+        && to != S::Cancelled
+    {
         return Err(TransitionError::Irreversible(from));
     }
 
@@ -106,9 +119,9 @@ pub fn can_transition(from: TalismanState, to: TalismanState) -> Result<(), Tran
         S::Formed => matches!(to, S::Sealed | S::Broken),
         S::Sealed => matches!(to, S::Pending | S::Rejected | S::Broken),
         S::Pending => matches!(to, S::Igniting | S::Draft),
-        S::Igniting => matches!(to, S::Answered | S::Exploded | S::TimedOut),
+        S::Igniting => matches!(to, S::Answered | S::Exploded | S::TimedOut | S::Cancelled),
         S::Answered => matches!(to, S::Archived | S::Igniting),
-        S::Archived | S::Broken | S::Rejected | S::Exploded | S::TimedOut => false,
+        S::Archived | S::Broken | S::Rejected | S::Exploded | S::TimedOut | S::Cancelled => false,
     };
 
     if allowed {

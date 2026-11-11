@@ -42,6 +42,8 @@ pub enum EventKind {
     TimedOut,
     /// 敕令凭据从箓牒解析（只记引用名，永不记明文）
     Credential,
+    /// 焚化途中被调用方取消；已收到的增量只记账，不当成功
+    Cancelled,
 }
 
 impl EventKind {
@@ -64,6 +66,7 @@ impl EventKind {
             Self::Exploded => "炸炉",
             Self::TimedOut => "过坛",
             Self::Credential => "凭据",
+            Self::Cancelled => "取消",
         }
     }
 }
