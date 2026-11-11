@@ -38,6 +38,7 @@ use fulu_script::{decode_fu, encode_fu, seal_hex};
 use fulu_tools::{
     AskSearchTool, SearchBackend, Tool, ToolArguments, ToolError, ToolPolicy, ToolRegistry,
 };
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -47,7 +48,7 @@ use std::sync::{Arc, OnceLock};
 pub use fulu_core::Sandbox;
 pub use fulu_core::Talisman as Fu;
 /// 流式事件类型由门面转出，CLI / GUI 不必直接依赖 `fulu-provider`。
-pub use fulu_provider::{StreamControl, StreamEvent};
+pub use fulu_provider::{RetryPolicy, StreamControl, StreamEvent};
 pub use fulu_runtime::{
     ConfirmRequest, ConfirmVerdict, Confirmer as Gatekeeper, DryRunPlan, Receipt,
 };
@@ -687,6 +688,11 @@ impl AltarSession {
         self.provider
             .set_endpoint(endpoint)
             .map_err(|e| AppError::Probe(e.to_string()))
+    }
+
+    /// 透传重试策略到本地 provider（加法式：不设置就是 provider 默认 3 次 / 400ms）。
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.provider.set_retry_policy(policy);
     }
 
     pub fn set_workspace(&mut self, root: PathBuf) {
@@ -1408,6 +1414,22 @@ impl AltarSession {
         graph: &TaijiGraph,
         confirmed: bool,
     ) -> Result<OrchestrationReceipt, AppError> {
+        self.run_taiji_with_progress(graph, confirmed, &mut |_| {})
+    }
+
+    /// 太极 + 逐节点进度回传（T36 GUI 用）。**加法式**：`run_taiji` 委托到这里，
+    /// 传空闭包，签名与行为都不变。
+    ///
+    /// `on_node` 在每个节点**判定后**调用：成功 / 失败 / 跳过都会调，跳过的理由
+    /// 在 `NodeResult::reason` 里。执行顺序仍**只来自** `TaijiGraph::validate()`；
+    /// 跳过与预算判定逐字段镜像 `TaijiGraph::execute` 的语义（编排器本体不提供
+    /// 进度钩子）——改编排器语义时必须同步改这里，下方测试会锁住行为。
+    pub fn run_taiji_with_progress(
+        &mut self,
+        graph: &TaijiGraph,
+        confirmed: bool,
+        on_node: &mut dyn FnMut(&NodeResult),
+    ) -> Result<OrchestrationReceipt, AppError> {
         struct SessionRunner<'a> {
             session: &'a mut AltarSession,
             confirmed: bool,
@@ -1434,13 +1456,102 @@ impl AltarSession {
             }
         }
 
+        let order = graph
+            .validate()
+            .map_err(|error| AppError::Ritual(error.to_string()))?;
+        let max_steps = if graph.max_steps == 0 {
+            fulu_orchestrator::DEFAULT_MAX_STEPS
+        } else {
+            graph.max_steps
+        };
         let mut runner = SessionRunner {
             session: self,
             confirmed,
         };
-        graph
-            .execute(&mut runner)
-            .map_err(|error| AppError::Ritual(error.to_string()))
+        let mut status: BTreeMap<String, NodeStatus> = BTreeMap::new();
+        let mut results = Vec::with_capacity(order.len());
+        let mut total_steps = 0_u32;
+        let mut stopped_by_budget = false;
+
+        for &i in &order {
+            let node = &graph.nodes[i];
+            let blocked: Vec<String> = node
+                .depends_on
+                .iter()
+                .filter(|dep| status.get(*dep).copied() != Some(NodeStatus::Succeeded))
+                .cloned()
+                .collect();
+            let outcome = if !blocked.is_empty() {
+                NodeResult {
+                    id: node.id.clone(),
+                    status: NodeStatus::Skipped,
+                    receipt: None,
+                    reason: Some(format!("依赖未完成：{}", blocked.join("、"))),
+                }
+            } else if stopped_by_budget || total_steps >= max_steps {
+                stopped_by_budget = true;
+                NodeResult {
+                    id: node.id.clone(),
+                    status: NodeStatus::Skipped,
+                    receipt: None,
+                    reason: Some(format!("总步数预算 {max_steps} 已耗尽")),
+                }
+            } else {
+                match runner.execute(node) {
+                    Ok(receipt) => {
+                        total_steps = total_steps.saturating_add(receipt.steps);
+                        if total_steps >= max_steps {
+                            stopped_by_budget = true;
+                        }
+                        NodeResult {
+                            id: node.id.clone(),
+                            status: NodeStatus::Succeeded,
+                            receipt: Some(receipt),
+                            reason: None,
+                        }
+                    }
+                    Err(reason) => NodeResult {
+                        id: node.id.clone(),
+                        status: NodeStatus::Failed,
+                        receipt: None,
+                        reason: Some(reason),
+                    },
+                }
+            };
+            status.insert(node.id.clone(), outcome.status);
+            on_node(&outcome);
+            results.push(outcome);
+        }
+
+        let succeeded = results
+            .iter()
+            .filter(|r| r.status == NodeStatus::Succeeded)
+            .count();
+        let failed = results
+            .iter()
+            .filter(|r| r.status == NodeStatus::Failed)
+            .count();
+        let skipped = results
+            .iter()
+            .filter(|r| r.status == NodeStatus::Skipped)
+            .count();
+        let converged = failed == 0
+            && skipped == 0
+            && results
+                .iter()
+                .filter_map(|r| r.receipt.as_ref())
+                .all(|receipt| receipt.converged);
+        Ok(OrchestrationReceipt {
+            order: order.iter().map(|&i| graph.nodes[i].id.clone()).collect(),
+            results,
+            total_steps,
+            succeeded,
+            failed,
+            skipped,
+            converged,
+            stopped_by_budget,
+            max_steps,
+        })
     }
 
     /// 缴符导出为 JSONL。
@@ -1689,6 +1800,54 @@ mod tests {
         assert!(!receipt.converged);
         assert!(parse_taiji_graph("{").is_err(), "坏 JSON 必须明确报错");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T36：逐节点进度回调。回调序列必须与执行顺序一致，
+    /// 且每个节点（成功 / 失败 / 跳过）恰好回调一次。
+    #[test]
+    fn taiji_progress_callbacks_cover_every_node_in_execution_order() {
+        let sample = sample_fu_text().unwrap();
+        let graph = TaijiGraph {
+            nodes: vec![
+                GraphNode {
+                    id: "a".into(),
+                    fu_text: sample.clone(),
+                    fu_path: None,
+                    depends_on: vec![],
+                },
+                GraphNode {
+                    id: "b".into(),
+                    fu_text: sample.clone(),
+                    fu_path: None,
+                    depends_on: vec!["a".into()],
+                },
+                GraphNode {
+                    id: "c".into(),
+                    fu_text: sample,
+                    fu_path: None,
+                    depends_on: vec![],
+                },
+            ],
+            max_steps: 0,
+        };
+        let mut session = AltarSession::new();
+        let mut seen: Vec<String> = Vec::new();
+        let receipt = session
+            .run_taiji_with_progress(&graph, false, &mut |result| {
+                seen.push(result.id.clone());
+            })
+            .unwrap();
+        assert_eq!(
+            receipt.order,
+            vec!["a", "c", "b"],
+            "字典序分层：a、c 同批先行，b 随后"
+        );
+        assert_eq!(seen, receipt.order, "回调序列必须与执行顺序完全一致");
+        assert_eq!(seen.len(), graph.nodes.len(), "跳过的节点也必须回调一次");
+        assert!(
+            receipt.failed + receipt.skipped == graph.nodes.len(),
+            "未确认时不得有任何节点伪装成功"
+        );
     }
 
     /// T10：召将子符的登记必须落在正确档位，且影响面进 dry-run 计划。

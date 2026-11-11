@@ -90,6 +90,7 @@ fn help() {
          \x20                 --mcp [配置路径]  焚化时接入外宗（受限级，需沙箱 ≥ limited）\n\
          \x20                 --allow-risk <observe|mutate|destructive>  预授权高危召将\n\
          \x20                 --ask            高危召将逐次在终端里问人\n\
+         \x20                 --retry <0-10>   推理失败重试次数（默认 3；0=不重试；只对限流/内部错误/超时/断连退避重试）\n\
          \x20                 --summon         启用召将子符（独立法坛、禁环回、不继承高危授权）\n\
          \x20                 --search         启用问天（从已接入外宗挑搜索后端，Destructive）\n\
          \x20                 --shexing        启用摄行（另需 FULU_ALLOW_SHEXING=1，逐次确认）\n\
@@ -372,6 +373,9 @@ struct AltarOptions {
     shexing: bool,
     /// T13：流式显示增量（只影响显示，不影响仪轨与判定）
     stream: bool,
+    /// `--retry N`：推理失败时的最大尝试次数（0..=10；0 与 1 都表示「不重试」）。
+    /// `None` = 用 provider 默认（3 次 / 400ms 基准退避）。
+    retry: Option<u8>,
 }
 
 fn parse_altar_options(args: &[String]) -> AltarOptions {
@@ -416,6 +420,18 @@ fn parse_altar_options(args: &[String]) -> AltarOptions {
             "--search" => options.search = true,
             "--shexing" => options.shexing = true,
             "--stream" => options.stream = true,
+            "--retry" => {
+                if let Some(value) = args.get(index + 1) {
+                    match value.parse::<u8>() {
+                        // N=0 表示「不重试」，映射成 max_attempts=1（至少发一次）。
+                        Ok(n) if n <= 10 => options.retry = Some(n.max(1)),
+                        _ => {
+                            eprintln!("[WARN] --retry 需要 0..=10 的整数：{value}（保持默认 3 次）")
+                        }
+                    }
+                    index += 1;
+                }
+            }
             "--context-ip" => options.context_ip = true,
             "--no-context" => options.no_context = true,
             "--prompt-mode" => {
@@ -623,6 +639,14 @@ fn altar(args: &[String]) -> i32 {
     if let Some(mode) = options.prompt_mode {
         session.set_prompt_mode(mode);
     }
+    // 重试策略：默认 provider 自带（3 次 / 400ms 基准退避，仅 429/5xx/超时/断连）。
+    // N=0 已在解析时映射成 max_attempts=1，即「发一次、不重试」。
+    if let Some(retry) = options.retry {
+        session.set_retry_policy(fulu_app::RetryPolicy {
+            max_attempts: retry,
+            ..fulu_app::RetryPolicy::default()
+        });
+    }
     // T40：装箓牒。缺凭据的符在 dry-run 阶段就会被拒，不会焚化到一半才失败。
     match fulu_vault::open_default() {
         Ok(vault) => match session.use_vault(vault) {
@@ -794,6 +818,10 @@ fn altar(args: &[String]) -> i32 {
             ""
         }
     );
+    // 重试不静默：provider 在 429/5xx/超时/断连上退避重试过，回执里必须如实说。
+    if receipt.retries_total > 0 {
+        println!("  重试       : 重试 {} 次后成功", receipt.retries_total);
+    }
     println!(
         "  符脚判定   : {}",
         if receipt.converged {
@@ -1844,6 +1872,14 @@ fn taiji(args: &[String]) -> i32 {
     }
     if let Some(mode) = options.prompt_mode {
         session.set_prompt_mode(mode);
+    }
+    // 重试策略：默认 provider 自带（3 次 / 400ms 基准退避，仅 429/5xx/超时/断连）。
+    // N=0 已在解析时映射成 max_attempts=1，即「发一次、不重试」。
+    if let Some(retry) = options.retry {
+        session.set_retry_policy(fulu_app::RetryPolicy {
+            max_attempts: retry,
+            ..fulu_app::RetryPolicy::default()
+        });
     }
     // T40：装箓牒。缺凭据的符在 dry-run 阶段就会被拒，不会焚化到一半才失败。
     match fulu_vault::open_default() {

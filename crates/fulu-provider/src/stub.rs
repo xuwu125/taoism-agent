@@ -78,6 +78,8 @@ pub fn text_reply(text: &str, prompt_tokens: u32, completion_tokens: u32) -> Inv
             completion_tokens,
             estimated: false,
         },
+        // 桩不重试；真实重试计数只来自 LocalLfmProvider 的退避循环。
+        retries: 0,
     }
 }
 

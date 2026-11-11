@@ -306,7 +306,10 @@ fn open(
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     if read_line(&mut reader, &mut line)? == 0 {
-        return Err(HttpError::MalformedResponse("响应为空".into()));
+        // 对端接受了连接却一个字节都没回就断开：这是 I/O 级断连（本地服务
+        // 瞬时重启 / 过载丢弃），属可重试的瞬态；协议错误指的是
+        // 「收到了字节但格式不对」，二者不能混为一谈。
+        return Err(HttpError::Io("连接在收到任何响应字节之前被对端关闭".into()));
     }
     let status = parse_status_line(&line)?;
 

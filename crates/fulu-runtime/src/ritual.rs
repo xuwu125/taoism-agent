@@ -169,6 +169,8 @@ pub struct Receipt {
     pub estimated_usage: bool,
     /// 是否真正满足 `success_criteria`，不因循环耗尽而伪装成功
     pub converged: bool,
+    /// 各步推理里 provider 实际重试的总次数（0 = 一次就成，仅展示用）
+    pub retries_total: u32,
     pub events: Vec<AuditEvent>,
 }
 
@@ -473,6 +475,7 @@ impl<'a> Altar<'a> {
         let mut remaining = fu.harness.budget_tokens;
         let mut spent_total = 0_u32;
         let mut estimated_usage = false;
+        let mut retries_total = 0_u32;
         let mut used_tools: BTreeMap<String, u32> = BTreeMap::new();
         let mut user_input = fu.user.clone();
         let mut final_text = String::new();
@@ -603,6 +606,7 @@ impl<'a> Altar<'a> {
 
             let spent = reply.usage.total();
             estimated_usage |= reply.usage.estimated;
+            retries_total += u32::from(reply.retries);
             spent_total = spent_total.saturating_add(spent);
             // 至少递减 1：服务端不给 usage 时也不会因 0 消耗而无限循环。
             remaining = remaining.saturating_sub(spent.max(1));
@@ -611,10 +615,11 @@ impl<'a> Altar<'a> {
                 TalismanState::Igniting,
                 EventKind::Invoked,
                 &format!(
-                    "请神 provider={} tokens={} estimated={} 剩余预算={}",
+                    "请神 provider={} tokens={} estimated={} 重试={} 剩余预算={}",
                     self.provider.id(),
                     spent,
                     reply.usage.estimated,
+                    reply.retries,
                     remaining
                 ),
             )?;
@@ -803,6 +808,7 @@ impl<'a> Altar<'a> {
             usage_total: spent_total,
             estimated_usage,
             converged,
+            retries_total,
             events: self.audit.replay(&seal).into_iter().cloned().collect(),
         })
     }
@@ -1066,6 +1072,40 @@ mod tests {
         audit.verify_chain().unwrap();
     }
 
+    /// `docs/03` 第 2.5 节的承诺：重试不许静默——provider 报上来的重试数
+    /// 必须同时落在缴符事件与回执里（provider 侧的计数由 `retry_e2e` 真机覆盖）。
+    #[test]
+    fn provider_retry_count_lands_in_audit_event_and_receipt() {
+        let (fu, register, tools, mut audit) = fixture();
+        let provider = StubProvider::default();
+        // 桩不跑退避循环；这里手工给一个「provider 内部重试过 2 次」的回执，
+        // 只验证法坛的记账：缴符事件带 重试=2，回执 retries_total == 2。
+        provider.push_reply(InvocationReply {
+            text: "这是摘要".into(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                estimated: false,
+            },
+            retries: 2,
+        });
+        let mut altar = altar(&provider, &tools, &register, &mut audit);
+        let plan = altar.prepare(&fu).unwrap();
+        let receipt = altar.ignite(&fu, &plan, true).unwrap();
+        assert_eq!(receipt.retries_total, 2);
+        let invoked = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == EventKind::Invoked)
+            .expect("一次成功的焚符必须有一条请神事件");
+        assert!(
+            invoked.detail.contains("重试=2"),
+            "请神事件必须带重试计数：{}",
+            invoked.detail
+        );
+    }
+
     #[test]
     fn tool_loop_feeds_results_back_into_the_next_request() {
         let (fu, register, tools, mut audit) = fixture();
@@ -1085,6 +1125,7 @@ mod tests {
                 completion_tokens: 5,
                 estimated: false,
             },
+            retries: 0,
         });
         provider.push_reply(text_reply("完成", 5, 5));
         let mut altar = altar(&provider, &tools, &register, &mut audit);
@@ -1137,6 +1178,7 @@ mod tests {
                 completion_tokens: 5,
                 estimated: false,
             },
+            retries: 0,
         }
     }
 

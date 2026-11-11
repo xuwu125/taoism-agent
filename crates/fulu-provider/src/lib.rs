@@ -155,6 +155,10 @@ pub struct InvocationReply {
     /// 归一后的工具调用；执行前仍须经「箓」+「风火轮」白名单复核
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
+    /// 成功前实际重试的次数（0 = 一次就成）。旧数据反序列化时按 0 处理，
+    /// 调用方只用于展示「重试 N 次后成功」，不参与任何判定。
+    #[serde(default)]
+    pub retries: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +168,13 @@ pub enum ProviderError {
     NotConfigured(String),
     ModelUnavailable(String),
     Transport(String),
+    /// 推理服务限流（HTTP 429）。是瞬态过载，值得按策略退避重试。
+    RateLimited(String),
+    /// 推理服务内部错误（HTTP 5xx）。状态码保留，供 `should_retry` 分类。
+    ServerError {
+        status: u16,
+        detail: String,
+    },
     /// 响应协议不符合 OpenAI 兼容约定
     Protocol(String),
     /// 流式调用被调用方主动取消（`StreamControl::Cancel`）。
@@ -182,6 +193,10 @@ impl fmt::Display for ProviderError {
             Self::NotConfigured(msg) => write!(f, "本地推理运行时未就绪：{msg}"),
             Self::ModelUnavailable(msg) => write!(f, "内置模型不可用：{msg}"),
             Self::Transport(msg) => write!(f, "本地推理服务通信失败：{msg}"),
+            Self::RateLimited(msg) => write!(f, "推理服务限流（HTTP 429）：{msg}"),
+            Self::ServerError { status, detail } => {
+                write!(f, "推理服务内部错误（HTTP {status}）：{detail}")
+            }
             Self::Protocol(msg) => write!(f, "推理服务响应协议错误：{msg}"),
             Self::Cancelled(msg) => write!(f, "推理调用已取消：{msg}"),
             Self::BudgetExceeded => write!(f, "token 预算耗尽"),
@@ -279,9 +294,25 @@ impl RetryPolicy {
         match error {
             ProviderError::Timeout => self.retry_on.timeout,
             ProviderError::Transport(_) => self.retry_on.transport,
-            // `HTTP 429` 在映射前是 Transport/Protocol，这里按语义保守判定：
-            // 无法确定状态码时不做重试（宁可不重试，也不重复计费）。
-            _ => false,
+            // 429 是服务端明确喊「稍后再来」，属瞬态过载，按策略退避重试。
+            ProviderError::RateLimited(_) => self.retry_on.rate_limited,
+            // 5xx 是服务端内部错误，多数本地推理场景属瞬态（加载中、短暂崩溃），
+            // 状态码已保留在 `ServerError.status`，按策略退避重试。
+            ProviderError::ServerError { .. } => self.retry_on.server_error,
+            // 以下一律不重试，理由如下：
+            // - `Cancelled`：取消是人主动按停，重试等于违抗调用方；
+            // - `Protocol`：响应格式错了，原样再发大概率还是错，重试只会重复计费；
+            // - `NotConfigured`：端点没设，纯配置问题，重试无意义；
+            // - `ModelUnavailable`：「服务没起 / 权重没加载」，属配置或部署错误，
+            //   不是瞬态——绝不能给「连不上就狂试」留口子；
+            // - `NotImplemented`：能力缺失，重试一万次也不会实现；
+            // - `BudgetExceeded`：预算烧完是硬边界，重试只会更糟。
+            ProviderError::Cancelled(_)
+            | ProviderError::Protocol(_)
+            | ProviderError::NotConfigured(_)
+            | ProviderError::ModelUnavailable(_)
+            | ProviderError::NotImplemented(_)
+            | ProviderError::BudgetExceeded => false,
         }
     }
 }

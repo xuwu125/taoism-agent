@@ -9,8 +9,8 @@
 use crate::http::{self, Endpoint, HttpError, StreamDirective};
 use crate::sse::{SseError, StreamAssembler, StreamParts};
 use crate::{
-    Capabilities, InvocationReply, InvocationRequest, Provider, ProviderError, StreamControl,
-    StreamEvent, ToolCall, Usage,
+    Capabilities, InvocationReply, InvocationRequest, Provider, ProviderError, RetryPolicy,
+    StreamControl, StreamEvent, ToolCall, Usage,
 };
 use serde_json::{Map, Value, json};
 use std::time::Duration;
@@ -62,6 +62,8 @@ pub struct LocalLfmProvider {
     /// 服务端启用了 `--api-key` 时从这里取；`None` = 不带认证头。
     /// 令牌由 `fulu-app` 从箓牒解析后注入，provider 自己**不碰凭据库**。
     pub auth: Option<BearerToken>,
+    /// 重试策略（默认 3 次 / 400ms 基准退避）。重试只在「零可见副作用」时发生。
+    pub retry: RetryPolicy,
 }
 
 impl LocalLfmProvider {
@@ -73,6 +75,7 @@ impl LocalLfmProvider {
             context_tokens,
             timeout: Duration::from_secs(30),
             auth: None,
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -88,6 +91,11 @@ impl LocalLfmProvider {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// 注入重试策略（与 `set_auth_token` 同一风格）。`max_attempts = 1` 即禁用重试。
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.retry = policy;
     }
 
     /// 本地服务只允许回环地址，避免把推理端口暴露到网络。
@@ -156,8 +164,26 @@ fn map_http_error(error: HttpError) -> ProviderError {
         HttpError::Connect(msg) => {
             ProviderError::ModelUnavailable(format!("本地推理服务未启动或权重未加载：{msg}"))
         }
+        // 429 是限流：状态码必须保留，否则 should_retry 无法分类（这正是
+        // 旧实现把 require_success 错误拍成 Transport 时丢掉的根子）。
+        HttpError::HttpStatus(429, body) => ProviderError::RateLimited(body),
+        // 5xx 是服务端内部错误；4xx 其余（如 400/404）不是瞬态，按通信失败上报。
+        HttpError::HttpStatus(code, body) if code >= 500 => ProviderError::ServerError {
+            status: code,
+            detail: body,
+        },
         other => ProviderError::Transport(other.to_string()),
     }
+}
+
+/// 退避抖动种子。**非密码学用途**：只用系统时钟纳秒打散并发下的退避重合，
+/// 不引入任何随机数 crate。
+fn jitter_permille() -> u16 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    800 + u16::try_from(nanos % 401).unwrap_or(0)
 }
 
 impl Provider for LocalLfmProvider {
@@ -181,17 +207,39 @@ impl Provider for LocalLfmProvider {
         if let Some(value) = &bearer {
             headers.push(("Authorization", value.as_str()));
         }
-        let http_request =
-            http::HttpRequest::post("/v1/chat/completions", payload.as_bytes(), self.timeout)
-                .with_headers(&headers);
-        let response = http::send(&endpoint, &http_request).map_err(map_http_error)?;
-        response
-            .require_success()
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-        let text = response
-            .body_text()
-            .map_err(|e| ProviderError::Protocol(e.to_string()))?;
-        parse_reply(&text, request)
+        // 退避循环：每次尝试都重新构造请求（HttpRequest 借用 payload，重建最便宜）；
+        // 状态码经 map_http_error 保留进 RateLimited/ServerError，重试分类才有依据。
+        let mut attempt = 1_u8;
+        loop {
+            let http_request =
+                http::HttpRequest::post("/v1/chat/completions", payload.as_bytes(), self.timeout)
+                    .with_headers(&headers);
+            let error = match http::send(&endpoint, &http_request) {
+                Ok(response) => match response.require_success() {
+                    Ok(()) => {
+                        let text = response
+                            .body_text()
+                            .map_err(|e| ProviderError::Protocol(e.to_string()))?;
+                        let mut reply = parse_reply(&text, request)?;
+                        reply.retries = attempt - 1;
+                        return Ok(reply);
+                    }
+                    // 非 2xx：按状态码分类（429→RateLimited、5xx→ServerError），
+                    // 不再把状态码拍扁成 Transport。
+                    Err(e) => map_http_error(e),
+                },
+                Err(e) => map_http_error(e),
+            };
+            if self.retry.should_retry(attempt, &error, false) {
+                std::thread::sleep(Duration::from_millis(
+                    self.retry.backoff_millis(attempt, jitter_permille()),
+                ));
+                attempt += 1;
+                continue;
+            }
+            // 最终失败只报最后一次的错误；成功路径与非重试路径的行为不变。
+            return Err(error);
+        }
     }
 
     /// 真流式：边收边把增量交给 `sink`，收齐后仍返回**完整**回执。
@@ -215,67 +263,90 @@ impl Provider for LocalLfmProvider {
         if let Some(value) = &bearer {
             headers.push(("Authorization", value.as_str()));
         }
-        let http_request =
-            http::HttpRequest::post("/v1/chat/completions", payload.as_bytes(), self.timeout)
-                .with_headers(&headers);
 
-        let mut assembler = StreamAssembler::new();
-        let mut sse_error: Option<SseError> = None;
-        let mut cancelled = false;
-        let sink = &mut *sink;
-        let stats = {
-            let mut on_line = |line: &[u8]| -> StreamDirective {
-                if sse_error.is_some() {
-                    return StreamDirective::Stop;
-                }
-                match assembler.feed_line(line) {
-                    Ok(feed) => {
-                        for event in feed.events {
-                            if sink(event) == StreamControl::Cancel {
-                                cancelled = true;
-                                return StreamDirective::Stop;
+        // 重试只在「零增量」时允许：一旦任何事件（含 TextDelta/ToolCallDelta/
+        // Usage/Done）已经交给 sink，重试就会把同一句话输出两遍——绝对禁止。
+        // 每次尝试都从干净状态开始：assembler/错误/取消标志全部重建，请求也重新构造。
+        let mut attempt = 1_u8;
+        loop {
+            let mut delivered = false;
+            let mut assembler = StreamAssembler::new();
+            let mut sse_error: Option<SseError> = None;
+            let mut cancelled = false;
+            let sink = &mut *sink;
+            let result = {
+                let mut on_line = |line: &[u8]| -> StreamDirective {
+                    if sse_error.is_some() {
+                        return StreamDirective::Stop;
+                    }
+                    match assembler.feed_line(line) {
+                        Ok(feed) => {
+                            for event in feed.events {
+                                delivered = true;
+                                if sink(event) == StreamControl::Cancel {
+                                    cancelled = true;
+                                    return StreamDirective::Stop;
+                                }
+                            }
+                            if feed.done {
+                                StreamDirective::Stop
+                            } else {
+                                StreamDirective::Continue
                             }
                         }
-                        if feed.done {
+                        Err(error) => {
+                            sse_error = Some(error);
                             StreamDirective::Stop
-                        } else {
-                            StreamDirective::Continue
                         }
                     }
-                    Err(error) => {
-                        sse_error = Some(error);
-                        StreamDirective::Stop
+                };
+                let http_request = http::HttpRequest::post(
+                    "/v1/chat/completions",
+                    payload.as_bytes(),
+                    self.timeout,
+                )
+                .with_headers(&headers);
+                http::send_streaming(&endpoint, &http_request, &mut on_line)
+            };
+            let error = match result {
+                Ok(stats) => {
+                    if let Some(error) = sse_error {
+                        error.into()
+                    } else if cancelled {
+                        return Err(ProviderError::Cancelled(format!(
+                            "调用方在 {} 字节后取消（已收 {} 行）",
+                            stats.body_bytes, stats.lines
+                        )));
+                    } else if !assembler.is_done() {
+                        // chunked 被截断时底层只看到「流意外结束」；对调用方要说清是
+                        // **没等到 [DONE]**，否则容易被当成「响应格式小毛病」重试。
+                        ProviderError::Protocol(format!(
+                            "流在结束标记 [DONE] 之前中断（已收 {} 字节 / {} 行），不回拼半份回执",
+                            stats.body_bytes, stats.lines
+                        ))
+                    } else {
+                        let reply = finish_stream(assembler.into_parts()?, request, attempt - 1)?;
+                        return Ok(reply);
                     }
                 }
+                Err(HttpError::MalformedResponse(detail)) => ProviderError::Protocol(format!(
+                    "流在结束标记 [DONE] 之前中断（{detail}）；不回拼半份回执"
+                )),
+                Err(other) => map_http_error(other),
             };
-            http::send_streaming(&endpoint, &http_request, &mut on_line).map_err(|error| {
-                // chunked 被截断时底层只看到「流意外结束」；对调用方要说清是
-                // **没等到 [DONE]**，否则容易被当成「响应格式小毛病」重试。
-                match error {
-                    HttpError::MalformedResponse(detail) => ProviderError::Protocol(format!(
-                        "流在结束标记 [DONE] 之前中断（{detail}）；不回拼半份回执"
-                    )),
-                    other => map_http_error(other),
-                }
-            })?
-        };
-
-        if let Some(error) = sse_error {
-            return Err(error.into());
+            // 取消永远不重试；已交付任何增量也不重试（宁可报错也不重复输出）。
+            if cancelled || delivered {
+                return Err(error);
+            }
+            if self.retry.should_retry(attempt, &error, false) {
+                std::thread::sleep(Duration::from_millis(
+                    self.retry.backoff_millis(attempt, jitter_permille()),
+                ));
+                attempt += 1;
+                continue;
+            }
+            return Err(error);
         }
-        if cancelled {
-            return Err(ProviderError::Cancelled(format!(
-                "调用方在 {} 字节后取消（已收 {} 行）",
-                stats.body_bytes, stats.lines
-            )));
-        }
-        if !assembler.is_done() {
-            return Err(ProviderError::Protocol(format!(
-                "流在结束标记 [DONE] 之前中断（已收 {} 字节 / {} 行），不回拼半份回执",
-                stats.body_bytes, stats.lines
-            )));
-        }
-        finish_stream(assembler.into_parts()?, request)
     }
 }
 
@@ -286,6 +357,7 @@ impl Provider for LocalLfmProvider {
 fn finish_stream(
     parts: StreamParts,
     request: &InvocationRequest,
+    retries: u8,
 ) -> Result<InvocationReply, ProviderError> {
     let mut tool_calls = parts.tool_calls;
     if tool_calls.is_empty() {
@@ -303,6 +375,7 @@ fn finish_stream(
         text: parts.text,
         tool_calls,
         usage,
+        retries,
     })
 }
 
@@ -390,6 +463,8 @@ pub fn parse_reply(
             completion_tokens,
             estimated,
         },
+        // 单次解析不涉及重试；重试计数由 invoke 的退避循环在外层补上。
+        retries: 0,
     })
 }
 
@@ -764,6 +839,25 @@ mod tests {
             Err(ProviderError::NotConfigured(_))
         ));
         assert!(provider.health().is_err());
+    }
+
+    #[test]
+    fn backoff_at_attempt_three_with_nominal_jitter_is_four_times_base() {
+        let policy = RetryPolicy::default();
+        // attempt=3 → 指数 2 → 400ms * 4；jitter=1000‰ 即原样。
+        assert_eq!(policy.backoff_millis(3, 1000), 1600);
+    }
+
+    #[test]
+    fn backoff_jitter_is_clamped_to_eight_hundred_to_twelve_hundred_permille() {
+        let policy = RetryPolicy::default();
+        for jitter in [0_u16, 799, 800, 1200, 1201, u16::MAX] {
+            let waited = policy.backoff_millis(1, jitter);
+            assert!(
+                (320..=480).contains(&waited),
+                "jitter={jitter} 的退避 {waited}ms 必须夹在 800‰..=1200‰（320..=480ms）"
+            );
+        }
     }
 
     /// 起一个只收一次请求的假服务，把**请求头原文**交回来。
