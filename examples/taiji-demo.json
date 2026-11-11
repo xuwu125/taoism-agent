@@ -1,0 +1,8 @@
+{
+  "nodes": [
+    { "id": "gather-a", "fu_path": "node-a.fu" },
+    { "id": "gather-b", "fu_path": "node-b.fu" },
+    { "id": "report",   "fu_path": "node-b.fu", "depends_on": ["gather-a", "gather-b"] }
+  ],
+  "max_steps": 0
+}

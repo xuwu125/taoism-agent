@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "id": "fu-sample-summary-0001",
+  "name": "镇宅·长文摘要",
+  "version": "1.0.0",
+  "head": {
+    "provider_ref": "lu://local/llama-server",
+    "endpoint": null
+  },
+  "deity": {
+    "model_id": "lfm3-1.7b-q4km",
+    "sampling": {
+      "temperature_milli": 100,
+      "top_k": 50,
+      "repeat_penalty_milli": 1100
+    }
+  },
+  "credential_ref": "lu://default/local",
+  "harness": {
+    "budget_tokens": 8000,
+    "timeout_secs": 60,
+    "sandbox": "strict",
+    "allow_tools": [
+      "fs.read"
+    ],
+    "max_steps": 12,
+    "network": false
+  },
+  "system": "你是严谨的摘要助手，只依据给定文本，不添加外部知识。",
+  "user": "{{input}}",
+  "goal": {
+    "description": "输出不超过 200 字的摘要",
+    "success_criteria": "output.len <= 200"
+  },
+  "tool_refs": [
+    "fs.read"
+  ],
+  "skill_refs": [],
+  "output": {
+    "schema": "summary.v1",
+    "max_iterations": 3,
+    "until": "success"
+  }
+}

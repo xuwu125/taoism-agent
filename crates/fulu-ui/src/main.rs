@@ -13,10 +13,11 @@
 mod confirm;
 mod fonts;
 mod paper;
+mod taiji;
 
 use confirm::ConfirmExchange;
 use eframe::egui;
-use fulu_app::{AltarSession, ConfirmVerdict, DryRunPlan, Fu, Receipt, RiskClass};
+use fulu_app::{AltarSession, ConfirmVerdict, DryRunPlan, Fu, NodeStatus, Receipt, RiskClass};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -115,6 +116,14 @@ struct FuluApp {
     form_open: bool,
     /// 焚符成功那一刻的时刻，用于「火光」衰减动效（纯视觉，不承载逻辑）。
     fire_at: Option<std::time::Instant>,
+
+    // ---- T36 太极编排视图 ----
+    taiji_open: bool,
+    taiji: taiji::TaijiView,
+    /// 符图焚化后台线程的收件箱（逐节点进度 + 最终回执）。
+    taiji_rx: Option<Receiver<taiji::TaijiMsg>>,
+    /// 太极是否正在后台焚化（串行，不允许重复提交）。
+    taiji_running: bool,
 }
 
 /// 字段表单里可被符纸热区定位的输入项。
@@ -200,6 +209,10 @@ impl FuluApp {
             form_focus: None,
             form_open: false,
             fire_at: None,
+            taiji_open: false,
+            taiji: taiji::TaijiView::default(),
+            taiji_rx: None,
+            taiji_running: false,
         };
         app.refresh_files();
         app.reload_models();
@@ -482,6 +495,229 @@ impl FuluApp {
         let next = inbox.lock().expect("敕门收件箱锁中毒").try_recv().ok();
         if let Some(exchange) = next {
             self.pending_confirm = Some(exchange);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // T36 太极编排视图
+    // ------------------------------------------------------------------
+
+    /// 载入符图并算显示用分层；错误**原文**进 `error` 与状态栏，绝不静默。
+    fn taiji_load(&mut self) {
+        let path = self.taiji.path.trim().to_owned();
+        match fulu_app::load_taiji_graph(Path::new(&path)) {
+            Ok(graph) => match taiji::layers(&graph) {
+                Ok(layers) => {
+                    let count = graph.nodes.len();
+                    self.taiji.graph = Some(graph);
+                    self.taiji.layers = Some(layers);
+                    self.taiji.error = None;
+                    self.taiji.reset_progress();
+                    self.say(
+                        format!("符图已载入：{count} 个节点（执行顺序以编排器校验为准）"),
+                        Tone::Good,
+                    );
+                }
+                Err(error) => {
+                    self.taiji.graph = None;
+                    self.taiji.layers = None;
+                    self.taiji.error = Some(error.clone());
+                    self.taiji.reset_progress();
+                    self.say(format!("符图分层失败：{error}"), Tone::Bad);
+                }
+            },
+            Err(error) => {
+                self.taiji.graph = None;
+                self.taiji.layers = None;
+                self.taiji.error = Some(error.to_string());
+                self.taiji.reset_progress();
+                self.say(format!("符图载入失败：{error}"), Tone::Bad);
+            }
+        }
+    }
+
+    /// 焚化整张符图：后台线程 + mpsc，照 `burn()` 的范式；逐节点进度经
+    /// `run_taiji_with_progress` 回传。**没有取消钩子**——面板文案已如实写明。
+    fn taiji_burn(&mut self) {
+        let Some(graph) = self.taiji.graph.clone() else {
+            return;
+        };
+        let confirmed = self.taiji.confirmed;
+        let Some(mut session) = self.session.take() else {
+            self.say("法坛正忙", Tone::Bad);
+            return;
+        };
+        let Some(ctx) = self.ctx.clone() else {
+            self.session = Some(session);
+            self.say("界面尚未就绪，稍后再焚", Tone::Bad);
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<taiji::TaijiMsg>();
+        let repaint = ctx.clone();
+        let done_wake = ctx.clone();
+        std::thread::spawn(move || {
+            let node_tx = tx.clone();
+            let mut on_node = move |result: &fulu_app::NodeResult| {
+                // 发送失败说明界面已关：忽略即可，编排不因显示层消失而中断。
+                let _ = node_tx.send(taiji::TaijiMsg::Node(result.clone()));
+                repaint.request_repaint();
+            };
+            let outcome = session
+                .run_taiji_with_progress(&graph, confirmed, &mut on_node)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(taiji::TaijiMsg::Done(Box::new(session), outcome));
+            done_wake.request_repaint();
+        });
+        self.taiji.reset_progress();
+        self.taiji_rx = Some(rx);
+        self.taiji_running = true;
+        self.say(
+            "符图焚化中……（整图一次确认，逐节点串行；本视图无中止）",
+            Tone::Info,
+        );
+        ctx.request_repaint();
+    }
+
+    /// 非阻塞抽干太极消息：逐节点进度追加进表，回执到了才定局。
+    fn poll_taiji(&mut self) {
+        let Some(rx) = &self.taiji_rx else {
+            return;
+        };
+        let mut done = None;
+        loop {
+            match rx.try_recv() {
+                Ok(taiji::TaijiMsg::Node(result)) => self.taiji.results.push(result),
+                Ok(taiji::TaijiMsg::Done(session, outcome)) => {
+                    done = Some((session, outcome));
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.taiji_rx = None;
+                    if self.taiji_running {
+                        self.taiji_running = false;
+                        self.say("符图线程异常退出", Tone::Bad);
+                    }
+                    return;
+                }
+            }
+        }
+        if let Some((session, outcome)) = done {
+            self.taiji_rx = None;
+            self.taiji_running = false;
+            self.session = Some(*session);
+            match outcome {
+                Ok(receipt) => {
+                    let converged = receipt.converged;
+                    self.say(
+                        format!("太极回执 · {}", receipt.summary()),
+                        if converged { Tone::Good } else { Tone::Bad },
+                    );
+                    self.taiji.receipt = Some(receipt);
+                }
+                Err(message) => {
+                    // 编排器在执行前拒绝（环 / 规模 / 校验）：原文照抄进 error。
+                    self.taiji.error = Some(message.clone());
+                    self.say(format!("符图编排失败：{message}"), Tone::Bad);
+                }
+            }
+        }
+    }
+
+    /// 太极编排面板。顺序：说明 → 载入 → 层视图 → 节点表 → 确认 → 焚化 → 进度 → 回执。
+    fn taiji_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("太极编排");
+        ui.label(
+            "整张符图一次性确认；编排器不会替任何节点点头。\
+             本视图不提供中止：单符的中止只在『③ 焚符』可用。",
+        );
+        ui.separator();
+
+        // 载入行（焚化途中不允许换图）。
+        ui.add_enabled_ui(!self.taiji_running, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("符图 JSON");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.taiji.path)
+                        .hint_text("符图路径，如 graph.json")
+                        .desired_width(420.0),
+                );
+                if ui.button("载入").clicked() {
+                    self.taiji_load();
+                }
+            });
+        });
+        if let Some(error) = &self.taiji.error {
+            ui.label(egui::RichText::new(error).color(egui::Color32::from_rgb(200, 80, 70)));
+        }
+        // 层视图：纯显示，执行顺序以编排器校验为准。
+        if let Some(layers) = &self.taiji.layers {
+            for (index, layer) in layers.iter().enumerate() {
+                ui.label(format!("第 {} 层：{}", index + 1, layer.join("、")));
+            }
+        }
+        ui.separator();
+
+        // 节点表：状态一律如实——没有结果就是「待焚」，不提前画勾。
+        let graph = self.taiji.graph.clone();
+        if let Some(graph) = graph {
+            egui::ScrollArea::vertical()
+                .id_salt("taiji_nodes")
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("taiji_table")
+                        .striped(true)
+                        .min_col_width(60.0)
+                        .show(ui, |ui| {
+                            for node in &graph.nodes {
+                                ui.monospace(&node.id);
+                                if let Some(result) = self.taiji.result_of(&node.id) {
+                                    let (label, _, detail) = taiji::node_line(result);
+                                    let color = match result.status {
+                                        NodeStatus::Succeeded => {
+                                            egui::Color32::from_rgb(60, 160, 90)
+                                        }
+                                        NodeStatus::Failed => egui::Color32::from_rgb(200, 80, 70),
+                                        NodeStatus::Skipped => {
+                                            egui::Color32::from_rgb(180, 120, 40)
+                                        }
+                                    };
+                                    ui.label(egui::RichText::new(label).color(color));
+                                    ui.label(egui::RichText::new(taiji::brief(&detail, 90)).weak());
+                                } else {
+                                    ui.label(egui::RichText::new("待焚").weak());
+                                    ui.label(egui::RichText::new("—").weak());
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+        }
+        ui.separator();
+
+        ui.checkbox(&mut self.taiji.confirmed, "我确认焚化整张符图（不可撤销）");
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(
+                self.taiji.graph.is_some() && self.taiji.confirmed && !self.taiji_running,
+                |ui| {
+                    if ui.button("焚化符图").clicked() {
+                        self.taiji_burn();
+                    }
+                },
+            );
+            if self.taiji_running {
+                ui.spinner();
+                ui.label("符图焚化中（逐节点串行，界面不阻塞）");
+            }
+        });
+        if let Some(receipt) = &self.taiji.receipt {
+            ui.label(receipt.summary());
+            if receipt.stopped_by_budget {
+                ui.label(
+                    egui::RichText::new("预算耗尽，剩余节点已跳过")
+                        .color(egui::Color32::from_rgb(180, 120, 40)),
+                );
+            }
         }
     }
 
@@ -844,6 +1080,15 @@ impl FuluApp {
     fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.top_bar(ui);
         self.status_bar(ui);
+        // T36 太极编排：叠在底部状态栏上方，不挤走三栏。
+        if self.taiji_open {
+            egui::Panel::bottom("taiji")
+                .resizable(true)
+                .default_size(240.0)
+                .show(ui, |ui| {
+                    self.taiji_panel(ui);
+                });
+        }
         self.left_panel(ui, ctx);
         self.right_panel(ui, ctx);
         self.center(ui, ctx);
@@ -880,6 +1125,15 @@ impl FuluApp {
                 }
                 if ui.button("重载外宗").clicked() {
                     self.attach_mcp();
+                }
+                ui.separator();
+                let taiji_label = if self.taiji_open {
+                    "太极 ×"
+                } else {
+                    "太极"
+                };
+                if ui.button(taiji_label).clicked() {
+                    self.taiji_open = !self.taiji_open;
                 }
             });
             ui.label(
@@ -1010,6 +1264,10 @@ impl FuluApp {
                         &receipt.seal[..16.min(receipt.seal.len())]
                     ));
                     ui.monospace(format!("正文 {}", receipt.text));
+                    // 重试不静默：provider 退避重试过就要让人看见。
+                    if receipt.retries_total > 0 {
+                        ui.monospace(format!("重试 {} 次后成功", receipt.retries_total));
+                    }
                     ui.separator();
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1879,8 +2137,9 @@ impl eframe::App for FuluApp {
         }
         self.ctx = Some(ctx.clone());
         self.poll_burn();
+        self.poll_taiji();
         self.poll_confirms();
-        if self.burning.is_some() {
+        if self.burning.is_some() || self.taiji_running {
             ctx.request_repaint();
         }
     }
