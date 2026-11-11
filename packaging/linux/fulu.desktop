@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=符箓台
+Name[en]=fulu Workbench
+Comment=符箓 · 本地优先的多智能体符箓台
+Exec=fulu-ui
+Terminal=false
+Categories=Development;
+Keywords=fulu;agent;local;

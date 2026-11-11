@@ -14,9 +14,11 @@ Rust 侧 `ModelManifest::validate()` 做同样检查，形成双保险。
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "models" / "manifest.json"
@@ -31,6 +33,25 @@ REQUIRED = (
     "license_url",
     "min_runtime",
 )
+# 权重来源域名白名单：清单里的 URL 就是将来 `model fetch` 会去下载的地方，
+# 允许任意域名等于把「静默下载任意内容」写进合规闸门，所以必须是白名单。
+ALLOWED_SOURCE_HOSTS = frozenset(
+    {
+        "huggingface.co",
+        "cdn-lfs.huggingface.co",
+        "cdn-lfs-us-1.huggingface.co",
+        "cdn-lfs-eu-1.huggingface.co",
+        "github.com",
+        "objects.githubusercontent.com",
+        "raw.githubusercontent.com",
+    }
+)
+# CI 里任何「检查不了」都必须判失败：静默跳过等于把闸门关掉。
+IN_CI = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
+
+
+def host_of(url: str) -> str:
+    return (urlparse(url).hostname or "").lower()
 
 
 def main() -> int:
@@ -80,6 +101,16 @@ def main() -> int:
             issues.append(f"{tag} 许可标注不是 lfm1.0，须复核合规")
         if not str(entry.get("source_url", "")).startswith("https://"):
             issues.append(f"{tag} source_url 必须为 HTTPS")
+        else:
+            source_host = host_of(str(entry.get("source_url", "")))
+            if source_host not in ALLOWED_SOURCE_HOSTS:
+                issues.append(
+                    f"{tag} source_url 主机 {source_host or '?'} 不在白名单："
+                    f"{', '.join(sorted(ALLOWED_SOURCE_HOSTS))}"
+                )
+        license_url = str(entry.get("license_url", ""))
+        if not license_url.startswith("https://"):
+            issues.append(f"{tag} license_url 必须为 HTTPS")
         if entry.get("runnable") and not entry.get("default_context_tokens", 0):
             issues.append(f"{tag} 可运行模型必须有默认上下文")
         if not entry.get("runnable") and entry.get("is_default"):
@@ -102,8 +133,13 @@ def main() -> int:
         ).stdout.strip()
         if tracked:
             issues.append(f"权重文件被纳入版本控制：{tracked}")
-    except (OSError, subprocess.CalledProcessError):
-        print("[WARN] 无法执行 git ls-files，跳过权重入库检查")
+    except (OSError, subprocess.CalledProcessError) as error:
+        # T31：CI 里「跳过」等于闸门失效，必须判红；非 CI 才允许降级为告警。
+        message = f"无法执行 git ls-files（{error}），权重入库检查未执行"
+        if IN_CI:
+            issues.append(message)
+        else:
+            print(f"[WARN] {message}；非 CI 环境允许降级，但请确保在仓库内运行")
 
     if issues:
         for issue in issues:

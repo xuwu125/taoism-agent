@@ -18,8 +18,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # M0/M4 之间：先产出轻量二进制包（不含权重）+ SHA256SUMS。
-  # 安装包（MSI / DMG / AppImage / DEB）与签名在 M4 接入，见 docs/02 第 8.2 节。
   build:
     strategy:
       fail-fast: false
@@ -46,38 +44,57 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
+            libfuse2
 
       - name: Build release binaries
         run: cargo build --release --locked --target ${{ matrix.target }} -p fulu-ui -p fulu-cli
 
-      - name: Package (Unix)
+      # 安装包版本号必须是数字三段式；非 vX.Y.Z 标签明确告警并回落 0.0.0，
+      # 绝不让 WiX/hdiutil 去猜一个版本。
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          if [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "value=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.0.0" >> "$GITHUB_OUTPUT"
+            echo "::warning::标签 $GITHUB_REF_NAME 不是 vX.Y.Z，安装包版本回落 0.0.0"
+          fi
+
+      - name: Package payload (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           BIN="target/${{ matrix.target }}/release"
           OUT="taoism-agent-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir -p "$OUT"
-          cp "$BIN/fulu" "$BIN/fulu-ui" "$OUT/"
-          cp LICENSE THIRD_PARTY_NOTICES.md models/manifest.json models/README.md "$OUT/"
+          STAGE="stage/$OUT"
+          mkdir -p "$STAGE" dist
+          cp "$BIN/fulu" "$BIN/fulu-ui" "$STAGE/"
+          cp LICENSE THIRD_PARTY_NOTICES.md models/manifest.json models/README.md "$STAGE/"
           # T07：二进制内嵌字体 = 分发字体，许可全文必须随包（THIRD_PARTY_NOTICES.md 第 4 节）。
-          mkdir -p "$OUT/licenses"
-          cp crates/fulu-ui/assets/fonts/*.txt crates/fulu-ui/assets/fonts/licenses/*.txt "$OUT/licenses/"
-          tar -czf "$OUT.tar.gz" "$OUT"
+          mkdir -p "$STAGE/licenses"
+          cp crates/fulu-ui/assets/fonts/*.txt crates/fulu-ui/assets/fonts/licenses/*.txt "$STAGE/licenses/"
+          tar -czf "dist/$OUT.tar.gz" -C stage "$OUT"
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
 
-      - name: Package (Windows)
+      - name: Package payload (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $bin = "target/${{ matrix.target }}/release"
           $out = "taoism-agent-${{ github.ref_name }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path $out | Out-Null
-          Copy-Item "$bin/fulu.exe", "$bin/fulu-ui.exe", "LICENSE", "THIRD_PARTY_NOTICES.md", "models/manifest.json", "models/README.md" -Destination $out
+          $stage = "stage/$out"
+          New-Item -ItemType Directory -Force -Path $stage, "dist" | Out-Null
+          Copy-Item "$bin/fulu.exe", "$bin/fulu-ui.exe", "LICENSE", "THIRD_PARTY_NOTICES.md", "models/manifest.json", "models/README.md" -Destination $stage
           # T07：与 Unix 一致，字体许可全文随包。
-          New-Item -ItemType Directory -Force -Path "$out/licenses" | Out-Null
-          Copy-Item "crates/fulu-ui/assets/fonts/*.txt", "crates/fulu-ui/assets/fonts/licenses/*.txt" -Destination "$out/licenses"
-          Compress-Archive -Path "$out/*" -DestinationPath "$out.zip"
+          New-Item -ItemType Directory -Force -Path "$stage/licenses" | Out-Null
+          Copy-Item "crates/fulu-ui/assets/fonts/*.txt", "crates/fulu-ui/assets/fonts/licenses/*.txt" -Destination "$stage/licenses"
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$out.zip"
 
       - name: Verify bundled font licenses
         shell: bash
@@ -85,17 +102,188 @@ jobs:
           set -euo pipefail
           OUT="taoism-agent-${{ github.ref_name }}-${{ matrix.target }}"
           for f in LICENSE-NotoSansSC.txt UFL.txt OFL.txt Hack-Regular.txt egui-icons.txt emoji-icon-font-mit-license.txt; do
-            if [ ! -s "$OUT/licenses/$f" ]; then echo "::error::发布包缺少字体许可全文 $f"; exit 1; fi
+            if [ ! -s "stage/$OUT/licenses/$f" ]; then echo "::error::发布包缺少字体许可全文 $f"; exit 1; fi
           done
-          echo "字体许可齐全：$(ls "$OUT/licenses" | wc -l) 份"
+          echo "字体许可齐全：$(ls "stage/$OUT/licenses" | wc -l) 份"
+
+      # ---------------- T26：安装包 ----------------
+
+      - name: Installer (Windows MSI)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # WiX 3 在 windows-latest 自带；缺失时直接失败，绝不产出一个「看起来像安装包」的假产物。
+          $candle = Get-Command candle.exe -ErrorAction SilentlyContinue
+          $light = Get-Command light.exe -ErrorAction SilentlyContinue
+          if (-not $candle -or -not $light) { throw "WiX (candle/light) 不可用：MSI 打包失败" }
+          $stage = (Resolve-Path "stage/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}").Path
+          $msi = "dist/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}.msi"
+          & candle.exe -nologo -dVersion=${{ steps.version.outputs.value }} -dBinDir=$stage -out "stage/fulu.wixobj" packaging/windows/fulu.wxs
+          if ($LASTEXITCODE -ne 0) { throw "candle 失败" }
+          & light.exe -nologo -out $msi "stage/fulu.wixobj"
+          if ($LASTEXITCODE -ne 0) { throw "light 失败" }
+          Get-Item $msi | Select-Object Name, Length
+
+      - name: Installer (macOS DMG)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="stage/Fulu.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$STAGE/fulu" "$STAGE/fulu-ui" "$APP/Contents/MacOS/"
+          sed "s/__VERSION__/${{ steps.version.outputs.value }}/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+          cp "$STAGE/LICENSE" "$STAGE/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/"
+          cp crates/fulu-ui/assets/fonts/licenses/*.txt "$APP/Contents/Resources/" || true
+          # 未签名时 hdiutil 仍能出包；签名在后续步骤按凭据条件执行。
+          hdiutil create -volname "fulu" -srcfolder "$APP" -ov -format UDZO \
+            "dist/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}.dmg"
+
+      - name: Installer (Linux DEB)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="stage/deb/fulu_${{ steps.version.outputs.value }}_amd64"
+          mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/share/applications" \
+                   "$PKG/usr/share/doc/fulu" "$PKG/usr/share/pixmaps"
+          cp "$STAGE/fulu" "$STAGE/fulu-ui" "$PKG/usr/bin/"
+          cp packaging/linux/fulu.desktop "$PKG/usr/share/applications/"
+          cp LICENSE THIRD_PARTY_NOTICES.md "$PKG/usr/share/doc/fulu/"
+          mkdir -p "$PKG/usr/share/doc/fulu/licenses"
+          cp crates/fulu-ui/assets/fonts/licenses/*.txt crates/fulu-ui/assets/fonts/*.txt "$PKG/usr/share/doc/fulu/licenses/"
+          cat > "$PKG/DEBIAN/control" <<EOF
+          Package: fulu
+          Version: ${{ steps.version.outputs.value }}
+          Section: devel
+          Priority: optional
+          Architecture: amd64
+          Maintainer: taoism-agent <noreply@example.invalid>
+          Depends: libc6, libxkbcommon0, libwayland-client0, libx11-6, libxcursor1, libxrandr2, libxi6, libgl1
+          Description: 符箓台 fulu - 本地优先的多智能体符箓
+           本地 LFM 模型驱动的多智能体系统：符（指令）/ 箓（授权名册）/
+           篆（编码书写）三层，配法坛运行时与缴符审计。不静默联网。
+          EOF
+          dpkg-deb --root-owner-group --build "$PKG" \
+            "dist/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}.deb"
+
+      # AppImage 额外依赖下载的 appimagetool 与 FUSE；失败不拖垮其它产物，
+      # 但必须留下明确告警（不伪装成功：没有产物就是没有）。
+      - name: Installer (Linux AppImage)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPDIR="stage/AppDir"
+          mkdir -p "$APPDIR/usr/bin"
+          cp "$STAGE/fulu" "$STAGE/fulu-ui" "$APPDIR/usr/bin/"
+          cp packaging/linux/fulu.desktop "$APPDIR/fulu.desktop"
+          python3 - <<'PY'
+          import struct, zlib
+          w = h = 256
+          rows = b''
+          for y in range(h):
+              row = b'\x00'
+              for x in range(w):
+                  border = x < 16 or y < 16 or x >= w - 16 or y >= h - 16
+                  row += bytes((0xB0, 0x2E, 0x1F, 0xFF)) if border else bytes((0xF6, 0xEF, 0xE2, 0xFF))
+              rows += row
+          def chunk(tag, data):
+              return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xFFFFFFFF)
+          png = (b'\x89PNG\r\n\x1a\n'
+                 + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
+                 + chunk(b'IDAT', zlib.compress(rows, 9))
+                 + chunk(b'IEND', b''))
+          open('stage/fulu.png', 'wb').write(png)
+          PY
+          cp stage/fulu.png "$APPDIR/fulu.png"
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/fulu-ui" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+          curl -fsSL -o appimagetool.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool.AppImage
+          ./appimagetool.AppImage --appimage-extract >/dev/null
+          ARCH=x86_64 ./squashfs-root/AppRun --no-appstream "$APPDIR" \
+            "dist/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}.AppImage"
+
+      # ---------------- T27：签名（有凭据才签，没有就明确标注未签名） ----------------
+
+      - name: Sign (Windows, only when certificate secrets exist)
+        if: runner.os == 'Windows'
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERT_B64)) {
+            "未签名构建：未配置 WINDOWS_CERT_PFX_BASE64 / WINDOWS_CERT_PASSWORD。" |
+              Out-File -Encoding utf8 "dist/UNSIGNED-${{ matrix.target }}.txt"
+            Write-Host "::warning::Windows 产物未签名（无签名凭据），已在发布资产中标注 UNSIGNED"
+            exit 0
+          }
+          $pfx = "$env:RUNNER_TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
+          $msi = "dist/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}.msi"
+          $files = @($msi, "stage/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}/fulu.exe", "stage/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}/fulu-ui.exe") | Where-Object { Test-Path $_ }
+          foreach ($f in $files) {
+            & signtool.exe sign /fd SHA256 /f $pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $f
+            if ($LASTEXITCODE -ne 0) { throw "signtool 签名失败：$f" }
+          }
+          Write-Host "已签名 $($files.Count) 个文件"
+
+      - name: Sign & notarize (macOS, only when credentials exist)
+        if: runner.os == 'macOS'
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG="dist/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}.dmg"
+          if [[ -z "${CERT_B64:-}" || -z "${APPLE_ID:-}" ]]; then
+            printf '未签名 / 未公证构建：缺少 APPLE_CERT_P12_BASE64、APPLE_ID、APPLE_TEAM_ID 或 APPLE_APP_PASSWORD。\n' \
+              > "dist/UNSIGNED-${{ matrix.target }}.txt"
+            echo "::warning::macOS 产物未签名未公证（无凭据），已在发布资产中标注 UNSIGNED"
+            exit 0
+          fi
+          echo "$CERT_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import "$RUNNER_TEMP/cert.p12" -k build.keychain -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
+          codesign --deep --force --options runtime --timestamp \
+            --sign "Developer ID Application" "stage/Fulu.app"
+          hdiutil create -volname "fulu" -srcfolder "stage/Fulu.app" -ov -format UDZO "$DMG"
+          xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$DMG"
 
       - name: Checksums
         shell: bash
         run: |
           set -euo pipefail
           NAME="taoism-agent-${{ github.ref_name }}-${{ matrix.target }}"
-          for file in "$NAME.tar.gz" "$NAME.zip"; do
-            if [ -f "$file" ]; then sha256sum "$file" >> "SHA256SUMS-${{ matrix.target }}.txt"; fi
+          for file in dist/*; do
+            base="$(basename "$file")"
+            case "$base" in
+              *.msi|*.dmg|*.deb|*.AppImage|*.tar.gz|*.zip)
+                if command -v sha256sum >/dev/null 2>&1; then
+                  sha256sum "$file" >> "SHA256SUMS-${{ matrix.target }}.txt"
+                else
+                  shasum -a 256 "$file" >> "SHA256SUMS-${{ matrix.target }}.txt"
+                fi
+                ;;
+            esac
           done
           cat "SHA256SUMS-${{ matrix.target }}.txt"
 
@@ -103,11 +291,35 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            taoism-agent-*.tar.gz
-            taoism-agent-*.zip
+            dist/*
             SHA256SUMS-*.txt
           fail_on_unmatched_files: false
           generate_release_notes: true
+
+  # T28：SBOM（CycloneDX）。单独 job，避免污染构建矩阵时间。
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate SBOM
+        run: cargo cyclonedx --format json --all
+      - name: Bundle SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find . -name '*.cdx.json' -not -path './target/*')
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::未生成任何 SBOM"; exit 1; fi
+          printf '%s\n' "${files[@]}"
+          tar -czf "taoism-agent-sbom-${{ github.ref_name }}.tar.gz" "${files[@]}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: taoism-agent-sbom-*.tar.gz
+          fail_on_unmatched_files: false
 
   # 离线 bundle 默认不跑：会下载约 1.1 GB 权重，且使我们成为 lfm1.0 的分发者。
   # 触发前必须确认：随包附 LICENSE 全文 + THIRD_PARTY_NOTICES.md + 保留全部署名。

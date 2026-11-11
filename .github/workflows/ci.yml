@@ -27,6 +27,8 @@ jobs:
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
           - { os: macos-15, target: aarch64-apple-darwin }
+          # T30：Intel macOS 仍在服役，不能只验 ARM。runner 用 macos-15-intel。
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
     steps:
       - uses: actions/checkout@v4
 
@@ -80,3 +82,33 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # T29：cargo-deny 的 advisories 与 RUSTSEC 官方 audit 口径不同，两者都留。
+  # 只读依赖数据库，不产生任何构建产物。
+  audit:
+    name: cargo audit (RUSTSEC)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # T30：ARM64 Linux 只做 **编译验证**（fulu-cli，不含 GUI）。
+  # GUI 交叉编译需要完整 arm64 X11 开发库与多架构环境，成本远高于收益，
+  # 因此明确不覆盖——这一条写在 docs/03 第 1 节第 4 条里，不假装做了。
+  cross-build:
+    name: cross build (aarch64-unknown-linux-gnu, CLI only)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross linker
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+      - name: Build CLI for ARM64 Linux
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --locked -p fulu-cli --target aarch64-unknown-linux-gnu

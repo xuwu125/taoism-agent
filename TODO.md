@@ -72,12 +72,12 @@
 
 # S5 · M4 发布流水线与合规
 
-- [ ] **T26 安装包格式** — 证据：`docs/02:255-258` 设计 MSI / DMG / AppImage / DEB；`release.yml:22` 注释「M4 接入」；当前只有 zip/tar.gz。做法：WiX / dmg / AppImage / deb 打包步骤 + 产物可安装冒烟。
-- [ ] **T27 签名与公证** — 证据：`docs/02:263,430`；需用户 Secrets（Authenticode 证书 / Developer ID）。做法：有凭据才签，**未配置时明确标注未签名不伪装**。阻塞：用户提供 Secrets。
-- [ ] **T28 SBOM（CycloneDX）** — 证据：`docs/02:249,263` 设计有，工作流无。做法：CI 生成并随 Release 发布。
-- [ ] **T29 `cargo audit` 接入 CI** — 证据：`docs/02:248,436` 设计有，`ci.yml` 无。做法：加独立 job（advisories），与 `cargo deny` 不重复冲突。
-- [ ] **T30 CI 矩阵补 macOS Intel / ARM64 Linux 评估** — 证据：`ci.yml:27-29` 只有 3 项；`docs/02:261,478` 把 `aarch64-unknown-linux-gnu` 列为可选待确认。做法：补 Intel macOS 编译；ARM64 Linux 由用户拍板是否纳入。
-- [ ] **T31 清单闸门不许静默跳过** — 证据：`check_model_manifest.py:105-106` `git ls-files` 失败就 `[WARN] 跳过权重入库检查`；`:81` 只校验 `source_url` 前缀。做法：CI 内失败即红（非 CI 才允许降级），并校验 URL 域名白名单。验收：故意破坏环境时脚本返回非 0。
+- [~] **T26 安装包格式** — 证据：`docs/02:255-258` 设计 MSI / DMG / AppImage / DEB；`release.yml:22` 注释「M4 接入」；当前只有 zip/tar.gz。做法：WiX / dmg / AppImage / deb 打包步骤 + 产物可安装冒烟。**脚本已全部落地（docs/02 第 24.1 节）：Windows MSI（WiX 3，perUser，无 candle 即判失败）、macOS DMG（Fulu.app + hdiutil）、Linux DEB（dpkg-deb + 运行库 Depends）、AppImage（best-effort，图标 CI 现场生成）；待下一次打 tag 由 CI 实跑确认安装/卸载，本机无 WiX/hdiutil/dpkg 不能代验证。**
+- [x] **T27 签名与公证** — 证据：`docs/02:263,430`；需用户 Secrets（Authenticode 证书 / Developer ID）。做法：有凭据才签，**未配置时明确标注未签名不伪装**。**已落地：Windows `signtool`、macOS `codesign + notarytool + stapler`，凭据全部缺位时写 `UNSIGNED-<target>.txt` 随发布资产上传并打 `::warning::`（docs/02 第 24.2 节）。实际签名仍阻塞：需你提供 Secrets。**
+- [x] **T28 SBOM（CycloneDX）** — 证据：`docs/02:249,263` 设计有，工作流无。做法：CI 生成并随 Release 发布。**已落地：独立 `sbom` job（cargo-cyclonedx --all → `*.cdx.json` → tar.gz 上传，零产物即判失败）。**
+- [x] **T29 `cargo audit` 接入 CI** — 证据：`docs/02:248,436` 设计有，`ci.yml` 无。做法：加独立 job（advisories），与 `cargo deny` 不重复冲突。**已落地：`audit` job（`rustsec/audit-check@v2`），与 cargo-deny 并行保留。**
+- [x] **T30 CI 矩阵补 macOS Intel / ARM64 Linux 评估** — 证据：`ci.yml:27-29` 只有 3 项；`docs/02:261,478` 把 `aarch64-unknown-linux-gnu` 列为可选待确认。做法：补 Intel macOS 编译；ARM64 Linux 由用户拍板是否纳入。**已落地：quality 增加 `macos-15-intel`；新增 `cross-build` 只编 `fulu-cli` 到 `aarch64-unknown-linux-gnu`（GUI 交叉编译明确不覆盖，见 docs/03 第 1 节第 4 条与 docs/02 第 24.4 节）。**
+- [x] **T31 清单闸门不许静默跳过** — 证据：`check_model_manifest.py:105-106` `git ls-files` 失败就 `[WARN] 跳过权重入库检查`；`:81` 只校验 `source_url` 前缀。做法：CI 内失败即红（非 CI 才允许降级），并校验 URL 域名白名单。验收：故意破坏环境时脚本返回非 0。**已落地：`IN_CI` 判定（CI/GITHUB_ACTIONS）+ 主机白名单（huggingface / github 系）；本机实测仓库内与 CI=1 均 exit 0，白名单对现有清单全绿（docs/02 第 24.5 节）。**
 - [~] **T32 文档根配套 + 性能预算实测**（`CHANGELOG` / `SECURITY` / `CONTRIBUTING` 已补；空闲内存 / 二进制体积 / 启动时间的实测基线**未做**） — 证据：`README.md:9-16` 文档表只有 4 份；仓库无 `CHANGELOG` / `SECURITY` / `CONTRIBUTING` / 使用手册；`docs/02:283,440` 内存/体积预算「M1 起实测校准」从未做。做法：补齐文档 + 出一份实测基线（空闲内存、二进制体积、启动时间），**不承诺达标**。
 
 # S6 · 符箓台完整 UI 与真人验收

@@ -14,6 +14,7 @@
 - **远程 MCP over HTTPS（T19，安全边界变更，用户已批准）**：`McpHttpsClient` 把 TLS 交给系统 `curl`（fulu 依赖树仍零 TLS）；主机白名单 `~/.fulu/remote-mcp.json`（`fulu mcp remote allow/deny/list`）；禁重定向、TLS ≥ 1.2、拒绝 IP 字面量 / localhost / userinfo；敏感请求头必须是 `${ENV:VAR}` 引用，字面量拒绝连接；8 MiB / 60s 硬上限。
 - **摄行电脑控制（T16，最高权限）**：`shexing.type / .key / .click / .screenshot` 默认**不注册**（工具不存在），需 `FULU_ALLOW_SHEXING=1` + `--shexing` 双钥匙；授权 `Limited + Destructive`（逐次确认）+ 配额 20；键位白名单拒绝注入，截屏只写工作区 `.png`；非 Windows 如实报不支持。
 - **决策与设计文档**：新增 `docs/03-决策记录与增量设计.md`——T41 七条待确认事项逐条定案、T13 provider/SSE/能力协商设计稿、T19 威胁模型、T16 风险评估。
+- **M4 发布流水线（T26–T31）**：Windows MSI（WiX 3，perUser）、macOS DMG（Fulu.app + hdiutil）、Linux DEB 与 AppImage（best-effort）；签名有凭据才签、缺凭据写 `UNSIGNED-<target>.txt` 并告警；新增 SBOM（CycloneDX）与 `cargo audit` job；CI 补 Intel macOS 与 ARM64 Linux（CLI build-only）；清单闸门在 CI 内不再允许静默跳过，且 `source_url` 走域名白名单。安装包步骤待 CI 实跑验证（本机无 WiX/hdiutil/dpkg）。
 
 ## v0.3.0（2026-11-11）
 

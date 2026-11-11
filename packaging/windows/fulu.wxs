@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  T26：Windows MSI（WiX 3.x）。
+
+  取舍：
+  - perUser 安装（`LocalAppDataFolder`），不需要管理员权限；
+  - 只装 fulu.exe（命令行）与 fulu-ui.exe（符箓台），外加许可与清单；
+  - 卸载即删干净，不写 HKLM、不改系统级 PATH（只往用户 PATH 末尾追加）。
+
+  构建（CI 里执行）：
+    candle.exe -dVersion=0.3.1 -dBinDir=<staging> -out fulu.wixobj packaging/windows/fulu.wxs
+    light.exe  -out fulu.msi fulu.wixobj
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="符箓台 fulu"
+           Language="2052"
+           Version="$(var.Version)"
+           Manufacturer="taoism-agent"
+           UpgradeCode="6F3B2C1A-8D4E-4B9F-9C2A-1E5D7A3B6C90">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" Platform="x64" />
+    <MajorUpgrade DowngradeErrorMessage="已安装更新的版本，请先卸载旧版本。" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="AppDir" Name="fulu">
+          <Component Id="Binaries" Guid="0B1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D" Win64="yes">
+            <File Id="FuluExe" Source="$(var.BinDir)\fulu.exe" KeyPath="yes" />
+            <File Id="FuluUiExe" Source="$(var.BinDir)\fulu-ui.exe" />
+            <File Id="LicenseFile" Source="$(var.BinDir)\LICENSE" />
+            <File Id="NoticesFile" Source="$(var.BinDir)\THIRD_PARTY_NOTICES.md" />
+            <File Id="ManifestFile" Source="$(var.BinDir)\manifest.json" />
+          </Component>
+          <!-- 只往用户 PATH 追加，不动系统 PATH；卸载时由 Windows Installer 回滚。 -->
+          <Component Id="UserPath" Guid="1C2D3E4F-5A6B-4C7D-9E8F-0A1B2C3D4E5F" Win64="yes">
+            <Environment Id="PathEntry" Name="PATH" Value="[AppDir]" Part="last" Action="set" System="no" />
+            <RegistryValue Root="HKCU" Key="Software\taoism-agent\fulu" Name="installed"
+                           Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Title="符箓台" Level="1">
+      <ComponentRef Id="Binaries" />
+      <ComponentRef Id="UserPath" />
+    </Feature>
+  </Product>
+</Wix>
