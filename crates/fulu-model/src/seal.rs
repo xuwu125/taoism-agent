@@ -183,9 +183,20 @@ mod tests {
         ));
     }
 
+    /// 测试固定从「未固化」出发，不依赖仓库清单当前是否已被 `model seal`
+    /// 写回真实值（写回后 default 已带官方 sha256，直接封会冲突）。
+    fn unsealed_manifest() -> ModelManifest {
+        let mut manifest = ModelManifest::embedded().unwrap();
+        for entry in &mut manifest.entries {
+            entry.bytes = None;
+            entry.sha256 = None;
+        }
+        manifest
+    }
+
     #[test]
     fn apply_seal_is_idempotent_and_conflict_resistant() {
-        let mut manifest = ModelManifest::embedded().unwrap();
+        let mut manifest = unsealed_manifest();
         let proposal = parse_tree_metadata(&sample_tree(), "LFM3-1.7B-Q4_K_M.gguf").unwrap();
         apply_seal(&mut manifest, "default", &proposal).unwrap();
         let entry = manifest.entry("default").unwrap();
@@ -212,7 +223,7 @@ mod tests {
     #[test]
     fn unsealed_entries_still_fail_verification_ready() {
         // 固化只动被点名的槽位，其余槽位保持 UNVERIFIED 语义。
-        let mut manifest = ModelManifest::embedded().unwrap();
+        let mut manifest = unsealed_manifest();
         let proposal = parse_tree_metadata(&sample_tree(), "LFM3-1.7B-Q4_K_M.gguf").unwrap();
         apply_seal(&mut manifest, "default", &proposal).unwrap();
         for entry in &manifest.entries {

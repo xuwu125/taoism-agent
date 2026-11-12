@@ -26,8 +26,8 @@
       "default_context_tokens": 8192,
       "arch": "lfm3",
       "approx_size": "1.1 GB",
-      "bytes": null,
-      "sha256": null,
+      "bytes": 1099627808,
+      "sha256": "3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4",
       "min_runtime": "llama.cpp >= b11960 (v0.8.0)",
       "sampling": {
         "temperature_milli": 100,

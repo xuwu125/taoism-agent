@@ -169,6 +169,10 @@ mod tests {
             .unwrap()
             .clone();
         entry.file = "test.gguf".into();
+        // 测试固定从「未固化」出发：仓库清单可能已被 `model seal` 写回真实值，
+        // 那会让「缺摘要 → UNVERIFIED」「离线导入」这类用例的语义跑偏。
+        entry.bytes = None;
+        entry.sha256 = None;
         entry
     }
 

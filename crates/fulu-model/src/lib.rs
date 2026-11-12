@@ -105,18 +105,17 @@ mod tests {
 
     #[test]
     fn missing_weight_is_reported_honestly() {
-        let entry = ModelManifest::embedded()
+        let mut entry = ModelManifest::embedded()
             .unwrap()
             .default_entry()
             .unwrap()
             .clone();
-        // 若本机恰好已导入权重，则只断言状态标签合法。
+        // 固定指向一个不可能存在的文件：只验「缺权重如实报 Missing」，绝不
+        // 去碰本机真实 1.1 GB 权重（那会让 CI 白跑一次全量 sha256）。
+        entry.file = format!("fulu-test-absent-{}.gguf", std::process::id());
         match status(&entry) {
             ModelStatus::Missing { .. } => {}
-            other => assert!(matches!(
-                other.label().as_str(),
-                "UNVERIFIED" | "VERIFIED" | "MISMATCH" | "UNREADABLE"
-            )),
+            other => panic!("缺权重时应报 Missing，实际 {}", other.label()),
         }
     }
 }

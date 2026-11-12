@@ -8,7 +8,7 @@ use fulu_app::{AltarSession, ENDPOINT_ENV, PromptMode, RiskClass};
 use fulu_download::{DownloadConfig, DownloadError, Downloaded, ProxyAddr, ResponseHead};
 use fulu_model::{
     ModelManifest, VerifyStatus, apply_seal, cache_dir, digest_file_state, import_file,
-    metadata_url, model_path, parse_tree_metadata, verify_file,
+    metadata_url, model_path, parse_tree_metadata, status, verify_file,
 };
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
@@ -164,8 +164,10 @@ fn model(args: &[String]) -> i32 {
     }
 }
 
+/// 清单读取：统一走 `ModelManifest::runtime()`（优先 seal 写回的文件清单，
+/// 无文件时回退编译期内嵌快照），保证 verify/list/import 与 doctor 同口径。
 fn manifest_or_fail() -> Result<ModelManifest, i32> {
-    match ModelManifest::embedded() {
+    match ModelManifest::runtime() {
         Ok(manifest) => Ok(manifest),
         Err(error) => {
             eprintln!("[ERR] {error}");
@@ -183,7 +185,8 @@ fn model_list() -> i32 {
         manifest.schema_version, manifest.updated, manifest.policy.engine, manifest.policy.bind
     );
     for entry in &manifest.entries {
-        let state = fulu_app::model_status(&entry.slot).unwrap_or_else(|_| "UNKNOWN".into());
+        // 用同一份（可能是 seal 写回的）清单算状态，别再读编译期快照。
+        let state = status(entry).label();
         println!(
             "  - {:<13} {:<22} {:<12} {:<8} runnable={:<5} default={:<5} {}",
             entry.slot,

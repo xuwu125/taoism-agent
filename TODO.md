@@ -63,8 +63,8 @@
 
 # S4 · M2.1 权重与真机推理（**需用户授权 / 外部依赖**）
 
-- [ ] **T20 权重 `bytes`/`sha256` 固化** — 证据：`models/manifest.json` 8 个 `null`；`fulu-model/src/manifest.rs` 单测锁定「不编造」。做法：固化机制已落地——`fulu model seal [槽位] --confirm` 从 HF LFS 官方元数据取 sha256/size 回写清单（`fulu-model::seal` 纯函数：非 LFS 拒绝、64 位十六进制校验、冲突拒绝改写）；剩余动作仅是**执行**一次 seal + fetch（1.1 GB 公网下载需用户明确批准）。阻塞：用户批准。
-- [x] **T21 HTTPS 公网下载链路** — 做法：新 crate `fulu-download`（rustls + webpki-roots，TLS 白名单唯一例外；重定向强制 https、CONNECT 代理、流式落盘 + sha256、断点续传、瞬态错误限 3 次重试）；`fulu model fetch --i-understand-license` 三道闸门（许可 / 清单已固化 / 槽位可运行）在发起任何网络请求前拦截；sha256+字节数双校验通过才原子改名。证据：`crates/fulu-download`（12 单测 + 9 真实 TLS 集成）、docs/02 第 39 节。**未验：对 HF 的真实下载未执行（1.1 GB 需用户批准）；当前清单 sha256 仍 null，fetch 被闸门正确拦截。**
+- [x] **T20 权重 `bytes`/`sha256` 固化** — **2026-11-12 用户批准后已执行**：`fulu model seal default --confirm --proxy http://127.0.0.1:7890` 从 HF LFS 官方元数据取回 `sha256=3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4` / `bytes=1099627808` 并回写清单（自动备份 `.bak`）。机制见 `fulu-model::seal`（非 LFS 拒绝、64 位十六进制校验、冲突拒绝改写、幂等）。**仅 default 槽位固化**：lowmem / fallback / finetune_base 仍为 null，保持 UNVERIFIED 语义。`check_model_manifest.py` 与 8 条 unittest 复核全绿（详见 docs/02 第 39.5 节）。
+- [x] **T21 HTTPS 公网下载链路** — 做法：新 crate `fulu-download`（rustls + webpki-roots，TLS 白名单唯一例外；重定向强制 https、CONNECT 代理、流式落盘 + sha256、断点续传、瞬态错误限 3 次重试）；`fulu model fetch --i-understand-license` 三道闸门（许可 / 清单已固化 / 槽位可运行）在发起任何网络请求前拦截；sha256+字节数双校验通过才原子改名。证据：`crates/fulu-download`（12 单测 + 10 真实 TLS 集成）、docs/02 第 39 节。**2026-11-12 真实下载已执行**（用户明确批准）：3 分 16 秒 / 1 跳 https 重定向 / 1,099,627,808 字节 / sha256 与上游 LFS 及 Python 独立复算三方一致，`model verify` → `[VERIFIED]`。**仍未验**：真实 llama-server 加载（T22/T23）、断点续传实战（一次直下未触发重试）、Actions 实跑与 gh 写回。
 - [ ] **T22 `llama-server` 进程生命周期管理** — 证据：`docs/02:562`「由用户手动完成，尚未进 Rust」；`provider/src/local.rs:26,62`。做法：按需拉起（仅回环端口）、健康检查、闲置退出、异常清理（Drop/超时）；**不静默启动**，须显式命令或明确配置。阻塞：本机需有 `llama-server` 二进制。
 - [ ] **T23 真机端到端验收** — 证据：`docs/02:817,822` 敕门卡片真人端到端待权重；`README.md:7`。做法：真模型 + 真 MCP + GUI 逐次弹窗完整跑一遍；记录模型效果**不承诺**。依赖 T20–T22。
 - [x] **T24 模型 bundle 分发合规**（2026-11-11，`docs/02` 第 38 节）：`gen_compliance_notes.py` 四模式闸门（缺字段拒、`--require-bundle` 对 null sha256 拒、防「权重误标 MIT」）、8 条 unittest 进 CI；release.yml 三处接线（build Compliance gate、compliance-notes 锚点幂等写回、model-bundle 下载前 sha256 硬闸门 + 下载后比对 + 上传前再闸），原 echo 已删。**当前清单 sha256 为 null → bundle 被硬拒绝，这正是未固化校验值时的正确行为**。**未验**：Actions 实跑与 gh 写回（本机无 gh）
@@ -106,7 +106,7 @@ S1(T01-T08) ──> S2(T09,T10) ──> S3(T14-T16)
                     │
                     └──> S4(T20-T23，需用户授权) ──> S5(T24,T26-T28)
 S1(T01,T02) ──> S6(T34,T35,T36)
-T27（签名 Secrets）/ T20（1.1GB 下载）= 外部阻塞项；T37 已于 2026-11-11 在 Windows 10 通过（macOS / Linux 的 IME 并入 T38，仍缺硬件）
+T27（签名 Secrets）= 外部阻塞项；T20/T21 已于 2026-11-12 用户批准后完成真实下载；T37 已于 2026-11-11 在 Windows 10 通过（macOS / Linux 的 IME 并入 T38，仍缺硬件）
 ```
 
 ## 开发进度

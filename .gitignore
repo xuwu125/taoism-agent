@@ -26,6 +26,7 @@ rustc-ice-*.txt
 *.gguf
 *.safetensors
 models/cache/
+models/manifest.json.bak
 
 # 本地运行产物
 fulu.log

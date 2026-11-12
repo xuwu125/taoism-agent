@@ -27,7 +27,7 @@
 
 ## 校验策略（诚实边界）
 
-清单里的 `bytes` 与 `sha256` 在权重首次下载前保持 `null`：固化值**只来自 HF LFS 元数据**（`fulu model seal`），绝不手工猜测；未固化时校验结果一律 `UNVERIFIED`。
+清单里的 `bytes` 与 `sha256` **只来自 HF LFS 元数据**（`fulu model seal`），绝不手工猜测；未固化的槽位校验结果一律 `UNVERIFIED`。截至 2026-11-12，`default` 槽位已固化（1099627808 字节 / sha256 `3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4`）并完成真实下载与三方比对；lowmem / fallback / finetune_base 仍为 `null`。运行时清单优先读文件清单（`ModelManifest::runtime()`），编译期内嵌快照只在安装环境无文件清单时回退。
 
 - `fulu model verify <file>`：文件存在时计算真实 SHA256 与字节数；若清单已登记摘要则逐项比对；若未登记，结果明确标记 `UNVERIFIED`（只报告实测值），**绝不输出「校验通过」**。
 - `fulu model import <file>`：离线复制到缓存目录，同样把 unverified 状态写入结果。Rust 侧**不加载权重**，只校验文件并登记状态；实际推理由用户启动的外部 `llama-server` 负责（M3 接进程生命周期管理）。

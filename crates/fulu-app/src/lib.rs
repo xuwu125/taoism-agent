@@ -127,13 +127,25 @@ impl DoctorReport {
 }
 
 /// 环境体检：不联网、不加载权重、不启动推理进程。
+/// 用运行时清单（seal 写回后的文件优先），不用编译期快照。
 pub fn doctor() -> Result<DoctorReport, AppError> {
-    let manifest = ModelManifest::embedded().map_err(|e| AppError::Manifest(e.to_string()))?;
+    let manifest = ModelManifest::runtime().map_err(|e| AppError::Manifest(e.to_string()))?;
+    doctor_with_path(&manifest, None)
+}
+
+/// 可注入权重路径（测试与嵌入方）：`None` 表示用清单推导的默认位置。
+/// 测试据此避开本机真实 1.1 GB 权重，不必每次体检都全量 sha256。
+fn doctor_with_path(
+    manifest: &ModelManifest,
+    weights_path: Option<&Path>,
+) -> Result<DoctorReport, AppError> {
     let issues = manifest.validate();
     let default = manifest
         .default_entry()
         .map_err(|e| AppError::Manifest(e.to_string()))?;
-    let path = model_path(default);
+    let path = weights_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| model_path(default));
     let model_status = if path.exists() {
         match verify_file(&path, default) {
             Ok(verification) => match &verification.status {
@@ -169,9 +181,9 @@ pub fn doctor() -> Result<DoctorReport, AppError> {
     })
 }
 
-/// 使用编译期清单查看某槽位的状态（供 CLI `model list` 复用）。
+/// 使用运行时清单查看某槽位的状态（供 GUI 状态栏复用）。
 pub fn model_status(slot: &str) -> Result<String, AppError> {
-    let manifest = ModelManifest::embedded().map_err(|e| AppError::Manifest(e.to_string()))?;
+    let manifest = ModelManifest::runtime().map_err(|e| AppError::Manifest(e.to_string()))?;
     let entry = manifest
         .entry(slot)
         .ok_or_else(|| AppError::Manifest(format!("未知槽位：{slot}")))?;
@@ -1612,8 +1624,13 @@ mod tests {
     use fulu_audit::EventKind;
 
     #[test]
-    fn doctor_reports_embedded_model_without_touching_disk() {
-        let report = doctor().unwrap();
+    fn doctor_reports_model_without_touching_real_weights() {
+        // 注入一个绝不存在的权重路径：本机真有权重时也不做 1.1 GB 全量哈希。
+        let manifest = ModelManifest::runtime().unwrap();
+        let absent =
+            std::env::temp_dir().join(format!("fulu-doctor-absent-{}.gguf", std::process::id()));
+        let report = doctor_with_path(&manifest, Some(&absent)).unwrap();
+        assert!(report.model_status.contains("MISSING"));
         assert_eq!(report.model_id, "lfm3-1.7b-q4km");
         assert!(report.license.contains("lfm1.0"));
         assert!(report.manifest_issues.is_empty());

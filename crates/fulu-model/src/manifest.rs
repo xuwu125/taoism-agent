@@ -112,6 +112,30 @@ impl ModelManifest {
         EMBEDDED_MANIFEST.parse()
     }
 
+    /// 运行时清单：`model seal` 写回的是**文件**清单（cwd/models/manifest.json
+    /// 或 `FULU_MANIFEST`），编译期内嵌快照不会自动更新。优先读文件，且文件
+    /// 存在但解析失败时明确报错——绝不静默回退到旧快照，把已固化的 sha256
+    /// 误报成 UNVERIFIED；安装后的轻量包没有文件清单时才回退内嵌。
+    pub fn runtime() -> Result<Self, ManifestError> {
+        Self::runtime_from(
+            std::env::var("FULU_MANIFEST").ok(),
+            std::env::current_dir().ok(),
+        )
+    }
+
+    fn runtime_from(
+        env_path: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<Self, ManifestError> {
+        let candidate = env_path
+            .map(std::path::PathBuf::from)
+            .or_else(|| cwd.map(|dir| dir.join("models").join("manifest.json")));
+        if let Some(path) = candidate.filter(|path| path.is_file()) {
+            return Self::load(&path);
+        }
+        Self::embedded()
+    }
+
     pub fn entry(&self, slot: &str) -> Option<&ModelEntry> {
         self.entries.iter().find(|entry| entry.slot == slot)
     }
@@ -218,15 +242,67 @@ mod tests {
 
     #[test]
     fn no_fabricated_digests() {
-        // 固化前守卫：所有精确字节数与摘要必须为空，而不是编造的值。
-        // 注意：`model seal --confirm` 用 HF LFS 官方元数据固化后，本测试需要随之
-        // 放宽为「每个已固化条目的值都必须来自 seal 的输出」——那时值不再是 null，
-        // 但依然不许手写猜测值。
+        // 「不编造」的口径：已固化的值只能来自 `model seal`（HF LFS 官方元数据），
+        // 因此必须成对出现且格式合法；未固化条目保持 null。绝不在这里写死某个
+        // 具体摘要——那才是编造。CI 的 check_model_manifest.py 做同样检查。
         for entry in manifest().entries {
-            assert!(entry.bytes.is_none(), "{} 的字节数尚未固化", entry.slot);
-            assert!(entry.sha256.is_none(), "{} 的 sha256 尚未固化", entry.slot);
-            assert!(!entry.verification_ready());
+            match (&entry.bytes, &entry.sha256) {
+                (None, None) => assert!(!entry.verification_ready()),
+                (Some(bytes), Some(sha)) => {
+                    assert!(*bytes > 0, "{} 的字节数必须为正", entry.slot);
+                    assert_eq!(sha.len(), 64, "{} 的 sha256 必须是 64 位", entry.slot);
+                    assert!(
+                        sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                        "{} 的 sha256 必须是十六进制",
+                        entry.slot
+                    );
+                    assert!(entry.verification_ready());
+                }
+                _ => panic!("{} 的 bytes / sha256 必须成对固化，不许半填", entry.slot),
+            }
         }
+    }
+
+    #[test]
+    fn runtime_manifest_prefers_sealed_file_over_embedded_snapshot() {
+        let mut sealed = manifest();
+        let default = sealed
+            .entries
+            .iter_mut()
+            .find(|entry| entry.slot == "default")
+            .expect("默认槽位");
+        default.bytes = Some(1_099_627_808);
+        default.sha256 =
+            Some("3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4".into());
+        let text = serde_json::to_string(&sealed).expect("序列化清单");
+        let path =
+            std::env::temp_dir().join(format!("fulu-runtime-sealed-{}.json", std::process::id()));
+        std::fs::write(&path, text).expect("写临时清单");
+        let loaded = ModelManifest::runtime_from(Some(path.to_string_lossy().into_owned()), None)
+            .expect("文件清单应可读");
+        assert!(loaded.entry("default").unwrap().verification_ready());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn runtime_manifest_falls_back_to_embedded_when_no_file() {
+        let path =
+            std::env::temp_dir().join(format!("fulu-runtime-absent-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let loaded = ModelManifest::runtime_from(Some(path.to_string_lossy().into_owned()), None)
+            .expect("无文件时应回退内嵌快照");
+        assert_eq!(loaded.entries.len(), manifest().entries.len());
+    }
+
+    #[test]
+    fn runtime_manifest_rejects_broken_file_instead_of_silently_falling_back() {
+        let path =
+            std::env::temp_dir().join(format!("fulu-runtime-broken-{}.json", std::process::id()));
+        std::fs::write(&path, "{ this is not json").expect("写损坏清单");
+        let error = ModelManifest::runtime_from(Some(path.to_string_lossy().into_owned()), None)
+            .expect_err("损坏文件必须明确报错，绝不静默回退到旧快照");
+        assert!(error.to_string().contains("解析失败"), "{error}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
