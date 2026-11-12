@@ -8,7 +8,9 @@ use fulu_audit::{AuditLog, EventKind};
 use fulu_context::{SessionContext, collect as collect_context};
 use fulu_core::{Talisman, TalismanState};
 use fulu_mcp::{McpServerInfo, RiskOverrides, RiskSource};
-use fulu_model::{ModelManifest, VerifyStatus, model_path, status, verify_file};
+use fulu_model::{
+    ModelManifest, VerifyStatus, digest_cache, model_path, status, verify_file_cached,
+};
 use fulu_orchestrator::NodeExecutor;
 use fulu_prompt::{CORE_TEXT, LayerCaps, LayerId, PromptDraft, assemble};
 use fulu_provider::{BearerToken, Health, LocalLfmProvider};
@@ -147,7 +149,9 @@ fn doctor_with_path(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| model_path(default));
     let model_status = if path.exists() {
-        match verify_file(&path, default) {
+        // doctor 与 list 一样走 path+size+mtime 缓存（显式校验命令 model verify
+        // 仍全量哈希）；注入的不存在路径在上面的 exists 分支就被拦住了。
+        match verify_file_cached(&path, default, &digest_cache::cache_file()) {
             Ok(verification) => match &verification.status {
                 VerifyStatus::Verified => "VERIFIED".into(),
                 VerifyStatus::Unverifiable(reason) => format!("UNVERIFIED（{reason}）"),

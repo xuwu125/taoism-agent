@@ -6,10 +6,12 @@
 //! - M0 不发起任何网络请求；`model fetch` 当前是**许可 + 校验闸门**，
 //!   公网 HTTPS 下载与摘要固化仍列为 M2.1 待办（见 TODO.md T20/T21）。
 
+pub mod digest_cache;
 pub mod manifest;
 pub mod seal;
 pub mod verify;
 
+pub use digest_cache::verify_file_cached;
 pub use manifest::{
     EMBEDDED_MANIFEST, ManifestError, ModelEntry, ModelManifest, ModelPolicy, ModelSampling,
 };
@@ -82,7 +84,9 @@ pub fn status(entry: &ModelEntry) -> ModelStatus {
     if !path.exists() {
         return ModelStatus::Missing { expected: path };
     }
-    match verify_file(&path, entry) {
+    // 带 path+size+mtime 缓存：list / doctor / GUI 启动不再每次全量哈希 1.1 GB。
+    // 显式校验命令 `model verify` 仍走 verify_file（全量，不走任何缓存）。
+    match verify_file_cached(&path, entry, &digest_cache::cache_file()) {
         Ok(verification) => ModelStatus::Present { verification },
         Err(error) => ModelStatus::Unreadable {
             path,

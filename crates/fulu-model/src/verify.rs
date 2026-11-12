@@ -81,12 +81,11 @@ pub fn digest_file_state(path: &Path) -> Result<(u64, Sha256), VerifyError> {
     Ok((total, hasher))
 }
 
-pub fn verify_file(path: &Path, entry: &ModelEntry) -> Result<Verification, VerifyError> {
-    let (bytes, sha256) = digest_file(path)?;
+/// 清单比对判据（verify_file 与 digest_cache 共用，单一事实源）。
+pub(crate) fn judge(bytes: u64, sha256: &str, entry: &ModelEntry) -> VerifyStatus {
     let expected_hash = entry.sha256.as_deref();
     let expected_bytes = entry.bytes;
-
-    let status = match (expected_hash, expected_bytes) {
+    match (expected_hash, expected_bytes) {
         (Some(expected_hash), Some(expected_bytes)) => {
             if sha256 != expected_hash {
                 VerifyStatus::Mismatch(format!("sha256 不符：期望 {expected_hash}，实测 {sha256}"))
@@ -103,8 +102,12 @@ pub fn verify_file(path: &Path, entry: &ModelEntry) -> Result<Verification, Veri
             "清单未登记 sha256（官方仅公布标称体积 {}）；本轮只报告实测值，不判定通过",
             entry.approx_size
         )),
-    };
+    }
+}
 
+pub fn verify_file(path: &Path, entry: &ModelEntry) -> Result<Verification, VerifyError> {
+    let (bytes, sha256) = digest_file(path)?;
+    let status = judge(bytes, &sha256, entry);
     Ok(Verification {
         path: path.to_path_buf(),
         bytes,

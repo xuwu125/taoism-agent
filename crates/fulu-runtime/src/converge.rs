@@ -86,7 +86,13 @@ pub fn evaluate(criterion: &Criterion, output: &str) -> Convergence {
             }
         }
         Criterion::MaxLen(limit) => {
-            if length <= *limit {
+            if trimmed.is_empty() && *limit > 0 {
+                // 空正文不是有效回执：LFM3 把思考放 reasoning_content，短预算下
+                // 思考耗尽后正文是空串，数学上满足「≤N」却毫无回答价值。
+                // 按「绝不在焚化后看起来完成了就算成功」的红线判未达标；
+                // `output.len <= 0`（limit=0）是显式要求空输出，如实放行。
+                Convergence::Pending("正文为空（可能思考耗尽预算）；上限类判据不接受空回执".into())
+            } else if length <= *limit {
                 Convergence::Achieved
             } else {
                 Convergence::Pending(format!("输出 {length} 字，超过上限 {limit} 字"))
@@ -158,5 +164,29 @@ mod tests {
             Convergence::Pending("模型未给出任何回执".into())
         );
         assert_eq!(evaluate(&Criterion::Success, "回执"), Convergence::Achieved);
+    }
+
+    /// T23 真机隐患回归：LFM3 思考耗尽预算后正文空串，不得判达标。
+    #[test]
+    fn empty_reply_never_satisfies_an_upper_bound_criterion() {
+        let criterion = parse("output.len <= 20").unwrap();
+        assert_eq!(
+            evaluate(&criterion, ""),
+            Convergence::Pending("正文为空（可能思考耗尽预算）；上限类判据不接受空回执".into())
+        );
+        assert_eq!(
+            evaluate(&criterion, "   \n\t"),
+            Convergence::Pending("正文为空（可能思考耗尽预算）；上限类判据不接受空回执".into())
+        );
+        // 非空正文行为不变
+        assert_eq!(evaluate(&criterion, "2"), Convergence::Achieved);
+    }
+
+    /// `output.len <= 0` 是显式要求空输出，属于明确意图，如实放行。
+    #[test]
+    fn explicit_zero_upper_bound_still_accepts_empty_reply() {
+        let criterion = parse("output.len <= 0").unwrap();
+        assert_eq!(criterion, Criterion::MaxLen(0));
+        assert_eq!(evaluate(&criterion, ""), Convergence::Achieved);
     }
 }
