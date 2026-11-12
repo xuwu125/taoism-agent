@@ -6,6 +6,7 @@
 
 ### 新增
 
+- **云篆笔顺演示动画（2026-11-13，T36 收口）**：`fulu-script::yunzhuan` 新增纯逻辑——`partial_polyline`（折线按千分比截笔，末端沿折线插值，**不许直线切角**，全整数）、`polyline_length`、`stroke_schedule`（每笔时长 ∝ 折线长度、保底 90 ms，调用方以末笔 `end_ms` 为总时长）；`fulu-ui` 笔画基元条加「笔顺演示」按钮——六笔依次从淡色引导线写成墨色，当前笔金框高亮 + 加粗并标注「第 N 笔 · 名」，写完自动回到静态条；纯视觉不影响状态。3 条新单测（截笔走折线不切角、三态进度、时长连续与保底）。**真云篆字形仍缺数据源，不冒充书法字帖**，残项与 T38 合并评估；动画视觉节奏未真人验收（并入 T38 符纸视觉清单）。基线 **430 Rust 测试零失败**、fmt / clippy -D warnings 全绿，GUI 冒烟 5 秒无 panic（docs/02 §28.5）。
 - **lowmem / fallback 槽位权重真实下载（2026-11-13，用户批准联网）**：`seal lowmem/fallback --confirm` 固化 HF LFS 官方 sha256/bytes 后 `fetch --i-understand-license --proxy`：lowmem 1,049,615,680 字节 / `43a7d09a…572a7452`（3 分 14 秒）、fallback 1,563,668,704 字节 / `384bc877…0340df`（4 分 40 秒），各 1 跳 https 重定向、sha256+字节数双校验通过；`model list` 三个可运行槽位全部 VERIFIED。`finetune_base` 保持 null（runnable=false 的微调底本，微调明确不做，不下载 3.46 GB）。多文件 digest-cache 实测：三个文件全量哈希 3 m 48 s → 缓存命中 0.107 s。
 
 - **判据修复：空正文不得判达标（2026-11-13，T23 实测隐患收口）**：`fulu-runtime::converge::evaluate` 的 `MaxLen` 分支加空正文守卫——trim 后为空且上限 > 0 时判「正文为空（可能思考耗尽预算）」，不再把 LFM3 思考耗尽后的空串判成 converged=true；`output.len <= 0`（显式要求空输出）如实放行。2 条新测试。

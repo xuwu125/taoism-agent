@@ -22,7 +22,10 @@ pub use fub::{
     inspect as inspect_fub,
 };
 pub use fuwen::{DICTIONARY, FUVEN_VERSION, fold as fuwen_fold, unfold as fuwen_unfold};
-pub use yunzhuan::{CloudLayout, CloudScript, CloudSlot, Stroke, describe as describe_cloud};
+pub use yunzhuan::{
+    CloudLayout, CloudScript, CloudSlot, Stroke, describe as describe_cloud, partial_polyline,
+    polyline_length, stroke_schedule,
+};
 
 use fulu_core::Talisman;
 use serde::Serialize;

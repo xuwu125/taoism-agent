@@ -78,6 +78,81 @@ pub struct Stroke {
     pub points: &'static [(i32, i32)],
 }
 
+/// 折线总长度（整数勾股，无浮点；与模块「全整数」的约定一致）。
+pub fn polyline_length(points: &[(i32, i32)]) -> u64 {
+    let mut total = 0u64;
+    for pair in points.windows(2) {
+        let dx = (pair[1].0 - pair[0].0) as i64;
+        let dy = (pair[1].1 - pair[0].1) as i64;
+        total += ((dx * dx + dy * dy) as u64).isqrt();
+    }
+    total
+}
+
+/// 把折线截到总长度的 `progress_permille`/1000 处，返回可见点列（末端按比例插值）。
+///
+/// - `0` → 只剩起点（长度为零，渲染层画不出任何线）；
+/// - `1000` → 与原折线完全一致；
+/// - 中间值 → 末端点落在折线上（逐段推进）。
+pub fn partial_polyline(points: &[(i32, i32)], progress_permille: u32) -> Vec<(i32, i32)> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+    let total = polyline_length(points);
+    if total == 0 {
+        return vec![points[0]];
+    }
+    let target = total * u64::from(progress_permille.min(1000)) / 1000;
+    let mut walked = 0u64;
+    let mut visible = vec![points[0]];
+    for pair in points.windows(2) {
+        let dx = (pair[1].0 - pair[0].0) as i64;
+        let dy = (pair[1].1 - pair[0].1) as i64;
+        let segment = ((dx * dx + dy * dy) as u64).isqrt();
+        if segment == 0 {
+            continue; // 重合点：不推进也不插值。
+        }
+        if walked + segment >= target {
+            // 末端落在这一段内：i64 全程线性插值，坐标仍落在 0..=1000 内。
+            // remain == 0 时端点就是上一个顶点，不重复推。
+            let remain = target - walked;
+            if remain > 0 {
+                let x = pair[0].0 as i64 + dx * remain as i64 / segment as i64;
+                let y = pair[0].1 as i64 + dy * remain as i64 / segment as i64;
+                visible.push((x as i32, y as i32));
+            }
+            return visible;
+        }
+        walked += segment;
+        visible.push(pair[1]);
+    }
+    visible
+}
+
+/// 每笔至少 90 ms：太短的话「点」这种短笔一闪而过，人看不出笔顺。
+const MIN_STROKE_MS: u64 = 90;
+
+/// 笔顺演示的时长分配：每笔时长与其折线长度成正比，但不得低于 [`MIN_STROKE_MS`]。
+///
+/// 返回每笔的 `(start_ms, end_ms)`（前闭后开、首尾相接）。**末笔的 `end_ms`
+/// 就是演示总时长**——因为保底时长可能把总长撑过请求值，调用方应以返回值为准，
+/// 不自己假设「刚好等于 total_ms」。
+pub fn stroke_schedule(strokes: &[Stroke], total_ms: u64) -> Vec<(u64, u64)> {
+    let lengths: Vec<u64> = strokes.iter().map(|s| polyline_length(s.points)).collect();
+    let sum: u64 = lengths.iter().sum();
+    let mut schedule = Vec::with_capacity(strokes.len());
+    let mut cursor = 0u64;
+    for length in &lengths {
+        let duration = (total_ms * length)
+            .checked_div(sum)
+            .unwrap_or(MIN_STROKE_MS)
+            .max(MIN_STROKE_MS);
+        schedule.push((cursor, cursor + duration));
+        cursor += duration;
+    }
+    schedule
+}
+
 /// 六种笔画基元。**抽象几何，不是书法字形。**
 pub const STROKE_PRIMITIVES: &[Stroke] = &[
     Stroke {
@@ -204,6 +279,65 @@ mod tests {
         );
         assert!(layout.line_gap_permille > 1000, "行距应大于一个字高");
         assert!(layout.chars_per_line > 0 && layout.max_lines > 0);
+    }
+
+    #[test]
+    fn length_and_partial_cut_follow_the_polyline() {
+        let straight = [(120, 500), (880, 500)];
+        assert_eq!(polyline_length(&straight), 760);
+        assert_eq!(partial_polyline(&straight, 0), vec![(120, 500)]);
+        assert_eq!(
+            partial_polyline(&straight, 500),
+            vec![(120, 500), (500, 500)]
+        );
+        assert_eq!(partial_polyline(&straight, 1000), straight.to_vec());
+        assert_eq!(
+            partial_polyline(&straight, 2000),
+            straight.to_vec(),
+            "超 1000 等同画完"
+        );
+        // 「点」只有两个点：截到一半也还是两个点，末端落在两点之间。
+        let dot = &STROKE_PRIMITIVES[5];
+        let half = partial_polyline(dot.points, 500);
+        assert_eq!(half.len(), 2);
+        assert!(half[1].0 > dot.points[0].0 && half[1].0 < dot.points[1].0);
+    }
+
+    #[test]
+    fn partial_cut_walks_the_corner_not_the_chord() {
+        // 「折」是三点的 L 形：截到一半必须沿横段走到拐角，再沿竖段往下，不许直线切角。
+        let fold = &STROKE_PRIMITIVES[4];
+        let half = partial_polyline(fold.points, 500);
+        assert_eq!(half[0], (220, 200));
+        assert_eq!(half[1], (780, 200), "横段 560 已走完（到拐角）");
+        assert_eq!(half[2].0, 780, "末点必须在竖段上（x 不变）");
+        assert!(
+            half[2].1 > 200 && half[2].1 < 780,
+            "y 应落在竖段中间：{:?}",
+            half
+        );
+    }
+
+    #[test]
+    fn schedule_is_contiguous_and_respects_the_floor() {
+        let schedule = stroke_schedule(STROKE_PRIMITIVES, 2400);
+        assert_eq!(schedule.len(), STROKE_PRIMITIVES.len());
+        assert_eq!(schedule[0].0, 0);
+        for pair in schedule.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "笔与笔之间不许有空档");
+        }
+        for (start, end) in &schedule {
+            assert!(end - start >= 90, "每笔至少 90 ms，否则看不出笔顺");
+            assert!(start < end);
+        }
+        // 长笔（撇 ~856）分到的时长必须多于短笔（横 760）。
+        let heng = schedule[0].1 - schedule[0].0;
+        let pie = schedule[2].1 - schedule[2].0;
+        assert!(pie > heng, "时长应与折线长度成正比：{pie} vs {heng}");
+        // 调用方应以末笔 end 为总时长，而不是请求值：比例时长向下取整、
+        // 保底 90 ms 都可能让总长偏离请求值，只保证量级不变。
+        let total = schedule.last().unwrap().1;
+        assert!((2000..=3000).contains(&total), "总时长应接近 2400：{total}");
     }
 
     #[test]

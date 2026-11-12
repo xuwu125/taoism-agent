@@ -116,6 +116,9 @@ struct FuluApp {
     form_open: bool,
     /// 焚符成功那一刻的时刻，用于「火光」衰减动效（纯视觉，不承载逻辑）。
     fire_at: Option<std::time::Instant>,
+    /// 云篆「笔顺演示」开始的时刻（None = 未在演示，静态笔画条）。
+    /// 纯视觉：按 T39 描述层把六笔依次画出来，不影响任何状态。
+    cloud_anim_at: Option<std::time::Instant>,
 
     // ---- T36 太极编排视图 ----
     taiji_open: bool,
@@ -209,6 +212,7 @@ impl FuluApp {
             form_focus: None,
             form_open: false,
             fire_at: None,
+            cloud_anim_at: None,
             taiji_open: false,
             taiji: taiji::TaijiView::default(),
             taiji_rx: None,
@@ -1696,11 +1700,43 @@ impl FuluApp {
                     );
                 }
                 ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("云篆笔画基元（归一化折线，T39 数据源）")
-                        .small()
-                        .weak(),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("云篆笔画基元（归一化折线，T39 数据源）")
+                            .small()
+                            .weak(),
+                    );
+                    if ui
+                        .small_button(if self.cloud_anim_at.is_some() {
+                            "重新演示"
+                        } else {
+                            "笔顺演示"
+                        })
+                        .clicked()
+                    {
+                        self.cloud_anim_at = Some(std::time::Instant::now());
+                    }
+                });
+
+                // 笔顺演示（T36）：按 T39 描述层把六笔依次「写」出来。纯视觉，
+                // 不影响任何状态；时长分配来自 fulu_script::stroke_schedule，
+                // 截笔来自 partial_polyline——GUI 只做映射与画笔。
+                const CLOUD_ANIM_REQUEST_MS: u64 = 2400;
+                let schedule = fulu_script::stroke_schedule(script.strokes, CLOUD_ANIM_REQUEST_MS);
+                let mut anim_ms = self
+                    .cloud_anim_at
+                    .map(|start| start.elapsed().as_millis() as u64);
+                if let Some(ms) = anim_ms
+                    && let Some(&(.., last_end)) = schedule.last()
+                    && ms >= last_end
+                {
+                    self.cloud_anim_at = None; // 演示完毕，回到静态完整笔画
+                    anim_ms = None;
+                }
+                let ink = egui::Color32::from_rgb(0x2B, 0x24, 0x1B);
+                let guide = egui::Color32::from_rgba_unmultiplied(0xB9, 0x8A, 0x4E, 70);
+                let accent = egui::Color32::from_rgb(0xE0, 0x6A, 0x1B);
+
                 let cell = 26.0;
                 let (strip, _) = ui.allocate_exact_size(
                     egui::vec2(cell * script.strokes.len() as f32 + 4.0, cell),
@@ -1710,26 +1746,62 @@ impl FuluApp {
                 for (index, stroke) in script.strokes.iter().enumerate() {
                     let origin = egui::pos2(strip.left() + index as f32 * cell + 2.0, strip.top());
                     let box_rect = egui::Rect::from_min_size(origin, egui::vec2(cell - 4.0, cell));
+
+                    // 该笔当前处于哪个阶段：未到 / 正在写（千分比进度）/ 已写完。
+                    enum Phase {
+                        Pending,
+                        Active(u32),
+                        Done,
+                    }
+                    let phase = match anim_ms {
+                        None => Phase::Done,
+                        Some(ms) => match schedule.get(index) {
+                            Some(&(start, _)) if ms < start => Phase::Pending,
+                            Some(&(_, end)) if ms >= end => Phase::Done,
+                            Some(&(start, end)) => {
+                                Phase::Active((((ms - start) * 1000) / (end - start)) as u32)
+                            }
+                            None => Phase::Done,
+                        },
+                    };
+                    let is_current = matches!(phase, Phase::Active(_));
+
                     strip_painter.rect_stroke(
                         box_rect,
                         2.0,
-                        egui::Stroke::new(0.5, egui::Color32::from_rgb(0xB9, 0x8A, 0x4E)),
+                        egui::Stroke::new(
+                            if is_current { 1.0 } else { 0.5 },
+                            if is_current {
+                                accent
+                            } else {
+                                egui::Color32::from_rgb(0xB9, 0x8A, 0x4E)
+                            },
+                        ),
                         egui::StrokeKind::Inside,
                     );
-                    let points: Vec<egui::Pos2> = stroke
-                        .points
-                        .iter()
-                        .map(|(x, y)| {
-                            egui::pos2(
-                                box_rect.left() + (*x as f32 / 1000.0) * box_rect.width(),
-                                box_rect.top() + (*y as f32 / 1000.0) * box_rect.height(),
-                            )
-                        })
-                        .collect();
+
+                    // 归一化点 → 像素；正在写的那笔用 partial_polyline 截到当前进度。
+                    let to_pixel = |(x, y): &(i32, i32)| {
+                        egui::pos2(
+                            box_rect.left() + (*x as f32 / 1000.0) * box_rect.width(),
+                            box_rect.top() + (*y as f32 / 1000.0) * box_rect.height(),
+                        )
+                    };
+                    let (points, color): (Vec<egui::Pos2>, egui::Color32) = match phase {
+                        Phase::Pending => (stroke.points.iter().map(&to_pixel).collect(), guide),
+                        Phase::Active(progress) => (
+                            fulu_script::partial_polyline(stroke.points, progress)
+                                .iter()
+                                .map(to_pixel)
+                                .collect(),
+                            ink,
+                        ),
+                        Phase::Done => (stroke.points.iter().map(&to_pixel).collect(), ink),
+                    };
                     if points.len() >= 2 {
                         strip_painter.add(egui::Shape::line(
                             points,
-                            egui::Stroke::new(1.2, egui::Color32::from_rgb(0x2B, 0x24, 0x1B)),
+                            egui::Stroke::new(if is_current { 1.6 } else { 1.2 }, color),
                         ));
                     }
                     strip_painter.text(
@@ -1739,6 +1811,22 @@ impl FuluApp {
                         egui::FontId::proportional(8.0),
                         egui::Color32::from_rgb(0x8A, 0x6A, 0x3B),
                     );
+                }
+                if let Some(ms) = anim_ms {
+                    if let Some(index) = schedule
+                        .iter()
+                        .position(|&(start, end)| ms >= start && ms < end)
+                    {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "笔顺演示：第 {} 笔 · {}",
+                                index + 1,
+                                script.strokes[index].name
+                            ))
+                            .small(),
+                        );
+                    }
+                    ui.ctx().request_repaint(); // 动画进行中，每帧重绘
                 }
             });
         });
