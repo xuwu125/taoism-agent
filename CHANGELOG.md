@@ -6,6 +6,8 @@
 
 ### 新增
 
+- **lowmem / fallback 槽位权重真实下载（2026-11-13，用户批准联网）**：`seal lowmem/fallback --confirm` 固化 HF LFS 官方 sha256/bytes 后 `fetch --i-understand-license --proxy`：lowmem 1,049,615,680 字节 / `43a7d09a…572a7452`（3 分 14 秒）、fallback 1,563,668,704 字节 / `384bc877…0340df`（4 分 40 秒），各 1 跳 https 重定向、sha256+字节数双校验通过；`model list` 三个可运行槽位全部 VERIFIED。`finetune_base` 保持 null（runnable=false 的微调底本，微调明确不做，不下载 3.46 GB）。多文件 digest-cache 实测：三个文件全量哈希 3 m 48 s → 缓存命中 0.107 s。
+
 - **判据修复：空正文不得判达标（2026-11-13，T23 实测隐患收口）**：`fulu-runtime::converge::evaluate` 的 `MaxLen` 分支加空正文守卫——trim 后为空且上限 > 0 时判「正文为空（可能思考耗尽预算）」，不再把 LFM3 思考耗尽后的空串判成 converged=true；`output.len <= 0`（显式要求空输出）如实放行。2 条新测试。
 - **状态摘要缓存：`model list`/`doctor` 不再每次全量哈希 1.1 GB（2026-11-13）**：新模块 `fulu-model::digest_cache`——`status()` 改走 `verify_file_cached()`，按「归一化路径 + 字节数 + mtime」三元组命中 `digest-cache.json`（原子写回），未命中重算并写回；判据与 `verify_file` 共用单一事实源 `verify::judge()`。**显式校验命令 `model verify` 始终全量哈希，不走缓存**；缓存损坏/缺字段/mtime 异常一律按未命中重算（安全方向的静默）；`FULU_DIGEST_CACHE=0` 强制全量。真机实测（debug）：`model list` 92.4 s → **0.07 s**、`doctor` 92 s → **0.87 s**，缓存摘要与清单固化值一致。4 条新测试。已知残余风险如实记录：mtime 粒度内改写且同字节数可能命中陈旧值。
 

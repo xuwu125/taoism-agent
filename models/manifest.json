@@ -53,8 +53,8 @@
       "default_context_tokens": 8192,
       "arch": "lfm3",
       "approx_size": "1.05 GB",
-      "bytes": null,
-      "sha256": null,
+      "bytes": 1049615680,
+      "sha256": "43a7d09a0e9cba91b63eb7052488b9564569bddfd65754d2e426465e572a7452",
       "min_runtime": "llama.cpp >= b11960 (v0.8.0)",
       "sampling": {
         "temperature_milli": 100,
@@ -80,8 +80,8 @@
       "default_context_tokens": 8192,
       "arch": "lfm2",
       "approx_size": "1.56 GB",
-      "bytes": null,
-      "sha256": null,
+      "bytes": 1563668704,
+      "sha256": "384bc877b6c37064982f96885bef69e4475919f5969218ed4e3b9399ae0340df",
       "min_runtime": "llama.cpp with lfm2 support; candle quantized-lfm2 example",
       "sampling": {
         "temperature_milli": 300,
