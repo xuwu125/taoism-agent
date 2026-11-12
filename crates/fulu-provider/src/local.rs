@@ -149,11 +149,19 @@ impl LocalLfmProvider {
             .map_err(|e| ProviderError::Protocol(e.to_string()))?;
         let root: Value = serde_json::from_str(&text)
             .map_err(|e| ProviderError::Protocol(format!("/v1/models 不是 JSON：{e}")))?;
+        // OpenAI 兼容格式用 `data[].id`；真实 llama-server b12314 实测返回
+        // `models[].name|model`。两者都认，缺字段时如实返回空数组（上层据此提示）。
         Ok(root["data"]
             .as_array()
+            .or_else(|| root["models"].as_array())
             .unwrap_or(&Vec::new())
             .iter()
-            .filter_map(|item| item["id"].as_str().map(str::to_owned))
+            .filter_map(|item| {
+                ["id", "name", "model"]
+                    .iter()
+                    .find_map(|key| item[*key].as_str())
+                    .map(str::to_owned)
+            })
             .collect())
     }
 }
@@ -948,5 +956,26 @@ mod tests {
             "provider 的 Debug 泄漏了令牌"
         );
         assert!(rendered.contains("BearerToken(***)"));
+    }
+
+    #[test]
+    fn loaded_models_accepts_openai_data_and_llama_cpp_models_shapes() {
+        // OpenAI 兼容格式
+        let (port, _headers) = capture_headers_once(r#"{"data":[{"id":"lfm3"}]}"#.to_owned());
+        let mut provider = LocalLfmProvider::from_model("lfm3", 1024, "r");
+        provider
+            .set_endpoint(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        assert_eq!(provider.loaded_models().unwrap(), vec!["lfm3"]);
+
+        // 真实 llama-server b12314 实测：字段是 models[].name/model
+        let (port, _headers) = capture_headers_once(
+            r#"{"models":[{"name":"C:/m/a.gguf","model":"C:/m/a.gguf"}]}"#.to_owned(),
+        );
+        let mut provider = LocalLfmProvider::from_model("a", 1024, "r");
+        provider
+            .set_endpoint(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        assert_eq!(provider.loaded_models().unwrap(), vec!["C:/m/a.gguf"]);
     }
 }

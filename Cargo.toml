@@ -37,6 +37,7 @@ fulu-register = { path = "crates/fulu-register", version = "0.1.0" }
 fulu-provider = { path = "crates/fulu-provider", version = "0.1.0" }
 fulu-model = { path = "crates/fulu-model", version = "0.1.0" }
 fulu-download = { path = "crates/fulu-download", version = "0.1.0" }
+fulu-engine = { path = "crates/fulu-engine", version = "0.1.0" }
 fulu-runtime = { path = "crates/fulu-runtime", version = "0.1.0" }
 fulu-orchestrator = { path = "crates/fulu-orchestrator", version = "0.1.0" }
 fulu-tools = { path = "crates/fulu-tools", version = "0.1.0" }

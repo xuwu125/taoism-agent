@@ -695,6 +695,7 @@ dependencies = [
  "fulu-app",
  "fulu-context",
  "fulu-download",
+ "fulu-engine",
  "fulu-mcp",
  "fulu-model",
  "fulu-prompt",
@@ -730,6 +731,16 @@ dependencies = [
  "rustls-pki-types",
  "sha2",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "fulu-engine"
+version = "0.1.0"
+dependencies = [
+ "fulu-model",
+ "fulu-provider",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

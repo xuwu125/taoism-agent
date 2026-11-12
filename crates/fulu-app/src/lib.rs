@@ -707,6 +707,18 @@ impl AltarSession {
         self.provider.set_retry_policy(policy);
     }
 
+    /// 让符文 `harness.timeout_secs` 真正作用于单次 provider 请求。
+    ///
+    /// T23 真机暴露：provider 默认固定 30s，本机 CPU 上 LFM3 约 11.9 tokens/s，
+    /// 稍长的回复会被掐断并触发重试（同一请求在服务端重复生成三次）。
+    /// 夹在 1..=600 秒，避免符文写个荒谬值把整符超时绕过。
+    pub fn set_provider_timeout(&mut self, timeout: std::time::Duration) {
+        self.provider.timeout = timeout.clamp(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(600),
+        );
+    }
+
     pub fn set_workspace(&mut self, root: PathBuf) {
         // 只换策略，保留已注册的外宗工具：重建 registry 会把它们静默丢掉。
         self.tools.set_policy(ToolPolicy {
@@ -1692,6 +1704,18 @@ mod tests {
         let mut session = AltarSession::new();
         assert!(session.set_endpoint("http://0.0.0.0:8080").is_err());
         assert!(session.set_endpoint("http://127.0.0.1:8080").is_ok());
+    }
+
+    #[test]
+    fn provider_timeout_follows_fu_harness_but_is_clamped() {
+        use std::time::Duration;
+        let mut session = AltarSession::new();
+        session.set_provider_timeout(Duration::from_secs(60));
+        assert_eq!(session.provider.timeout, Duration::from_secs(60));
+        session.set_provider_timeout(Duration::ZERO);
+        assert_eq!(session.provider.timeout, Duration::from_secs(1));
+        session.set_provider_timeout(Duration::from_secs(99_999));
+        assert_eq!(session.provider.timeout, Duration::from_secs(600));
     }
 
     /// T01/T02：七层真正装配出来，会话头与符文正文都在 system 里，符文本身不变。

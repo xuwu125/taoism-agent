@@ -15,6 +15,7 @@ fulu-app.workspace = true
 fulu-script.workspace = true
 fulu-model.workspace = true
 fulu-download.workspace = true
+fulu-engine.workspace = true
 fulu-context.workspace = true
 fulu-prompt.workspace = true
 fulu-mcp.workspace = true

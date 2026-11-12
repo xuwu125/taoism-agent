@@ -6,6 +6,10 @@
 
 use fulu_app::{AltarSession, ENDPOINT_ENV, PromptMode, RiskClass};
 use fulu_download::{DownloadConfig, DownloadError, Downloaded, ProxyAddr, ResponseHead};
+use fulu_engine::{
+    EngineConfig, EngineHandle, check_runtime, discover_binary, read_record, record_path,
+    stop_owned_service,
+};
 use fulu_model::{
     ModelManifest, VerifyStatus, apply_seal, cache_dir, digest_file_state, import_file,
     metadata_url, model_path, parse_tree_metadata, status, verify_file,
@@ -61,6 +65,8 @@ fn help() {
          \x20 fulu model verify <文件> [槽位]      离线校验权重文件\n\
          \x20 fulu model import <文件> [槽位]      离线导入权重到缓存目录\n\
          \x20 fulu model serve                    探活本地 llama-server（不启动进程）\n\
+         \x20 fulu model start [槽位] [--port N] [--detach]  显式拉起 llama-server（仅回环）\n\
+         \x20 fulu model stop                     核验后停止后台 llama-server\n\
          \x20 fulu model seal [槽位] --confirm     从上游元数据固化 bytes/sha256（显式联网，元数据 KB 级）\n\
          \x20 fulu model fetch [槽位] --i-understand-license [--proxy URL] [--resume]\n\
          \x20                                     下载权重并校验（清单已固化才放行）\n\
@@ -155,6 +161,8 @@ fn model(args: &[String]) -> i32 {
         "list" => model_list(),
         "verify" | "import" => model_file_command(command, args),
         "serve" => model_serve(),
+        "start" => model_start(args),
+        "stop" => model_stop(),
         "seal" => model_seal(args),
         "fetch" => model_fetch(args),
         other => {
@@ -211,14 +219,28 @@ fn model_list() -> i32 {
 }
 
 /// 只探活，不启动进程、不下载权重。
+/// `FULU_LLAMA_ENDPOINT` 未设置但有 `--detach` 运行记录时，用记录里的端点探活。
 fn model_serve() -> i32 {
-    let session = match AltarSession::from_env() {
+    let mut session = match AltarSession::from_env() {
         Ok(session) => session,
         Err(error) => {
             eprintln!("[ERR] {error}");
             return 1;
         }
     };
+    if std::env::var(ENDPOINT_ENV).is_err()
+        && let Ok(Some(record)) = read_record(&record_path())
+    {
+        if let Err(error) = session.set_endpoint(&record.endpoint) {
+            eprintln!("[ERR] 运行记录里的端点不合法：{error}");
+            return 1;
+        }
+        println!(
+            "[..] 端点来自运行记录 {}（PID {}）",
+            record_path().display(),
+            record.pid
+        );
+    }
     match session.probe() {
         Ok(report) => {
             println!("[OK] 本地推理服务：{}", report.endpoint);
@@ -243,18 +265,337 @@ fn model_serve() -> i32 {
         }
         Err(error) => {
             eprintln!("[ERR] {error}");
-            if let Ok(report) = fulu_app::doctor() {
-                eprintln!(
-                    "  启动示例：llama-server -m \"{}\" --host 127.0.0.1 --port 8080 -c {}",
-                    report.weights_path, report.context_tokens
-                );
-            }
-            eprintln!("  然后设置 {ENDPOINT_ENV}=http://127.0.0.1:8080");
-            eprintln!(
-                "  权重须先由 `fulu model import <本地文件>` 离线导入；本命令不会下载任何内容。"
-            );
+            eprintln!("  如需由符箓管理进程：`fulu model start [槽位] [--port 8080] [--detach]`");
+            eprintln!("  或自行启动后设置 {ENDPOINT_ENV}=http://127.0.0.1:8080");
+            eprintln!("  本命令只探活：绝不启动进程、绝不下载任何内容。");
             2
         }
+    }
+}
+
+/// `model start` 的显式参数。默认全部本地、全部回环、不联网。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartOptions {
+    slot: String,
+    port: u16,
+    context: Option<u32>,
+    threads: Option<u32>,
+    /// 0 = 永不自动停
+    idle_seconds: u64,
+    startup_seconds: u64,
+    binary: Option<PathBuf>,
+    detach: bool,
+    verify_weight: bool,
+}
+
+impl Default for StartOptions {
+    fn default() -> Self {
+        Self {
+            slot: "default".into(),
+            port: fulu_engine::DEFAULT_PORT,
+            context: None,
+            threads: None,
+            idle_seconds: 900,
+            startup_seconds: 120,
+            binary: None,
+            detach: false,
+            verify_weight: false,
+        }
+    }
+}
+
+fn take_value<'a>(
+    iter: &mut impl Iterator<Item = &'a String>,
+    flag: &str,
+) -> Result<&'a str, String> {
+    let value = iter.next().ok_or_else(|| format!("{flag} 缺少取值"))?;
+    if value.starts_with("--") {
+        return Err(format!("{flag} 缺少取值（遇到 {value}）"));
+    }
+    Ok(value.as_str())
+}
+
+/// 纯函数参数解析：分发器传进来的 args[0] 是命令字本身，先剥掉。
+/// 只认白名单 flag，未知参数一律报错，**不接受自由命令行参数**（防绕过回环约束）。
+fn parse_start_args(args: &[String]) -> Result<StartOptions, String> {
+    let rest = args.get(1..).unwrap_or(&[]);
+    let mut options = StartOptions::default();
+    let mut slot: Option<String> = None;
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--port" => {
+                options.port = take_value(&mut iter, "--port")?
+                    .parse()
+                    .map_err(|_| "--port 必须是 1-65535 的整数".to_owned())?;
+            }
+            "--context" => {
+                options.context = Some(
+                    take_value(&mut iter, "--context")?
+                        .parse()
+                        .map_err(|_| "--context 必须是正整数".to_owned())?,
+                );
+            }
+            "--threads" => {
+                options.threads = Some(
+                    take_value(&mut iter, "--threads")?
+                        .parse()
+                        .map_err(|_| "--threads 必须是正整数".to_owned())?,
+                );
+            }
+            "--idle-seconds" => {
+                options.idle_seconds = take_value(&mut iter, "--idle-seconds")?
+                    .parse()
+                    .map_err(|_| "--idle-seconds 必须是非负整数".to_owned())?;
+            }
+            "--startup-seconds" => {
+                options.startup_seconds = take_value(&mut iter, "--startup-seconds")?
+                    .parse()
+                    .map_err(|_| "--startup-seconds 必须是正整数".to_owned())?;
+            }
+            "--llama-server" => {
+                options.binary = Some(PathBuf::from(take_value(&mut iter, "--llama-server")?));
+            }
+            "--detach" => options.detach = true,
+            "--verify-weight" => options.verify_weight = true,
+            other if other.starts_with("--") => return Err(format!("未知参数：{other}")),
+            other => {
+                if slot.is_some() {
+                    return Err(format!("槽位重复：{other}"));
+                }
+                slot = Some(other.to_owned());
+            }
+        }
+    }
+    if let Some(explicit) = slot {
+        options.slot = explicit;
+    }
+    Ok(options)
+}
+
+/// `fulu model start [槽位]`：**显式**拉起本地 llama-server（T22）。
+///
+/// 闸门顺序：清单槽位可运行 → 权重存在且字节数相符 → （可选）全量 sha256 →
+/// 二进制发现 → `min_runtime` 版本核对 → 端口未被占用 → spawn → 就绪轮询。
+/// 任何一步失败都在启动进程之前拒绝；进程一旦拉起，由 `EngineHandle` 的 Drop 兜底回收。
+fn model_start(args: &[String]) -> i32 {
+    let options = match parse_start_args(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 2;
+        }
+    };
+    let Ok(manifest) = manifest_or_fail() else {
+        return 1;
+    };
+    let Some(entry) = manifest.entry(&options.slot).cloned() else {
+        eprintln!("[ERR] 未知槽位：{}", options.slot);
+        return 2;
+    };
+    if !entry.runnable {
+        eprintln!(
+            "[ERR] 槽位 {} 在清单里标记为 runnable=false，拒绝加载",
+            entry.slot
+        );
+        return 2;
+    }
+    let model = model_path(&entry);
+    if !model.is_file() {
+        eprintln!("[ERR] 权重文件不存在：{}", model.display());
+        eprintln!(
+            "      先执行 `fulu model fetch {}` 或 `fulu model import <文件>`",
+            entry.slot
+        );
+        return 2;
+    }
+    // 轻量状态：只比精确字节数，避免每次启动都把 1.1 GB 重新哈希一遍
+    // （release 下也要 8.5 s）。摘要校验是显式选项，不伪称「已校验」。
+    if let Some(expected) = entry.bytes {
+        let actual = std::fs::metadata(&model).map(|m| m.len()).unwrap_or(0);
+        if actual != expected {
+            eprintln!("[ERR] 权重字节数不符：清单期望 {expected}，实际 {actual}；拒绝加载");
+            return 2;
+        }
+    }
+    if options.verify_weight {
+        match verify_file(&model, &entry) {
+            Ok(report) if matches!(report.status, VerifyStatus::Verified) => {
+                println!("[OK] 权重全量 sha256 校验：VERIFIED");
+            }
+            Ok(report) => {
+                eprintln!(
+                    "[ERR] 权重校验未通过（{}）：{:?}",
+                    report.status.label(),
+                    report.status
+                );
+                return 2;
+            }
+            Err(error) => {
+                eprintln!("[ERR] 权重校验失败：{error}");
+                return 2;
+            }
+        }
+    } else {
+        println!("[..] 本次未做全量 sha256 校验（如需请加 --verify-weight）");
+    }
+
+    let binary = match options.binary.clone() {
+        Some(path) => path,
+        None => match discover_binary() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("[ERR] {error}");
+                return 2;
+            }
+        },
+    };
+    match check_runtime(&binary, &entry.min_runtime) {
+        Ok(info) if info.meets_minimum == Some(true) => println!(
+            "[OK] 运行时核对：{}（build {:?} ≥ 清单要求 {:?}）",
+            info.version_line, info.build, info.required_build
+        ),
+        Ok(info) => println!(
+            "[WARN] 无法核对清单 min_runtime「{}」：{} → UNVERIFIED（不伪称通过）",
+            entry.min_runtime, info.version_line
+        ),
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 2;
+        }
+    }
+
+    let mut config = EngineConfig::new(binary.clone(), model.clone());
+    config.port = options.port;
+    config.context_tokens = options.context.unwrap_or(entry.default_context_tokens);
+    config.threads = options.threads;
+    config.startup_timeout = std::time::Duration::from_secs(options.startup_seconds);
+    config.idle_timeout =
+        (options.idle_seconds > 0).then(|| std::time::Duration::from_secs(options.idle_seconds));
+
+    println!(
+        "[..] 显式拉起 llama-server：仅 127.0.0.1:{}（不联网、不下载）",
+        config.port
+    );
+    let mut handle = match EngineHandle::spawn(config) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            return 1;
+        }
+    };
+    println!("[OK] 已就绪：{}", handle.endpoint());
+    println!("  PID / 二进制 : {:?} / {}", handle.pid(), binary.display());
+    println!(
+        "  权重 / 上下文: {} / {}",
+        model.display(),
+        handle.config().context_tokens
+    );
+    println!("  日志         : {}", handle.config().log_path.display());
+    println!("  启动耗时     : {:?}", handle.started_at().elapsed());
+    println!("  健康检查     : {}", handle.health().label());
+    match handle.models() {
+        Ok(models) => println!(
+            "  已加载模型   : {}",
+            if models.is_empty() {
+                "—".into()
+            } else {
+                models.join(", ")
+            }
+        ),
+        Err(error) => eprintln!("  [WARN] 模型列表读取失败：{error}"),
+    }
+    println!("  供其它进程使用：{ENDPOINT_ENV}={}", handle.endpoint());
+
+    if options.detach {
+        return match handle.detach() {
+            Ok(record) => {
+                println!(
+                    "[OK] 已转入后台（PID {}）；结束时执行 `fulu model stop`",
+                    record.pid
+                );
+                0
+            }
+            Err(error) => {
+                eprintln!("[ERR] {error}");
+                1
+            }
+        };
+    }
+
+    println!(
+        "[..] 前台常驻：按回车结束；闲置 {} 自动退出；退出时进程自动回收。",
+        if options.idle_seconds == 0 {
+            "永不".into()
+        } else {
+            format!("{}s", options.idle_seconds)
+        }
+    );
+    println!("    Windows 下 Ctrl+C 会跳过 Drop 清理，请用回车或另开窗口执行 `fulu model stop`。");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+        let _ = tx.send(());
+    });
+    let mut reason = "收到回车";
+    loop {
+        if rx.try_recv().is_ok() {
+            break;
+        }
+        if !handle.is_running() {
+            reason = "推理进程已退出";
+            break;
+        }
+        if handle.poll_idle() {
+            reason = "闲置超时";
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    println!("[..] {reason}，正在回收进程…");
+    let _ = handle.shutdown();
+    0
+}
+
+/// `fulu model stop`：核验运行记录与端点上真实加载的模型后才发终止信号。
+fn model_stop() -> i32 {
+    let path = record_path();
+    match read_record(&path) {
+        Err(error) => {
+            eprintln!("[ERR] {error}");
+            1
+        }
+        Ok(None) => {
+            eprintln!("[ERR] 没有后台运行记录：{}", path.display());
+            eprintln!(
+                "      只有 `fulu model start --detach` 会生成记录；前台启动随 CLI 退出自动回收。"
+            );
+            1
+        }
+        Ok(Some(record)) => match stop_owned_service(&record, &path) {
+            Ok(report) => {
+                if report.already_stopped {
+                    println!(
+                        "[OK] 进程已不存在（PID {}），清理了陈旧运行记录；端口 {}",
+                        report.pid, report.port
+                    );
+                } else {
+                    println!(
+                        "[OK] 已停止后台 llama-server：PID {} / 端口 {}",
+                        report.pid, report.port
+                    );
+                }
+                if !report.port_released {
+                    eprintln!("[WARN] 端口在 3 秒内未观测到释放，请人工确认（不谎称干净）");
+                }
+                0
+            }
+            Err(error) => {
+                eprintln!("[ERR] {error}");
+                1
+            }
+        },
     }
 }
 
@@ -1070,6 +1411,11 @@ fn altar(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // 符文的硬超时必须覆盖单次 provider 请求，否则「整符 60s」会被
+    // provider 默认的 30s 提前掐断（真机 T23 实测：CPU 上 300+ tokens 需 >30s）。
+    session.set_provider_timeout(std::time::Duration::from_secs(
+        fu.harness.timeout_secs as u64,
+    ));
     if let Some(endpoint) = &options.endpoint
         && let Err(error) = session.set_endpoint(endpoint)
     {
@@ -2954,5 +3300,57 @@ mod tests {
         let state = FetchState::open(&part, false).expect("重头打开");
         assert_eq!(state.written, 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn start_args_strip_command_word_and_keep_flag_values_out_of_slot() {
+        let args = [
+            "start",
+            "--port",
+            "18080",
+            "--context",
+            "8192",
+            "lowmem",
+            "--detach",
+            "--llama-server",
+            "C:/bin/llama-server.exe",
+        ]
+        .map(String::from)
+        .to_vec();
+        let options = parse_start_args(&args).expect("参数合法");
+        assert_eq!(options.slot, "lowmem");
+        assert_eq!(options.port, 18080);
+        assert_eq!(options.context, Some(8192));
+        assert!(options.detach);
+        assert_eq!(
+            options.binary,
+            Some(PathBuf::from("C:/bin/llama-server.exe"))
+        );
+        assert_eq!(options.idle_seconds, 900);
+    }
+
+    #[test]
+    fn start_args_reject_unknown_flags_missing_values_and_duplicate_slots() {
+        let words = |items: &[&str]| {
+            items
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect::<Vec<String>>()
+        };
+        assert!(parse_start_args(&words(&["start", "--unknown"])).is_err());
+        assert!(parse_start_args(&words(&["start", "--port"])).is_err());
+        assert!(parse_start_args(&words(&["start", "--port", "--detach"])).is_err());
+        assert!(parse_start_args(&words(&["start", "default", "lowmem"])).is_err());
+        let idle_off = parse_start_args(&words(&["start", "--idle-seconds", "0"])).unwrap();
+        assert_eq!(idle_off.idle_seconds, 0);
+    }
+
+    #[test]
+    fn start_defaults_are_loopback_and_bounded() {
+        let options = parse_start_args(&["start".to_owned()]).unwrap();
+        assert_eq!(options.slot, "default");
+        assert_eq!(options.port, fulu_engine::DEFAULT_PORT);
+        assert!(!options.detach);
+        assert!(!options.verify_weight);
     }
 }
