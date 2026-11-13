@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "id": "fu-t23-short-0001",
+  "name": "T23·真机短答",
+  "version": "1.0.0",
+  "head": {
+    "provider_ref": "lu://local/llama-server",
+    "endpoint": null
+  },
+  "deity": {
+    "model_id": "lfm3-1.7b-q4km",
+    "sampling": {
+      "temperature_milli": 0,
+      "top_k": 0,
+      "repeat_penalty_milli": 1000
+    }
+  },
+  "credential_ref": "lu://default/local",
+  "harness": {
+    "budget_tokens": 160,
+    "timeout_secs": 120,
+    "sandbox": "strict",
+    "allow_tools": [],
+    "max_steps": 2,
+    "network": false
+  },
+  "system": "你是简洁的问答助手，只输出最终答案，不要解释。",
+  "user": "1+1 等于几？只回答一个数字。",
+  "goal": {
+    "description": "只回答一个数字",
+    "success_criteria": "output.len <= 20"
+  },
+  "tool_refs": [],
+  "skill_refs": [],
+  "output": {
+    "schema": "summary.v1",
+    "max_iterations": 1,
+    "until": "success"
+  }
+}

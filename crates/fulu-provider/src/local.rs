@@ -66,6 +66,27 @@ pub struct LocalLfmProvider {
     pub retry: RetryPolicy,
 }
 
+/// 单次请求默认超时。T23 真机暴露：本机 CPU 上 LFM3-1.7B 生成约 12.8 tokens/s，
+/// 原 30 s 只够约 380 token，稍长的回复必被掐断并触发重试（服务端白生成三遍）。
+/// 180 s ≈ 2000 token 生成余量，对「单符串行」的人机交互仍算可接受上限。
+pub const DEFAULT_TIMEOUT_SECS: u64 = 180;
+/// 夹紧上界：与 `fulu-app::set_provider_timeout` 一致，防止配一个荒谬值绕过整符超时。
+pub const MAX_TIMEOUT_SECS: u64 = 600;
+
+/// 解析超时（秒）：非法/缺失一律回落默认值，再夹到 `1..=MAX_TIMEOUT_SECS`。
+///
+/// 单独抽成纯函数是为了可测——直接读环境变量的写法在并行测试里会互相干扰。
+pub fn timeout_from_raw(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .clamp(1, MAX_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// 环境变量覆盖：`FULU_PROVIDER_TIMEOUT_SECS`（GUI 设置面板与符文超时之外的手动通道）。
+pub const TIMEOUT_ENV: &str = "FULU_PROVIDER_TIMEOUT_SECS";
+
 impl LocalLfmProvider {
     pub fn from_model(model_id: &str, context_tokens: u32, min_runtime: &str) -> Self {
         Self {
@@ -73,7 +94,7 @@ impl LocalLfmProvider {
             model_id: model_id.to_owned(),
             min_runtime: min_runtime.to_owned(),
             context_tokens,
-            timeout: Duration::from_secs(30),
+            timeout: timeout_from_raw(std::env::var(TIMEOUT_ENV).ok().as_deref()),
             auth: None,
             retry: RetryPolicy::default(),
         }
@@ -977,5 +998,25 @@ mod tests {
             .set_endpoint(&format!("http://127.0.0.1:{port}"))
             .unwrap();
         assert_eq!(provider.loaded_models().unwrap(), vec!["C:/m/a.gguf"]);
+    }
+
+    #[test]
+    fn timeout_defaults_wide_enough_for_cpu_inference_and_is_clamped() {
+        // 默认必须显著高于旧的 30 s：本机 LFM3 生成 12.8 t/s，30 s 只够 ~380 token。
+        assert_eq!(timeout_from_raw(None), Duration::from_secs(180));
+        const { assert!(DEFAULT_TIMEOUT_SECS > 30, "旧默认值会掐断 CPU 推理") }
+        // 显式配置生效
+        assert_eq!(timeout_from_raw(Some("90")), Duration::from_secs(90));
+        assert_eq!(timeout_from_raw(Some(" 240 ")), Duration::from_secs(240));
+        // 非法值回落默认，不 panic 也不变成 0（0 会让每个请求瞬间超时）
+        assert_eq!(timeout_from_raw(Some("abc")), Duration::from_secs(180));
+        assert_eq!(timeout_from_raw(Some("-5")), Duration::from_secs(180));
+        assert_eq!(timeout_from_raw(Some("")), Duration::from_secs(180));
+        // 夹紧：0 → 1 s，超大 → 600 s（不许单次请求把整符超时架空）
+        assert_eq!(timeout_from_raw(Some("0")), Duration::from_secs(1));
+        assert_eq!(
+            timeout_from_raw(Some("999999")),
+            Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
     }
 }

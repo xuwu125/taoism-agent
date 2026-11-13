@@ -127,6 +127,10 @@ struct FuluApp {
     taiji_rx: Option<Receiver<taiji::TaijiMsg>>,
     /// 太极是否正在后台焚化（串行，不允许重复提交）。
     taiji_running: bool,
+
+    /// 单次 provider 请求超时（秒）。只作用于本次焚化的请求，不写任何配置文件。
+    /// 取值范围与 `fulu-app::set_provider_timeout` 的夹紧一致（1..=600）。
+    provider_timeout_secs: u32,
 }
 
 /// 字段表单里可被符纸热区定位的输入项。
@@ -139,6 +143,21 @@ enum FormFocus {
     Budget,
     Goal,
     Criteria,
+}
+
+/// 与 `fulu_provider::local::DEFAULT_TIMEOUT_SECS` 保持同值的界面初始值。
+/// fulu-ui 不直接依赖 provider 层：这里只负责显示与传递，夹紧由法坛侧再做一次。
+const DEFAULT_PROVIDER_TIMEOUT_SECS: u32 = 180;
+/// 与法坛 `set_provider_timeout` 的夹紧上界一致。
+const MAX_PROVIDER_TIMEOUT_SECS: u32 = 600;
+
+/// 初始超时：允许用 `FULU_PROVIDER_TIMEOUT_SECS` 覆盖（非法值回落默认，再夹紧）。
+fn provider_default_timeout_secs() -> u32 {
+    std::env::var("FULU_PROVIDER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_PROVIDER_TIMEOUT_SECS)
+        .clamp(1, MAX_PROVIDER_TIMEOUT_SECS)
 }
 
 impl FuluApp {
@@ -217,6 +236,7 @@ impl FuluApp {
             taiji: taiji::TaijiView::default(),
             taiji_rx: None,
             taiji_running: false,
+            provider_timeout_secs: provider_default_timeout_secs(),
         };
         app.refresh_files();
         app.reload_models();
@@ -324,6 +344,11 @@ impl FuluApp {
             self.say("界面尚未就绪，稍后再焚", Tone::Bad);
             return;
         };
+        // 单次请求超时：取「界面设置」与「符文整符超时」的较小者——符文里的
+        // `timeout_secs` 是作者写死的上限，界面设置只用来放宽 provider 默认值
+        // （CPU 慢推理），不能反过来突破它。
+        let provider_secs = self.provider_timeout_secs.min(fu.harness.timeout_secs);
+        session.set_provider_timeout(std::time::Duration::from_secs(u64::from(provider_secs)));
         // 确认门先于焚化装好：默认逐次弹卡问人；勾了预授权则一次放行、不再弹窗。
         if self.allow_high_risk {
             session.set_risk_ceiling(Some(RiskClass::Destructive));
@@ -919,6 +944,10 @@ impl FuluApp {
         let endpoint = self.endpoint.trim().to_owned();
         let workspace = PathBuf::from(&self.workspace);
         let mut session = AltarSession::new();
+        session.set_provider_timeout(std::time::Duration::from_secs(u64::from(
+            self.provider_timeout_secs
+                .clamp(1, MAX_PROVIDER_TIMEOUT_SECS),
+        )));
         if !endpoint.is_empty()
             && let Err(error) = session.set_endpoint(&endpoint)
         {
@@ -1298,6 +1327,12 @@ impl FuluApp {
 
     fn center(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ui, |ui| {
+            // 窗口矮时（如 800×600 或更矮的宽度比）动作按钮会被裁到窗外——整栏可滚，
+            // 按钮与敕门卡片总能滚到视口内。内层编辑器自带 ScrollArea，滚轮悬停
+            // 在编辑器上时优先滚编辑器，不会互相抢。
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
             ui.heading("法坛");
             ui.label("符文正文（YAML / .fu）。改了正文就要重新盖印——符印只认当下的字。");
             self.paper_view(ui, ctx);
@@ -1448,6 +1483,7 @@ impl FuluApp {
             self.save_and_form(ui);
             self.model_and_session(ui);
             self.settings(ui);
+                });
             let _ = ctx;
         });
     }
@@ -2131,6 +2167,46 @@ impl FuluApp {
                             Tone::Info,
                         );
                     }
+                });
+
+                // 单次请求超时：本机 CPU 生成约 12.8 tokens/s，30 秒会掐断长回复。
+                // 这里只改本次会话的 provider 参数，不写任何配置文件。
+                ui.horizontal(|ui| {
+                    ui.label("请求超时");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut self.provider_timeout_secs)
+                            .range(1..=MAX_PROVIDER_TIMEOUT_SECS)
+                            .suffix(" 秒"),
+                    );
+                    if response.changed() {
+                        self.provider_timeout_secs = self
+                            .provider_timeout_secs
+                            .clamp(1, MAX_PROVIDER_TIMEOUT_SECS);
+                        if let Some(session) = self.session.as_mut() {
+                            session.set_provider_timeout(std::time::Duration::from_secs(
+                                u64::from(self.provider_timeout_secs),
+                            ));
+                        }
+                    }
+                    if ui.button("恢复默认").clicked() {
+                        self.provider_timeout_secs = DEFAULT_PROVIDER_TIMEOUT_SECS;
+                        if let Some(session) = self.session.as_mut() {
+                            session.set_provider_timeout(std::time::Duration::from_secs(
+                                u64::from(DEFAULT_PROVIDER_TIMEOUT_SECS),
+                            ));
+                        }
+                        self.say(
+                            format!("请求超时已恢复默认 {DEFAULT_PROVIDER_TIMEOUT_SECS} 秒"),
+                            Tone::Info,
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "单次 provider 请求；焚符时还会被符文 harness.timeout_secs 夹小",
+                        )
+                        .small()
+                        .weak(),
+                    );
                 });
 
                 if !self.context_text.is_empty() {

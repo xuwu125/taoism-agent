@@ -723,6 +723,11 @@ impl AltarSession {
         );
     }
 
+    /// 当前单次请求超时（设置面板回显用；只读）。
+    pub fn provider_timeout(&self) -> std::time::Duration {
+        self.provider.timeout
+    }
+
     pub fn set_workspace(&mut self, root: PathBuf) {
         // 只换策略，保留已注册的外宗工具：重建 registry 会把它们静默丢掉。
         self.tools.set_policy(ToolPolicy {

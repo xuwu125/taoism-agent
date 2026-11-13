@@ -6,6 +6,8 @@
 
 ### 新增
 
+- **请求超时可配置 + T23 GUI 机器模拟端到端（2026-11-13）**：provider 默认超时 30 s → 180 s（CPU 12.76 t/s 下 30 s 只够 ~380 token），三条配置通道夹紧口径一致（1..=600）：环境变量 `FULU_PROVIDER_TIMEOUT_SECS`、`set_provider_timeout`、GUI 设置面板「请求超时」数字框（焚符时被符文 `timeout_secs` 夹小）。**T23 GUI 逐次弹窗链路以机器模拟走通（非真人，docs/02 §41.4）**：真 MCP mock server 接入 → 1.7B 模型正确发起破坏性召将 → 敕门卡片弹出 → 敕可 → 工具真执行（将回 bytes=15）→ 预算耗尽炸炉如实终态；箓层双向核验首次真机实测（sandbox=strict 被 PermissionTooLow 驳回）；焚符达标回执与中止取消独立终态均经 GUI 走通。顺手修复：法坛窗口矮时动作按钮被裁切（整栏加外层 ScrollArea）。新工具 `tools/gui-drive.py` / `tools/gui-locate.py`（SendInput 坐标点击 + 截图，供 GUI 机器辅助验收）。真人复核敕门观感后才可宣称 T23 GUI 完全通过。
+
 - **T11 量化吞吐基准补齐（2026-11-13，真机实测）**：真权重 + llama.cpp b12314 + 真焚符（缴符 usage 全部 `estimated=false`）——单路生成 12.76 t/s（prefill 211 tok @ 145 t/s，纠正了「除以 usage 得 ~29 t/s」的 prompt+completion 混算假象）；两路并发对打单实例时逐流生成几乎不降（12.31 / 11.50 t/s）、聚合生成吞吐 ≈ 1.4×。**真机数据推翻了「单实例就是串行上限」的旧论证并已修正**：b12314 默认 4 槽位 + 统一 KV，并行收益发生在 llama-server 槽位层（continuous batching），法坛层不需要自己调度；「保持同步、不引入 tokio」的结论不变，主因改为太极 DAG 确定性 + 缴符链线性审计面（docs/02 §22.1/§22.2）。
 - **T25 内嵌推理后端评估定案（2026-11-13）**：两个候选都否——candle 无 LFM3 支持（官方运行时列表核实：llama.cpp/MLX/ONNX/Ollama/SGLang/vLLM/transformers）；llama-cpp-2 的 C++ 构建链违反「Rust 不链 C++ 库」铁律且权重进 GUI 进程地址空间爆 130 MB 预算。现状（fulu-engine 按需拉起外部 llama-server）四维全面占优；重评触发条件写死（单文件零依赖分发 + 静态链接方案同时满足）（docs/02 §30.3）。
 - **云篆笔顺演示动画（2026-11-13，T36 收口）**：`fulu-script::yunzhuan` 新增纯逻辑——`partial_polyline`（折线按千分比截笔，末端沿折线插值，**不许直线切角**，全整数）、`polyline_length`、`stroke_schedule`（每笔时长 ∝ 折线长度、保底 90 ms，调用方以末笔 `end_ms` 为总时长）；`fulu-ui` 笔画基元条加「笔顺演示」按钮——六笔依次从淡色引导线写成墨色，当前笔金框高亮 + 加粗并标注「第 N 笔 · 名」，写完自动回到静态条；纯视觉不影响状态。3 条新单测（截笔走折线不切角、三态进度、时长连续与保底）。**真云篆字形仍缺数据源，不冒充书法字帖**，残项与 T38 合并评估；动画视觉节奏未真人验收（并入 T38 符纸视觉清单）。基线 **430 Rust 测试零失败**、fmt / clippy -D warnings 全绿，GUI 冒烟 5 秒无 panic（docs/02 §28.5）。

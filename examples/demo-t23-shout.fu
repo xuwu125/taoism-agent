@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "id": "fu-t23-shout-0001",
+  "name": "T23·召将敕门",
+  "version": "1.0.0",
+  "head": {
+    "provider_ref": "lu://local/llama-server",
+    "endpoint": null
+  },
+  "deity": {
+    "model_id": "lfm3-1.7b-q4km",
+    "sampling": {
+      "temperature_milli": 0,
+      "top_k": 0,
+      "repeat_penalty_milli": 1000
+    }
+  },
+  "credential_ref": "lu://default/local",
+  "harness": {
+    "budget_tokens": 600,
+    "timeout_secs": 300,
+    "sandbox": "limited",
+    "allow_tools": ["mcp.demo.shout"],
+    "max_steps": 4,
+    "network": false
+  },
+  "system": "你是助手。必须调用工具 mcp.demo.shout，参数为 {\"text\": \"急急如律令\"}，工具返回后把返回内容原样写进最终回答。",
+  "user": "请调用工具 mcp.demo.shout，text 参数用 急急如律令，然后告诉我工具返回了什么。",
+  "goal": {
+    "description": "完成一次工具调用并复述结果",
+    "success_criteria": "output.len <= 100"
+  },
+  "tool_refs": ["mcp.demo.shout"],
+  "skill_refs": [],
+  "output": {
+    "schema": "summary.v1",
+    "max_iterations": 3,
+    "until": "success"
+  }
+}

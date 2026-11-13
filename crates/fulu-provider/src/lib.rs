@@ -15,7 +15,8 @@ pub mod stub;
 
 pub use http::{Endpoint, HttpError, HttpResponse, MAX_RESPONSE_BYTES};
 pub use local::{
-    BearerToken, Health, LocalLfmProvider, build_request_body, normalize_tool_calls, parse_reply,
+    BearerToken, DEFAULT_TIMEOUT_SECS, Health, LocalLfmProvider, MAX_TIMEOUT_SECS, TIMEOUT_ENV,
+    build_request_body, normalize_tool_calls, parse_reply, timeout_from_raw,
 };
 pub use sse::{SseError, StreamAssembler, StreamParts};
 pub use stub::{StubProvider, text_reply};
