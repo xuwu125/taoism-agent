@@ -72,7 +72,7 @@
 
 # S5 · M4 发布流水线与合规
 
-- [~] **T26 安装包格式** — 证据：`docs/02:255-258` 设计 MSI / DMG / AppImage / DEB；`release.yml:22` 注释「M4 接入」；当前只有 zip/tar.gz。做法：WiX / dmg / AppImage / deb 打包步骤 + 产物可安装冒烟。**脚本已全部落地（docs/02 第 24.1 节）：Windows MSI（WiX 3，perUser，无 candle 即判失败）、macOS DMG（Fulu.app + hdiutil）、Linux DEB（dpkg-deb + 运行库 Depends）、AppImage（best-effort，图标 CI 现场生成）；待下一次打 tag 由 CI 实跑确认安装/卸载，本机无 WiX/hdiutil/dpkg 不能代验证。**
+- [~] **T26 安装包格式** — 证据：`docs/02:255-258` 设计 MSI / DMG / AppImage / DEB；`release.yml:22` 注释「M4 接入」；当前只有 zip/tar.gz。做法：WiX / dmg / AppImage / deb 打包步骤 + 产物可安装冒烟。**脚本已全部落地（docs/02 第 24.1 节）；v0.3.1 CI 实跑结果（docs/02 §41.5）：macOS DMG 双平台成功出包 ✅；Windows MSI 失败已定位并修复——`light.exe` LGHT0311（wxs 中文字符串 vs MSI 数据库 CP1252），修复 = `Product/@Codepage="936"`，连带 ICE38（per-user KeyPath 改 HKCU 注册表键）/ ICE64（RemoveFolder/RemoveFile）同修，本地 candle+light exit 0 实测产出 MSI ✅（CI 实装待下一次 tag）；Linux DEB / AppImage 未到（release build 在 ubuntu 失败）。另：CI 全部 47 个 run 自首 push 起全红零成功（首次盘点）；ubuntu clippy/build、cross ARM64、windows/mac tests 间歇失败四项根因 UNVERIFIED——匿名拿不到 Actions 日志，需只读 token（actions:read）定位后再打 v0.3.2。**
 - [x] **T27 签名与公证** — 证据：`docs/02:263,430`；需用户 Secrets（Authenticode 证书 / Developer ID）。做法：有凭据才签，**未配置时明确标注未签名不伪装**。**已落地：Windows `signtool`、macOS `codesign + notarytool + stapler`，凭据全部缺位时写 `UNSIGNED-<target>.txt` 随发布资产上传并打 `::warning::`（docs/02 第 24.2 节）。实际签名仍阻塞：需你提供 Secrets。**
 - [x] **T28 SBOM（CycloneDX）** — 证据：`docs/02:249,263` 设计有，工作流无。做法：CI 生成并随 Release 发布。**已落地：独立 `sbom` job（cargo-cyclonedx --all → `*.cdx.json` → tar.gz 上传，零产物即判失败）。**
 - [x] **T29 `cargo audit` 接入 CI** — 证据：`docs/02:248,436` 设计有，`ci.yml` 无。做法：加独立 job（advisories），与 `cargo deny` 不重复冲突。**已落地：`audit` job（`rustsec/audit-check@v2`），与 cargo-deny 并行保留。**

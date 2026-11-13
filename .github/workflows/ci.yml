@@ -73,8 +73,9 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # --no-fail-fast：一个 crate 失败不掩盖其它 crate 的失败（§41.5 间歇失败定位需要全量信息）。
       - name: tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
       - name: build binaries
         run: cargo build --locked --target ${{ matrix.target }} -p fulu-ui -p fulu-cli

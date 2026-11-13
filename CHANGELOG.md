@@ -45,6 +45,8 @@
 - **符箓台完善（S6 / T33–T35）**：新增存符（`.fu` 先 `parse_fu` 再 `dump_fu`，同名需显式允许覆盖，UI 明示「规范格式重写会丢注释与字段顺序」）、字段表单（改字段即 `invalidate()` 破符）、模型与法坛面板（清单逐档展示，`digest_pinned=false` 标 `UNVERIFIED`；新开法坛保留端点；缴符回放 + 关键字筛选）、只读设置面板（提示词档位 / IP 开关 / 会话头 / 七层预览 / 符胆 / 技能 / 风险覆盖表）。门面新增 `dump_fu`、`manifest_slots`、`skills_listing`、`risk_overrides_listing`、`AltarSession::replay_audit`，GUI 不直接拼业务逻辑、不写全局配置。GUI 交互无自动化测试，布局与手感待真人验证。
 
 ### 修复
+- **Windows MSI 打包失败（T26，2026-11-13，本地复现修复）**：`light.exe` 报 `LGHT0311`——`packaging/windows/fulu.wxs` 的中文字符串在 MSI 数据库默认 CP1252（CI en-US locale）下不可编码；修复 = `Product/@Codepage="936"`，连带修复暴露出的 ICE38（per-user 组件 KeyPath 必须是 HKCU 注册表键，不能是文件）与 ICE64（用户目录卸载须登记 RemoveFolder/RemoveFile）。本地 candle+light（WiX 3.14.1）exit 0 实测产出 MSI；CI 实装待下一次 tag。
+- **CI 可观测性**：ci.yml tests 步骤加 `--no-fail-fast`（windows/mac 的间歇失败需要一次看到全部失败用例，docs/02 §41.5）。首次盘点确认：**CI 47 个 run 自首 push 起全红零成功**；windows/mac tests 间歇失败自太极编排/召将提交起出现，本地（rustc 1.100 同款工具链 + 干净 worktree + CI 环境变量）无法复现，根因 UNVERIFIED 待 CI 日志；ubuntu clippy/build 与 cross ARM64 自首跑起全红，同样待日志定位。
 - **moli 无头浏览器必须用独立 profile**：用户开着 Edge/Chrome 时（本机实测 41 个 `msedge` 进程），共用默认 `user-data-dir` 的新进程会把请求转交给已有实例后**立刻退出**——退出码 0、stdout 为空。原实现只判退出码，于是把空 DOM 当成功返回，`moli.open` 会静默拉回空页（与「页面无文本要如实报错」的口径冲突，因为根本走不到那一步）。现在每次给 `--user-data-dir=<临时目录>`（另加 `--no-first-run --no-default-browser-check`），先清理 profile 再判错；新增纯函数 `moli_headless_args` 与测试 `moli_headless_args_always_isolate_the_profile` 锁住「不许删掉独立 profile」。真机集成测试的 mock 服务同时改为循环 accept（浏览器一个页面会发不止一个连接），该测试此前的偶发失败（单跑过、连跑 5 轮错 1 轮）由此消除，修后连跑 10 轮零失败。
 
 ### 真人验收结论（2026-11-11，Windows 10）
