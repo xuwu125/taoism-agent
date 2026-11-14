@@ -6,6 +6,8 @@
 
 ### 新增
 
+- **CI 首次全绿 + v0.3.2 release 四平台产物实跑（2026-11-14，docs/02 §41.7）**：`4e78b1e` 起 ci.yml 7/7 全绿（终结仓库 47 run 全红历史）；tag v0.3.2 的 release 实跑产出 Windows MSI、macOS DMG ×2、Linux DEB、AppImage、zip/tar.gz、SBOM、SHA256SUMS ×4 并全部上传。追加修证：回环 mock 串行化 + 换端口重试 + 读循环读到 Content-Length 齐（TCP 无消息边界，本地也假红）；release.yml 两处打包坑——**pwsh 把 `-dVersion=0.3.2` 切成 `-dVersion=0` + `.3.2`（整开关加引号解决）**、GNU cp 多源同名拒覆盖（分两步 licenses/ 为权威）。
+
 - **CI 根因全清 + 测试修复（2026-11-14，docs/02 §41.6）**：用户只读 token 后首次下载 Actions 日志，**47 个 run 全红的真实根因不是「间歇 flaky」，是四个确定性 bug + 一个 runner 噪音**：①fulu-tools fs/shell 测试共用固定名临时目录，并行时互删文件（windows/mac 稳定复现 NotFound）→ 唯一目录化；②summon 路径越界测试样例 `C:/evil.fu` 在 mac/linux 是相对路径（假红，产品逻辑无恙）→ 平台感知样例；③Linux 上 winit 无窗口后端——工作区 eframe `default-features=false` 缺 `x11`/`wayland`（ubuntu clippy/build 自首跑全红的根因）→ fulu-ui 加 target 专属 feature + Cargo.lock 同步；④cross ARM64 只装了交叉编译器缺 libc 头文件 → CI 补 `libc6-dev-arm64-cross`；⑤Windows runner 回环偶发 refused（provider 头部测试）→ 仅对 refused 限次重试。
 
 ### 修复
