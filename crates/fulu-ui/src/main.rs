@@ -14,6 +14,8 @@ mod confirm;
 mod fonts;
 mod paper;
 mod taiji;
+mod theme;
+mod widgets;
 
 use confirm::ConfirmExchange;
 use eframe::egui;
@@ -38,6 +40,14 @@ enum Tone {
     Info,
     Good,
     Bad,
+}
+
+/// 中栏的两个视图。**符文界面是独立设计的一屏**，不是塞在滚动栏里的一小块：
+/// 法坛管「仪轨与判定」，符文管「这张符长什么样、哪里还没写」。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Altar,
+    Paper,
 }
 
 struct FuluApp {
@@ -131,6 +141,8 @@ struct FuluApp {
     /// 单次 provider 请求超时（秒）。只作用于本次焚化的请求，不写任何配置文件。
     /// 取值范围与 `fulu-app::set_provider_timeout` 的夹紧一致（1..=600）。
     provider_timeout_secs: u32,
+    /// 中栏视图：法坛（仪轨）/ 符文（符纸案台）。
+    view: ViewMode,
 }
 
 /// 字段表单里可被符纸热区定位的输入项。
@@ -158,6 +170,20 @@ fn provider_default_timeout_secs() -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .unwrap_or(DEFAULT_PROVIDER_TIMEOUT_SECS)
         .clamp(1, MAX_PROVIDER_TIMEOUT_SECS)
+}
+
+/// 回执终态标签 → 轨道终态。只认 `fulu_core::TalismanState::label()` 的六个终态，
+/// 其余（回执 / 草稿 / 成符…）一律返回 None，避免在状态轨道上伪造终态。
+fn terminal_from_label(label: &str) -> Option<theme::Stage> {
+    match label {
+        "归档" => Some(theme::Stage::Archived),
+        "破符" => Some(theme::Stage::Broken),
+        "驳回" => Some(theme::Stage::Rejected),
+        "炸炉" => Some(theme::Stage::Exploded),
+        "过坛" => Some(theme::Stage::TimedOut),
+        "中止" => Some(theme::Stage::Cancelled),
+        _ => None,
+    }
 }
 
 impl FuluApp {
@@ -237,6 +263,7 @@ impl FuluApp {
             taiji_rx: None,
             taiji_running: false,
             provider_timeout_secs: provider_default_timeout_secs(),
+            view: ViewMode::Altar,
         };
         app.refresh_files();
         app.reload_models();
@@ -245,6 +272,34 @@ impl FuluApp {
 
     fn say(&mut self, text: impl Into<String>, tone: Tone) {
         self.status = (text.into(), tone);
+    }
+
+    /// 仪轨阶段的唯一推导口。状态轨道只认这里的结果，绘制层不自己猜状态。
+    ///
+    /// 门面没有重导出 `TalismanState`（UI 不直连 `fulu-core` 是架构铁律），
+    /// 所以用稳定的 `state.label()` 中文常量映射；六个终态由单测锁住，新增终态
+    /// 必须同步改这里——否则轨道会把新终态误画成「焚化中」。
+    fn current_stage(&self) -> (theme::Stage, Option<theme::Stage>) {
+        if self.burning.is_some() {
+            return (theme::Stage::Igniting, None);
+        }
+        if let Some(receipt) = &self.receipt {
+            return match terminal_from_label(receipt.state.label()) {
+                Some(stage) => (stage, Some(stage)),
+                // 「回执」等中间态：还在收尾，不冒充终态。
+                None => (theme::Stage::Igniting, None),
+            };
+        }
+        if self.plan.is_some() {
+            return (theme::Stage::Pending, None);
+        }
+        if self.seal.is_some() {
+            return (theme::Stage::Sealed, None);
+        }
+        if self.loaded.is_some() {
+            return (theme::Stage::Formed, None);
+        }
+        (theme::Stage::Draft, None)
     }
 
     fn refresh_files(&mut self) {
@@ -1112,6 +1167,11 @@ impl FuluApp {
     #[allow(clippy::too_many_lines)]
     fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.top_bar(ui);
+        // 仪轨状态轨道独占一条：状态机是一等视觉对象，不埋在按钮堆里。
+        egui::Panel::top("ritual_rail").show(ui, |ui| {
+            let (stage, terminal) = self.current_stage();
+            widgets::ritual_rail(ui, stage, terminal);
+        });
         self.status_bar(ui);
         // T36 太极编排：叠在底部状态栏上方，不挤走三栏。
         if self.taiji_open {
@@ -1127,69 +1187,154 @@ impl FuluApp {
         self.center(ui, ctx);
     }
 
+    /// 坛额：左侧朱砂方印 + 品牌，中间系统陈述（青色只读语义），右侧全局开关。
+    /// 端点 / 工作区这类「坛务」收进折叠，不再让两行输入框占掉首屏。
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("top").show(ui, |ui| {
+        egui::Panel::top("altar_head").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("符箓台");
-                ui.label("· 一张提示词一张符");
-                ui.separator();
-                ui.label(&self.doctor);
-                ui.separator();
-                ui.label(&self.outer_summary);
-            });
-            ui.horizontal(|ui| {
-                ui.label("端点");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.endpoint)
-                        .hint_text("http://127.0.0.1:8080")
-                        .desired_width(260.0),
+                // 朱砂方印：整台唯一允许出现「符」字图形的地方。
+                let (seal_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+                let sp = ui.painter_at(seal_rect);
+                sp.rect_filled(seal_rect, 2.0, theme::c::CINNABAR_DEEP);
+                sp.rect_stroke(
+                    seal_rect,
+                    2.0,
+                    egui::Stroke::new(1.0, theme::c::CINNABAR),
+                    egui::StrokeKind::Inside,
                 );
-                if ui.button("设定").clicked() {
-                    self.set_endpoint();
-                }
-                if ui.button("探活").clicked() {
-                    self.probe();
-                }
-                ui.separator();
-                ui.label("工作区");
-                ui.add(egui::TextEdit::singleline(&mut self.workspace).desired_width(300.0));
-                if ui.button("应用").clicked() {
-                    self.set_workspace();
-                }
-                if ui.button("重载外宗").clicked() {
-                    self.attach_mcp();
-                }
-                ui.separator();
-                let taiji_label = if self.taiji_open {
-                    "太极 ×"
-                } else {
-                    "太极"
-                };
-                if ui.button(taiji_label).clicked() {
-                    self.taiji_open = !self.taiji_open;
-                }
+                sp.text(
+                    seal_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "符",
+                    egui::FontId::proportional(20.0),
+                    theme::c::INK_ON_RED,
+                );
+                ui.add_space(theme::s::SM);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("符 箓 台")
+                            .size(theme::t::H2)
+                            .strong()
+                            .color(theme::c::INK),
+                    );
+                    ui.label(
+                        egui::RichText::new("FULÜ ALTAR  ·  一张提示词，一张符")
+                            .size(theme::t::CAPTION)
+                            .color(theme::c::GOLD_DEEP),
+                    );
+                });
+                ui.add_space(theme::s::XL);
+                ui.label(
+                    egui::RichText::new(&self.doctor)
+                        .size(theme::t::SMALL)
+                        .color(theme::c::INK_SOFT),
+                );
+                widgets::chip(ui, &self.outer_summary, theme::c::JADE, theme::c::SUNKEN);
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let settings_label = if self.show_settings {
+                        "设置 ×"
+                    } else {
+                        "设置"
+                    };
+                    if widgets::ritual_button(ui, settings_label, widgets::ButtonKind::Ghost, true)
+                        .clicked()
+                    {
+                        self.show_settings = !self.show_settings;
+                        // 设置折叠在中栏底部，打开时把视图切回法坛，避免用户找不到。
+                        if self.show_settings {
+                            self.view = ViewMode::Altar;
+                        }
+                    }
+                    let taiji_label = if self.taiji_open {
+                        "太极 ×"
+                    } else {
+                        "太极"
+                    };
+                    if widgets::ritual_button(ui, taiji_label, widgets::ButtonKind::Ghost, true)
+                        .clicked()
+                    {
+                        self.taiji_open = !self.taiji_open;
+                    }
+                });
             });
-            ui.label(
-                egui::RichText::new(&self.compliance)
-                    .small()
-                    .color(egui::Color32::from_rgb(180, 120, 40)),
+
+            ui.collapsing(
+                "坛务 · 端点 / 工作区 / 外宗接入（只在内存生效）",
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("端点").size(theme::t::SMALL));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.endpoint)
+                                .hint_text("http://127.0.0.1:8080")
+                                .desired_width(260.0),
+                        );
+                        if ui.button("设定").clicked() {
+                            self.set_endpoint();
+                        }
+                        if ui.button("探活").clicked() {
+                            self.probe();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("工作区").size(theme::t::SMALL));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.workspace).desired_width(300.0),
+                        );
+                        if ui.button("应用").clicked() {
+                            self.set_workspace();
+                        }
+                        if ui.button("重载外宗").clicked() {
+                            self.attach_mcp();
+                        }
+                        widgets::readonly_note(ui, "接入与安装请在原生态完成");
+                    });
+                },
             );
+
+            if !self.compliance.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    // 合规警告是「提示」，不是「估算 / 未验证」——不套用诚实性标注原子，
+                    // 免得把一条法务提醒伪装成数据可信度结论。
+                    widgets::chip(ui, "合规提示", theme::c::WARN, theme::c::SUNKEN);
+                    ui.label(
+                        egui::RichText::new(&self.compliance)
+                            .size(theme::t::SMALL)
+                            .color(theme::c::WARN),
+                    );
+                });
+            }
         });
     }
 
+    /// 状态栏：Tone 三态改用设计令牌；终态徽标从回执推导，绝不靠文案猜。
+    /// **中文 IME 探针是 M0 未完成的真人验收项，重做界面也不许把它藏起来。**
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status").show(ui, |ui| {
             let color = match self.status.1 {
-                Tone::Info => ui.visuals().text_color(),
-                Tone::Good => egui::Color32::from_rgb(60, 160, 90),
-                Tone::Bad => egui::Color32::from_rgb(200, 80, 70),
+                Tone::Info => theme::c::INFO,
+                Tone::Good => theme::c::GOOD,
+                Tone::Bad => theme::c::BAD,
             };
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(&self.status.0).color(color));
+                let (_, terminal) = self.current_stage();
+                if let Some(end) = terminal {
+                    widgets::terminal_badge(ui, end);
+                }
+                ui.label(
+                    egui::RichText::new(&self.status.0)
+                        .size(theme::t::BODY)
+                        .color(color),
+                );
+                if !self.cjk_note.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&self.cjk_note)
+                            .size(theme::t::CAPTION)
+                            .color(theme::c::INK_MUTED),
+                    );
+                }
             });
-            if !self.cjk_note.is_empty() {
-                ui.label(egui::RichText::new(&self.cjk_note).small().weak());
-            }
             ui.collapsing(
                 "中文 IME 探针（M0 未完成的人工验收项）",
                 |ui| {
@@ -1217,101 +1362,221 @@ impl FuluApp {
         });
     }
 
+    /// 左栏「符箓」：符文清单。朱砂语义（用户可写的对象），青色语义（只展示不管理）分开。
     fn left_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Panel::left("fu_list")
             .resizable(true)
-            .default_size(220.0)
+            .default_size(240.0)
             .show(ui, |ui| {
-                ui.heading("符箓");
-                if ui.button("载入内置示例符").clicked()
+                widgets::section_title(
+                    ui,
+                    "符箓",
+                    "点一下送入法坛",
+                    theme::c::CINNABAR,
+                );
+                ui.add_space(theme::s::SM);
+                if widgets::ritual_button(
+                    ui,
+                    "载入内置示例符",
+                    widgets::ButtonKind::Ghost,
+                    true,
+                )
+                .clicked()
                     && let Ok(text) = fulu_app::sample_fu_text()
                 {
                     self.fu_text = text;
                     self.invalidate();
                     self.say("已载入内置示例符", Tone::Info);
                 }
-                ui.separator();
-                ui.label(format!(
-                    "工作区共 {} 个符文文件（.fu / .dsl / .fub）",
-                    self.fu_files.len()
-                ));
-                if ui.button("重新扫描").clicked() {
-                    self.refresh_files();
-                }
+
+                widgets::divider(ui, theme::c::HAIRLINE);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("工作区 {} 张符", self.fu_files.len()))
+                            .size(theme::t::SMALL)
+                            .color(theme::c::INK_SOFT),
+                    );
+                    if ui.small_button("重新扫描").clicked() {
+                        self.refresh_files();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(".fu / .dsl / .fub 三种形态，按内容识别")
+                        .size(theme::t::CAPTION)
+                        .color(theme::c::INK_MUTED),
+                );
+
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for path in self.fu_files.clone() {
+                    for (index, path) in self.fu_files.clone().iter().enumerate() {
                         let name = path
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        if ui.selectable_label(false, name).clicked() {
-                            // 与 CLI 同一个门面：`.fub` / 中文 DSL 都能开；
-                            // 打开后一律转成**规范 JSON 文本**进编辑器（编辑器只认文本）。
-                            match fulu_app::load_fu_file(&path) {
-                                Ok((fu, form)) => match fulu_app::dump_fu(&fu) {
-                                    Ok(text) => {
-                                        self.fu_text = text;
-                                        self.invalidate();
-                                        self.say(
-                                            format!(
-                                                "已载入 {}（{}，已转为规范文本；原文件不会被改写）",
-                                                path.display(),
-                                                form.label()
-                                            ),
-                                            Tone::Info,
-                                        );
-                                    }
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{:02}", index + 1))
+                                    .size(theme::t::CAPTION)
+                                    .monospace()
+                                    .color(theme::c::GOLD_DEEP),
+                            );
+                            if ui.selectable_label(false, &name).clicked() {
+                                // 与 CLI 同一个门面：`.fub` / 中文 DSL 都能开；
+                                // 打开后一律转成规范 JSON 文本进编辑器，原文件不会被改写。
+                                match fulu_app::load_fu_file(path) {
+                                    Ok((fu, form)) => match fulu_app::dump_fu(&fu) {
+                                        Ok(text) => {
+                                            self.fu_text = text;
+                                            self.invalidate();
+                                            self.say(
+                                                format!(
+                                                    "已载入 {}（{}，已转为规范文本；原文件不会被改写）",
+                                                    path.display(),
+                                                    form.label()
+                                                ),
+                                                Tone::Info,
+                                            );
+                                        }
+                                        Err(error) => {
+                                            self.say(format!("转换失败：{error}"), Tone::Bad);
+                                        }
+                                    },
                                     Err(error) => {
-                                        self.say(format!("转换失败：{error}"), Tone::Bad);
+                                        self.say(format!("破符：{error}"), Tone::Bad);
                                     }
-                                },
-                                Err(error) => {
-                                    self.say(format!("破符：{error}"), Tone::Bad);
                                 }
                             }
-                        }
+                        });
+                    }
+                    if self.fu_files.is_empty() {
+                        ui.label(
+                            egui::RichText::new("（工作区里还没有符文文件）")
+                                .size(theme::t::SMALL)
+                                .color(theme::c::INK_MUTED),
+                        );
                     }
                 });
-                ui.separator();
-                ui.label(
-                    egui::RichText::new("外宗与符胆只展示不管理：安装升级请在原生态完成。").small(),
-                );
-                if ui.button("查看外宗摘要").clicked() {
+
+                widgets::divider(ui, theme::c::HAIRLINE);
+                widgets::readonly_note(ui, "外宗 / 符胆只展示不管理");
+                if widgets::ritual_button(
+                    ui,
+                    "查看外宗摘要",
+                    widgets::ButtonKind::Ghost,
+                    true,
+                )
+                .clicked()
+                {
                     self.attach_mcp();
+                }
+                ui.add_space(theme::s::SM);
+                if widgets::ritual_button(
+                    ui,
+                    "去符文界面看这张符",
+                    widgets::ButtonKind::Rite,
+                    true,
+                )
+                .clicked()
+                {
+                    self.view = ViewMode::Paper;
                 }
                 let _ = ctx;
             });
     }
 
+    /// 右栏「缴符」：单向时间线。链上的每个点都是 append-only，
+    /// 界面刻意不给任何可编辑 / 可删 / 可拖拽的视觉暗示。
     fn right_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Panel::right("audit")
             .resizable(true)
-            .default_size(320.0)
+            .default_size(340.0)
             .show(ui, |ui| {
-                ui.heading("缴符");
-                ui.label("append-only · sha256 链式摘要 · 写入前脱敏");
-                ui.separator();
+                widgets::section_title(ui, "缴符", "append-only · sha256 链式摘要", theme::c::JADE);
+                ui.add_space(theme::s::XS);
+                widgets::readonly_note(ui, "只读回放，不校验链");
+                ui.horizontal_wrapped(|ui| {
+                    widgets::honesty_badge(ui, widgets::Honesty::Redacted);
+                    widgets::honesty_badge(ui, widgets::Honesty::ReadOnly);
+                });
+                widgets::divider(ui, theme::c::HAIRLINE);
+
                 if let Some(receipt) = &self.receipt {
-                    ui.monospace(format!(
-                        "符印 {}",
-                        &receipt.seal[..16.min(receipt.seal.len())]
-                    ));
-                    ui.monospace(format!("正文 {}", receipt.text));
-                    // 重试不静默：provider 退避重试过就要让人看见。
-                    if receipt.retries_total > 0 {
-                        ui.monospace(format!("重试 {} 次后成功", receipt.retries_total));
-                    }
-                    ui.separator();
+                    let accent = if terminal_from_label(receipt.state.label())
+                        == Some(theme::Stage::Archived)
+                    {
+                        theme::c::GOOD
+                    } else {
+                        theme::c::BAD
+                    };
+                    widgets::card(ui, accent, |ui| {
+                        ui.label(
+                            egui::RichText::new("回执")
+                                .size(theme::t::BODY_LG)
+                                .strong()
+                                .color(theme::c::INK),
+                        );
+                        if let Some(end) = terminal_from_label(receipt.state.label()) {
+                            widgets::terminal_badge(ui, end);
+                        }
+                        ui.monospace(format!(
+                            "符印 {}",
+                            &receipt.seal[..16.min(receipt.seal.len())]
+                        ));
+                        ui.monospace(format!("正文 {}", receipt.text));
+                        ui.horizontal_wrapped(|ui| {
+                            if receipt.estimated_usage {
+                                widgets::honesty_badge(ui, widgets::Honesty::Estimated);
+                            }
+                            if receipt.retries_total > 0 {
+                                // 重试不静默：provider 退避重试过就要让人看见。
+                                widgets::chip(
+                                    ui,
+                                    &format!("重试 {} 次后成功", receipt.retries_total),
+                                    theme::c::WARN,
+                                    theme::c::SUNKEN,
+                                );
+                            }
+                            if !receipt.converged {
+                                widgets::chip(
+                                    ui,
+                                    "未达标 · 不伪装成功",
+                                    theme::c::WARN,
+                                    theme::c::SUNKEN,
+                                );
+                            }
+                        });
+                    });
+                    widgets::divider(ui, theme::c::HAIRLINE);
                 }
+
+                ui.label(
+                    egui::RichText::new(format!("事件链 · {} 条", self.audit_lines.len()))
+                        .size(theme::t::SMALL)
+                        .color(theme::c::INK_MUTED),
+                );
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if self.audit_lines.is_empty() {
-                        ui.label("（尚无事件）");
+                        ui.label(
+                            egui::RichText::new("（尚无事件）")
+                                .size(theme::t::SMALL)
+                                .color(theme::c::INK_MUTED),
+                        );
                     }
-                    for line in &self.audit_lines {
-                        ui.monospace(line);
+                    let last = self.audit_lines.len().saturating_sub(1);
+                    for (index, line) in self.audit_lines.iter().enumerate() {
+                        widgets::audit_row(ui, index + 1, line, index == last);
                     }
                 });
-                if self.session.is_some() && ui.button("导出缴符 JSONL").clicked() {
+
+                widgets::divider(ui, theme::c::HAIRLINE);
+                if self.session.is_some()
+                    && widgets::ritual_button(
+                        ui,
+                        "导出缴符 JSONL",
+                        widgets::ButtonKind::Ghost,
+                        true,
+                    )
+                    .clicked()
+                {
                     let path = Path::new(&self.workspace).join("fulu-audit.jsonl");
                     match self.session.as_ref().map(|s| s.export_audit(&path)) {
                         Some(Ok(count)) => {
@@ -1327,63 +1592,135 @@ impl FuluApp {
 
     fn center(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ui, |ui| {
-            // 窗口矮时（如 800×600 或更矮的宽度比）动作按钮会被裁到窗外——整栏可滚，
-            // 按钮与敕门卡片总能滚到视口内。内层编辑器自带 ScrollArea，滚轮悬停
-            // 在编辑器上时优先滚编辑器，不会互相抢。
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-            ui.heading("法坛");
-            ui.label("符文正文（YAML / .fu）。改了正文就要重新盖印——符印只认当下的字。");
-            self.paper_view(ui, ctx);
-            ui.separator();
-            let mut changed = false;
-            egui::ScrollArea::vertical()
-                .id_salt("fu_editor")
-                .max_height(300.0)
-                .show(ui, |ui| {
-                    changed = ui
-                        .add(
-                            egui::TextEdit::multiline(&mut self.fu_text)
-                                .code_editor()
-                                .desired_rows(18)
-                                .desired_width(f32::INFINITY),
-                        )
-                        .changed();
-                });
-            if changed {
-                self.invalidate();
-            }
-
+            // 视图切换条固定在顶部，不随内容滚动——两个视图是「同一张符的两面」。
             ui.horizontal(|ui| {
-                if ui.button("① 校验符印").clicked() {
-                    self.verify();
-                }
-                if ui.button("② 成符 · 盖印 · 待焚").clicked() {
-                    self.dry_run();
-                }
-                let can_burn = self.plan.is_some() && self.burning.is_none();
-                ui.add_enabled_ui(can_burn, |ui| {
-                    if ui.button("③ 焚符").clicked() && self.confirm_checked {
-                        self.burn();
+                widgets::section_title(ui, "法坛", "仪轨 · 判定 · 不可撤销", theme::c::CINNABAR);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .selectable_label(
+                            self.view == ViewMode::Paper,
+                            egui::RichText::new("符文 · 符纸")
+                                .size(theme::t::SMALL)
+                                .color(theme::c::GOLD),
+                        )
+                        .clicked()
+                    {
+                        self.view = ViewMode::Paper;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.view == ViewMode::Altar,
+                            egui::RichText::new("法坛 · 仪轨")
+                                .size(theme::t::SMALL)
+                                .color(theme::c::INK_SOFT),
+                        )
+                        .clicked()
+                    {
+                        self.view = ViewMode::Altar;
                     }
                 });
-                ui.checkbox(&mut self.confirm_checked, "我确认焚化不可撤销");
             });
-            ui.horizontal(|ui| {
-                ui.checkbox(
-                    &mut self.allow_high_risk,
-                    "免逐次弹窗：预授权放行全部高危召将",
-                )
-                .on_hover_text(
-                    "不勾选（默认）：每个需要确认的召将在执行前弹出「敕门」卡片，\
-                     逐次问人，拒绝的理由会回喂给模型换路；\
-                     勾选等于一次性预授权，整张符不再弹窗。两种路径都会记入缴符。",
-                );
-            });
+            widgets::divider(ui, theme::c::HAIRLINE);
 
-            ui.separator();
-            if self.burning.is_some() {
+            // 窗口矮时动作按钮会被裁到窗外——整栏可滚，按钮与敕门卡片总能滚到视口内。
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match self.view {
+                    ViewMode::Altar => self.altar_view(ui, ctx),
+                    ViewMode::Paper => self.paper_studio(ui, ctx),
+                });
+        });
+    }
+
+    /// 法坛视图：只放「仪轨与判定」。写符的事全部交给符文界面。
+    fn altar_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        widgets::card(ui, theme::c::GOLD_DEEP, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("当前符")
+                        .size(theme::t::SMALL)
+                        .color(theme::c::INK_MUTED),
+                );
+                let name = fulu_app::parse_fu(&self.fu_text)
+                    .map(|fu| fu.name)
+                    .unwrap_or_else(|_| "（正文当前不能解析）".to_owned());
+                ui.label(
+                    egui::RichText::new(name)
+                        .size(theme::t::BODY_LG)
+                        .strong()
+                        .color(theme::c::INK),
+                );
+                if self.seal.is_some() {
+                    widgets::chip(ui, "已盖印", theme::c::GOLD, theme::c::SUNKEN);
+                } else {
+                    widgets::chip(ui, "未盖印", theme::c::INK_MUTED, theme::c::SUNKEN);
+                }
+            });
+            ui.label(
+                egui::RichText::new("符印只认当下的字：正文改一个字，之前的待焚计划立即作废。")
+                    .size(theme::t::SMALL)
+                    .color(theme::c::INK_MUTED),
+            );
+        });
+        if widgets::ritual_button(ui, "去符文界面改这张符", widgets::ButtonKind::Rite, true)
+            .clicked()
+        {
+            self.view = ViewMode::Paper;
+        }
+        widgets::divider(ui, theme::c::HAIRLINE);
+
+        // ---- 三步动作条：红线 1「dry-run 之前不给焚符按钮 + 焚符要勾选确认」----
+        ui.horizontal_wrapped(|ui| {
+            if widgets::ritual_button(ui, "① 校验符印", widgets::ButtonKind::Rite, true).clicked()
+            {
+                self.verify();
+            }
+            if widgets::ritual_button(ui, "② 成符 · 盖印 · 待焚", widgets::ButtonKind::Rite, true)
+                .clicked()
+            {
+                self.dry_run();
+            }
+            // 焚符的 enabled 同时看「计划存在 / 没在焚 / 已勾选确认」。
+            // 比旧版（按钮亮着但点了不生效）更诚实；门面 ignite(confirmed) 仍有兜底，
+            // 红线没有被这里放宽，只是把「待确认」画成了默认态。
+            let can_burn = self.plan.is_some() && self.burning.is_none() && self.confirm_checked;
+            if widgets::ritual_button(ui, "③ 焚符", widgets::ButtonKind::Ignite, can_burn).clicked()
+            {
+                self.burn();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.confirm_checked, "我确认焚化不可撤销");
+            ui.label(
+                egui::RichText::new("整符级闸门")
+                    .size(theme::t::CAPTION)
+                    .color(theme::c::INK_MUTED),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut self.allow_high_risk,
+                "免逐次弹窗：预授权放行全部高危召将",
+            )
+            .on_hover_text(
+                "不勾选（默认）：每个需要确认的召将在执行前弹出「敕门」卡片，\
+                 逐次问人，拒绝的理由会回喂给模型换路；\
+                 勾选等于一次性预授权，整张符不再弹窗。两种路径都会记入缴符。",
+            );
+            widgets::honesty_badge(ui, widgets::Honesty::FailClosed);
+        });
+        ui.label(
+            egui::RichText::new(
+                "两道闸门互不替代：整符勾选决定是否起炉，逐次敕门决定每个高危召将放不放行。",
+            )
+            .size(theme::t::SMALL)
+            .color(theme::c::INK_MUTED),
+        );
+        widgets::divider(ui, theme::c::HAIRLINE);
+
+        // ---- 焚化中：后台线程，界面仍可操作，但不能重复提交 ----
+        if self.burning.is_some() {
+            widgets::card(ui, theme::c::EMBER, |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("焚符中……（后台线程，界面仍可操作，但不能重复提交）");
@@ -1409,17 +1746,51 @@ impl FuluApp {
                         }
                     });
                 });
-            }
+            });
+        }
 
-            // 敕门卡片：默认逐次问人，答完即弃。
-            if let Some(exchange) = self.pending_confirm.clone() {
-                let (request, reply) = &exchange;
-                ui.separator();
-                ui.heading("敕门 · 高危召将等待确认");
-                ui.label(egui::RichText::new(request.summary()).strong());
+        // ---- 敕门卡片：默认逐次问人，答完即弃 ----
+        if let Some(exchange) = self.pending_confirm.clone() {
+            let (request, reply) = &exchange;
+            widgets::card(ui, theme::c::CINNABAR, |ui| {
+                widgets::section_title(
+                    ui,
+                    "敕门 · 高危召将等待确认",
+                    "逐次闸门 · 答完即弃",
+                    theme::c::CINNABAR,
+                );
+                ui.label(
+                    egui::RichText::new(request.summary())
+                        .strong()
+                        .color(theme::c::INK),
+                );
                 if !request.description.is_empty() {
                     ui.label(&request.description);
                 }
+                // 权限 / 风险正交：风险与确认档位来自本次真实请求，权限来自本符箓层。
+                // 风险来源未随 ConfirmRequest 下发，如实写「未随请求下发」，不编造。
+                let (permission, level) = match self.loaded.as_ref().map(|fu| &fu.harness.sandbox) {
+                    Some(fulu_app::Sandbox::Strict) => ("只读", 1),
+                    Some(fulu_app::Sandbox::Limited) => ("受限执行", 2),
+                    Some(fulu_app::Sandbox::Full) => ("完全执行", 3),
+                    None => ("未成符", 0),
+                };
+                let risk_color = match request.risk {
+                    RiskClass::Observe => theme::c::JADE,
+                    RiskClass::Mutate => theme::c::WARN,
+                    RiskClass::Destructive => theme::c::BAD,
+                };
+                widgets::axes(
+                    ui,
+                    widgets::Axes {
+                        permission,
+                        permission_level: level,
+                        risk: request.risk.label(),
+                        risk_color,
+                        confirmation: request.confirmation.label(),
+                        source: "未随请求下发",
+                    },
+                );
                 ui.label("参数原文（模型输出，原样展示，不解释）：");
                 egui::ScrollArea::vertical()
                     .id_salt("confirm_args")
@@ -1428,19 +1799,41 @@ impl FuluApp {
                         ui.monospace(&request.arguments_json);
                     });
                 ui.horizontal(|ui| {
-                    if ui.button("敕可 · 本次放行").clicked() {
+                    if widgets::ritual_button(
+                        ui,
+                        "敕可 · 本次放行",
+                        widgets::ButtonKind::Rite,
+                        true,
+                    )
+                    .clicked()
+                    {
                         let _ = reply.send(ConfirmVerdict::Allow);
                         self.pending_confirm = None;
                     }
-                    if ui.button("敕否 · 本次拒绝").clicked() {
+                    if widgets::ritual_button(
+                        ui,
+                        "敕否 · 本次拒绝",
+                        widgets::ButtonKind::Ghost,
+                        true,
+                    )
+                    .clicked()
+                    {
                         let _ = reply.send(ConfirmVerdict::Deny);
                         self.pending_confirm = None;
                     }
                 });
-            }
+            });
+        }
 
-            if let Some(plan) = &self.plan {
-                ui.heading("待焚计划");
+        // ---- 待焚计划：确认前必须看得见的影响面 ----
+        if let Some(plan) = &self.plan {
+            widgets::card(ui, theme::c::GOLD, |ui| {
+                widgets::section_title(
+                    ui,
+                    "待焚计划",
+                    "dry-run · 零网络 · 确认前的影响面",
+                    theme::c::GOLD,
+                );
                 egui::ScrollArea::vertical()
                     .id_salt("plan")
                     .max_height(260.0)
@@ -1449,11 +1842,17 @@ impl FuluApp {
                             ui.monospace(line);
                         }
                     });
-            }
+            });
+        }
 
-            // 焚化途中的增量：明确标注「不是回执」，免得半份正文被当结果。
-            if self.burning.is_some() && !self.live_text.is_empty() {
-                ui.heading("焚化中（增量，非回执）");
+        // ---- 焚化途中的增量：明确标注「不是回执」----
+        if self.burning.is_some() && !self.live_text.is_empty() {
+            widgets::card(ui, theme::c::EMBER, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("焚化中（增量）").strong());
+                    widgets::honesty_badge(ui, widgets::Honesty::NotResult);
+                    widgets::honesty_badge(ui, widgets::Honesty::DisplayOnly);
+                });
                 ui.label("这些字只用于看进度；工具调用仍须收齐后过箓与敕门，判定一律以回执为准。");
                 egui::ScrollArea::vertical()
                     .max_height(120.0)
@@ -1461,10 +1860,17 @@ impl FuluApp {
                     .show(ui, |ui| {
                         ui.monospace(&self.live_text);
                     });
-                ui.separator();
-            }
-            if let Some(receipt) = &self.receipt {
-                ui.heading("回执");
+            });
+        }
+        if let Some(receipt) = &self.receipt {
+            let accent = terminal_from_label(receipt.state.label())
+                .map(|s| s.color())
+                .unwrap_or(theme::c::GOLD);
+            widgets::card(ui, accent, |ui| {
+                widgets::section_title(ui, "回执", "判定以回执为准", accent);
+                if let Some(end) = terminal_from_label(receipt.state.label()) {
+                    widgets::terminal_badge(ui, end);
+                }
                 ui.monospace(format!("状态       : {}", receipt.state.label()));
                 ui.monospace(format!("正文       : {}", receipt.text));
                 ui.monospace(format!(
@@ -1477,80 +1883,204 @@ impl FuluApp {
                         ""
                     }
                 ));
-            }
+                if receipt.estimated_usage {
+                    widgets::honesty_badge(ui, widgets::Honesty::Estimated);
+                }
+            });
+        }
 
-            ui.separator();
-            self.save_and_form(ui);
-            self.model_and_session(ui);
-            self.settings(ui);
-                });
-            let _ = ctx;
-        });
+        widgets::divider(ui, theme::c::HAIRLINE);
+        self.model_and_session(ui);
+        self.settings(ui);
+        let _ = ctx;
     }
 
-    /// T36：符纸视图。
+    /// 符文界面：把「这张符」当作唯一主角的一屏。
     ///
-    /// 全部用 `egui::Painter` 画矢量，**不用 HTML/CSS/WebView**（`docs/02` 第 7 节的
-    /// 视觉约定），版式数字全部来自 `paper::plan`（背后是 `fulu-script` 的云篆描述）。
-    /// 这里只做三件事：把归一化版式乘成像素、把热区做成可点、把「未成符 / 截断 /
-    /// 已盖印 / 火光」如实画出来——**不画任何能让人误会成「已完成」的东西**。
+    /// 金纸案台（左）+ 选中段与云篆（右）+ 字段表单 + 符文正文编辑器。
+    /// 与法坛视图刻意分开：写符时不需要看仪轨按钮，执行时不需要看九段纸面。
+    fn paper_studio(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        widgets::section_title(
+            ui,
+            "符文 · 符纸案台",
+            "九段部件 · 点段跳字段 · 缺段不伪装",
+            theme::c::GOLD,
+        );
+        ui.horizontal_wrapped(|ui| {
+            widgets::honesty_badge(ui, widgets::Honesty::DisplayOnly);
+            widgets::chip(
+                ui,
+                "版式由 fulu-script 云篆描述层驱动",
+                theme::c::JADE,
+                theme::c::SUNKEN,
+            );
+            if self.seal.is_some() {
+                widgets::chip(ui, "已盖朱砂印", theme::c::SEAL_RED, theme::c::SUNKEN);
+            } else {
+                widgets::chip(ui, "未盖印", theme::c::INK_MUTED, theme::c::SUNKEN);
+            }
+        });
+        ui.add_space(theme::s::SM);
+
+        self.paper_view(ui, ctx);
+
+        widgets::divider(ui, theme::c::HAIRLINE);
+        self.save_and_form(ui);
+
+        widgets::divider(ui, theme::c::HAIRLINE);
+        ui.label(
+            egui::RichText::new("符文正文（YAML / .fu）· 改了就要重新盖印")
+                .size(theme::t::BODY)
+                .strong()
+                .color(theme::c::INK),
+        );
+        let mut changed = false;
+        egui::ScrollArea::vertical()
+            .id_salt("fu_editor_studio")
+            .max_height(260.0)
+            .show(ui, |ui| {
+                changed = ui
+                    .add(
+                        egui::TextEdit::multiline(&mut self.fu_text)
+                            .code_editor()
+                            .desired_rows(14)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .changed();
+            });
+        if changed {
+            self.invalidate();
+        }
+        ui.label(
+            egui::RichText::new(
+                "保存会按规范格式重写正文（注释 / 字段顺序 / 空行会丢），原文件不会被静默改写。",
+            )
+            .size(theme::t::CAPTION)
+            .color(theme::c::INK_MUTED),
+        );
+    }
+
+    /// 符文界面的主视觉：金纸案台 + 九段符纸。
+    ///
+    /// 全部用 `egui::Painter` 画矢量，不用 HTML/CSS/WebView；版式数字仍全部来自
+    /// `paper::plan`（背后是 `fulu-script` 云篆描述层），GUI 只把归一化坐标乘成像素。
+    ///
+    /// 四条诚实性约束在这里逐条落地：
+    /// 1. 解不出符就**不画**，宁可空白也不拿半张符冒充符纸；
+    /// 2. 缺段是数据判断（`zone.filled`），画成灰底虚线 + 「未成符」，绝不假装完整；
+    /// 3. `truncated` 必须显式标出来，绝不静默丢字；
+    /// 4. 符头云纹 / 朱砂印 / 火光 / 笔顺全是**纯视觉**，不承载任何状态判定。
     fn paper_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // 解不出符就不画：宁可空白，也不拿半张符冒充符纸。
+        // 解不出符就不画。
         let fu = match fulu_app::parse_fu(&self.fu_text) {
             Ok(fu) => fu,
             Err(error) => {
-                ui.label(
-                    egui::RichText::new(format!("符纸视图：正文当前不能解析（{error}）"))
-                        .small()
-                        .weak(),
-                );
+                widgets::card(ui, theme::c::BAD, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("符纸视图：正文当前不能解析（{error}）"))
+                            .size(theme::t::SMALL)
+                            .color(theme::c::INK_MUTED),
+                    );
+                });
                 return;
             }
         };
         let script = fulu_script::describe_cloud(&fu);
         let layout = paper::plan(&fu, &script);
 
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("符纸视图 · 九段热区（点击选段，去字段表单改）")
-                    .small()
-                    .weak(),
-            );
-            if layout.truncated {
-                ui.label(
-                    egui::RichText::new("正文超出版式，符胆末行已省略")
-                        .small()
-                        .color(egui::Color32::from_rgb(0xB4, 0x5F, 0x06)),
-                );
+        // 纸面文字按可用像素宽度裁剪，超出一定补 `…`：宁可显式说「这里截了」，
+        // 也不让长正文溢出纸边框、糊到下一段上（不静默丢字是符纸的硬约束）。
+        // 中文按 1em 保守估宽，ASCII 会显得短一点，但绝不会越界。
+        fn elide(text: &str, max_width: f32, font_size: f32) -> String {
+            if max_width < font_size {
+                return String::new();
             }
-        });
-
-        let missing = layout.missing();
-        if !missing.is_empty() {
-            let names: Vec<&str> = missing.iter().map(|band| band.label()).collect();
-            ui.label(
-                egui::RichText::new(format!("未成符：{}（灰底虚线）", names.join("、")))
-                    .small()
-                    .color(egui::Color32::from_rgb(0x8A, 0x8A, 0x8A)),
-            );
+            let max_chars = (max_width / font_size).floor() as usize;
+            let chars: Vec<char> = text.chars().collect();
+            if chars.len() <= max_chars {
+                return text.to_owned();
+            }
+            let mut shown: String = chars
+                .into_iter()
+                .take(max_chars.saturating_sub(1))
+                .collect();
+            shown.push('…');
+            shown
         }
 
-        // 纸面尺寸：3:5 竖长方，装进可用区域（缩放在 `paper::fit` 里，有单测）。
+        ui.horizontal_wrapped(|ui| {
+            widgets::chip(ui, "九段 · 3:5 竖长方", theme::c::GOLD, theme::c::SUNKEN);
+            let missing = layout.missing();
+            if missing.is_empty() {
+                widgets::chip(ui, "九段俱全", theme::c::GOOD, theme::c::SUNKEN);
+            } else {
+                let names: Vec<&str> = missing.iter().map(|band| band.label()).collect();
+                widgets::chip(
+                    ui,
+                    &format!("未成符：{}（灰底虚线）", names.join("、")),
+                    theme::c::WARN,
+                    theme::c::SUNKEN,
+                );
+            }
+            if layout.truncated {
+                widgets::honesty_badge(ui, widgets::Honesty::Truncated);
+            }
+        });
+        ui.add_space(theme::s::SM);
+
+        // 纸面尺寸：3:5 竖长方，缩放规则在 paper::fit 里（有单测）。
         let (paper_w, paper_h) =
             paper::fit(layout.aspect, ui.available_width(), ui.available_height());
         ui.horizontal_top(|ui| {
-            let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(paper_w, paper_h), egui::Sense::click());
-            let painter = ui.painter_at(rect);
+            let desk_w = paper_w + 24.0;
+            let desk_h = paper_h + 24.0;
+            let (desk_rect, _) =
+                ui.allocate_exact_size(egui::vec2(desk_w, desk_h), egui::Sense::hover());
+            let painter = ui.painter_at(desk_rect);
+            widgets::paper_backdrop(&painter, desk_rect);
+            let rect = egui::Rect::from_min_size(
+                desk_rect.min + egui::vec2(12.0, 12.0),
+                egui::vec2(paper_w, paper_h),
+            );
+            let response = ui.interact(
+                rect,
+                ui.make_persistent_id("fulu_paper_hotspots"),
+                egui::Sense::click(),
+            );
 
-            // 金纸底 + 朱砂细边。
-            painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(0xF3, 0xE7, 0xC8));
+            // 金纸：方正无圆角，双层边框（外粗内细），与界面控件的圆角形成材质对比。
+            painter.rect_filled(rect, theme::r::PAPER, theme::c::PAPER);
             painter.rect_stroke(
                 rect,
-                4.0,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(0xB9, 0x8A, 0x4E)),
+                theme::r::PAPER,
+                egui::Stroke::new(2.0, theme::c::PAPER_EDGE),
                 egui::StrokeKind::Inside,
             );
+            painter.rect_stroke(
+                rect.shrink(5.0),
+                theme::r::PAPER,
+                egui::Stroke::new(0.6, theme::c::GOLD_DEEP),
+                egui::StrokeKind::Inside,
+            );
+
+            // 符头云纹：抽象几何装饰（三清点 + 两侧卷云），明确不是云篆书法字形。
+            let cx = rect.center().x;
+            let cy = rect.top() + 9.0;
+            for dx in [-8.0, 0.0, 8.0] {
+                painter.circle_filled(egui::pos2(cx + dx, cy), 1.6, theme::c::SEAL_RED);
+            }
+            for side in [-1.0_f32, 1.0] {
+                let base = cx + side * 22.0;
+                painter.add(egui::Shape::line(
+                    vec![
+                        egui::pos2(base, cy + 4.0),
+                        egui::pos2(base + side * 10.0, cy + 4.0),
+                        egui::pos2(base + side * 14.0, cy),
+                        egui::pos2(base + side * 10.0, cy - 4.0),
+                    ],
+                    egui::Stroke::new(1.0, theme::c::GOLD_DEEP),
+                ));
+            }
 
             let hover_y = response
                 .hover_pos()
@@ -1558,30 +2088,38 @@ impl FuluApp {
             let hovered_zone = hover_y.and_then(|y| layout.band_at(y));
             let hovered = hovered_zone.map(|zone| zone.band);
 
-            for zone in &layout.zones {
+            for (index, zone) in layout.zones.iter().enumerate() {
                 let top = rect.top() + zone.start * rect.height();
                 let bottom = rect.top() + zone.end * rect.height();
                 let band_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left(), top),
-                    egui::pos2(rect.right(), bottom),
+                    egui::pos2(rect.left() + 5.0, top),
+                    egui::pos2(rect.right() - 5.0, bottom),
                 );
                 let selected = self.paper_pick == Some(zone.band);
                 if selected {
                     painter.rect_filled(
                         band_rect,
                         0.0,
-                        egui::Color32::from_rgba_unmultiplied(0xC0, 0x39, 0x2B, 26),
+                        egui::Color32::from_rgba_unmultiplied(0xB2, 0x3B, 0x28, 24),
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            band_rect.min,
+                            egui::vec2(3.0, band_rect.height()),
+                        ),
+                        0.0,
+                        theme::c::SEAL_RED,
                     );
                 } else if hovered == Some(zone.band) {
                     painter.rect_filled(
                         band_rect,
                         0.0,
-                        egui::Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 10),
+                        egui::Color32::from_rgba_unmultiplied(0x7A, 0x5A, 0x30, 14),
                     );
                 }
                 if !zone.filled {
                     // 缺部件：灰底 + 顶部虚线，明确「这里还没写」。
-                    painter.rect_filled(band_rect, 0.0, egui::Color32::from_rgb(0xE4, 0xDF, 0xD2));
+                    painter.rect_filled(band_rect, 0.0, theme::c::PAPER_MISSING);
                     let mut x = band_rect.left() + 2.0;
                     while x < band_rect.right() - 2.0 {
                         painter.line_segment(
@@ -1589,84 +2127,151 @@ impl FuluApp {
                                 egui::pos2(x, band_rect.top() + 1.0),
                                 egui::pos2((x + 4.0).min(band_rect.right()), band_rect.top() + 1.0),
                             ],
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x9A, 0x93, 0x84)),
+                            egui::Stroke::new(1.0, theme::c::PAPER_MISSING_INK),
                         );
                         x += 7.0;
                     }
                 }
-                // 段名：竖排太窄，横排小字压在左上角，不抢正文。
-                painter.text(
-                    egui::pos2(band_rect.left() + 4.0, band_rect.top() + 2.0),
-                    egui::Align2::LEFT_TOP,
-                    zone.band.label(),
-                    egui::FontId::proportional(9.0),
-                    egui::Color32::from_rgb(0x8A, 0x6A, 0x3B),
+                // 段间细线：让九段的节奏可读，而不是一整块黄纸。
+                painter.line_segment(
+                    [
+                        egui::pos2(band_rect.left(), bottom),
+                        egui::pos2(band_rect.right(), bottom),
+                    ],
+                    egui::Stroke::new(
+                        0.5,
+                        egui::Color32::from_rgba_unmultiplied(0xB9, 0x8A, 0x4E, 90),
+                    ),
                 );
 
-                // 内容：从段名下方起画，行高按段高与行数取小，绝不让字溢出条带。
-                let text_left = band_rect.left() + 4.0;
-                let text_top = band_rect.top() + 12.0;
-                let avail_h = (band_rect.height() - 12.0).max(0.0);
-                let rows = zone.lines.len().max(1) as f32;
-                let line_h = (avail_h / rows).clamp(7.0, 13.0);
-                if zone.lines.is_empty() || zone.lines.iter().all(|line| line.trim().is_empty()) {
+                // 段号（等宽暗金）/ 段名（纸面棕）/ 正文（纸面墨）。
+                // 字号从历史 9.0/9.5 提到 11px——中文小字终于达到可读下限。
+                painter.text(
+                    egui::pos2(band_rect.left() + 2.0, band_rect.top() + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{:02}", index + 1),
+                    egui::FontId::monospace(theme::t::PAPER_MIN),
+                    theme::c::GOLD_DEEP,
+                );
+                let compact = band_rect.height() < 30.0;
+                let name_x = band_rect.left() + 24.0;
+                painter.text(
+                    egui::pos2(name_x, band_rect.top() + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    zone.band.label(),
+                    egui::FontId::proportional(theme::t::PAPER_MIN),
+                    theme::c::PAPER_BROWN,
+                );
+
+                let empty_label = if zone.filled {
+                    "（空）"
+                } else {
+                    "未成符"
+                };
+                let text_color = if zone.filled {
+                    theme::c::PAPER_INK
+                } else {
+                    theme::c::PAPER_MISSING_INK
+                };
+                if compact {
+                    let first = zone
+                        .lines
+                        .first()
+                        .filter(|line| !line.trim().is_empty())
+                        .map(String::as_str)
+                        .unwrap_or(empty_label);
+                    let body_x = name_x + 48.0;
+                    let body_w = (band_rect.right() - 4.0 - body_x).max(0.0);
                     painter.text(
-                        egui::pos2(text_left, text_top),
+                        egui::pos2(body_x, band_rect.top() + 2.0),
                         egui::Align2::LEFT_TOP,
-                        if zone.filled {
-                            "（空）"
-                        } else {
-                            "未成符"
-                        },
-                        egui::FontId::proportional(9.0),
-                        egui::Color32::from_rgb(0x9A, 0x93, 0x84),
+                        elide(first, body_w, theme::t::PAPER_MIN),
+                        egui::FontId::proportional(theme::t::PAPER_MIN),
+                        text_color,
                     );
                 } else {
-                    for (index, line) in zone.lines.iter().enumerate() {
-                        let y = text_top + index as f32 * line_h;
-                        if y + line_h > band_rect.bottom() {
-                            break;
-                        }
+                    let text_top = band_rect.top() + 16.0;
+                    let avail_h = (band_rect.height() - 16.0).max(0.0);
+                    let rows = zone.lines.len().max(1) as f32;
+                    let line_h = (avail_h / rows).clamp(11.0, 15.0);
+                    if zone.lines.is_empty() || zone.lines.iter().all(|line| line.trim().is_empty())
+                    {
                         painter.text(
-                            egui::pos2(text_left, y),
+                            egui::pos2(name_x, text_top),
                             egui::Align2::LEFT_TOP,
-                            line,
-                            egui::FontId::proportional(9.5),
-                            egui::Color32::from_rgb(0x2B, 0x24, 0x1B),
+                            empty_label,
+                            egui::FontId::proportional(theme::t::PAPER_MIN),
+                            text_color,
                         );
+                    } else {
+                        for (line_index, line) in zone.lines.iter().enumerate() {
+                            let y = text_top + line_index as f32 * line_h;
+                            if y + line_h > band_rect.bottom() {
+                                break;
+                            }
+                            painter.text(
+                                egui::pos2(name_x, y),
+                                egui::Align2::LEFT_TOP,
+                                elide(
+                                    line,
+                                    (band_rect.right() - 4.0 - name_x).max(0.0),
+                                    theme::t::PAPER_MIN,
+                                ),
+                                egui::FontId::proportional(theme::t::PAPER_MIN),
+                                text_color,
+                            );
+                        }
                     }
                 }
             }
 
-            // 盖印：只有校验过（`self.seal` 有值）才盖，朱砂方印压在符脚右下。
+            // 朱砂方印：只有校验过（self.seal 有值）才盖。双框 + 印文 + 符印短摘要。
             if let Some(seal) = &self.seal {
-                let side = (paper_w * 0.22).clamp(22.0, 40.0);
+                let side = (paper_w * 0.22).clamp(26.0, 44.0);
                 let stamp = egui::Rect::from_min_size(
-                    egui::pos2(rect.right() - side - 6.0, rect.bottom() - side - 6.0),
+                    egui::pos2(rect.right() - side - 8.0, rect.bottom() - side - 8.0),
                     egui::vec2(side, side),
+                );
+                painter.rect_filled(
+                    stamp,
+                    2.0,
+                    egui::Color32::from_rgba_unmultiplied(0xB2, 0x3B, 0x28, 20),
                 );
                 painter.rect_stroke(
                     stamp,
                     2.0,
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(0xC0, 0x39, 0x2B)),
+                    egui::Stroke::new(2.0, theme::c::SEAL_RED),
+                    egui::StrokeKind::Inside,
+                );
+                painter.rect_stroke(
+                    stamp.shrink(3.0),
+                    0.0,
+                    egui::Stroke::new(0.7, theme::c::SEAL_RED),
                     egui::StrokeKind::Inside,
                 );
                 painter.text(
                     stamp.center(),
                     egui::Align2::CENTER_CENTER,
+                    "符",
+                    egui::FontId::proportional(16.0),
+                    theme::c::SEAL_RED,
+                );
+                painter.text(
+                    egui::pos2(stamp.center().x, stamp.bottom() + 2.0),
+                    egui::Align2::CENTER_TOP,
                     &seal[..8.min(seal.len())],
-                    egui::FontId::proportional(8.0),
-                    egui::Color32::from_rgb(0xC0, 0x39, 0x2B),
+                    egui::FontId::monospace(8.0),
+                    theme::c::SEAL_RED,
                 );
             }
 
-            // 火光：焚符成功后 0.9 秒内从符心向外淡出的暖光。纯视觉，不影响任何状态。
+            // 火光：焚符成功后 0.9 秒内从符心向外淡出。纯视觉，不影响任何状态。
             if let Some(start) = self.fire_at {
                 let elapsed = start.elapsed().as_secs_f32();
-                if elapsed >= 0.9 {
+                if elapsed >= theme::m::FIRE_MS as f32 / 1000.0 {
                     self.fire_at = None;
                 } else {
-                    let t = 1.0 - elapsed / 0.9;
+                    let t = 1.0 - elapsed / (theme::m::FIRE_MS as f32 / 1000.0);
                     let radius = paper_w * (0.25 + 0.55 * (1.0 - t));
                     for ring in 0..3 {
                         let alpha = ((t * 70.0) as u8).saturating_sub(ring * 18);
@@ -1676,7 +2281,12 @@ impl FuluApp {
                         painter.circle_filled(
                             rect.center(),
                             radius * (1.0 - ring as f32 * 0.22),
-                            egui::Color32::from_rgba_unmultiplied(0xE0, 0x6A, 0x1B, alpha),
+                            egui::Color32::from_rgba_unmultiplied(
+                                theme::c::EMBER.r(),
+                                theme::c::EMBER.g(),
+                                theme::c::EMBER.b(),
+                                alpha,
+                            ),
                         );
                     }
                     ctx.request_repaint();
@@ -1696,9 +2306,9 @@ impl FuluApp {
                     _ => None,
                 };
                 if self.form.is_none()
-                    && let Ok(fu) = fulu_app::parse_fu(&self.fu_text)
+                    && let Ok(parsed) = fulu_app::parse_fu(&self.fu_text)
                 {
-                    self.form = Some(fu);
+                    self.form = Some(parsed);
                 }
                 self.form_open = self.form.is_some();
                 let hint = match band {
@@ -1725,22 +2335,26 @@ impl FuluApp {
 
             // 右侧：选中段的字段清单 + 云篆笔画基元（抽象几何，非书法字形）。
             ui.vertical(|ui| {
+                widgets::section_title(ui, "选中段", "点左侧符纸条带", theme::c::SEAL_RED);
                 if let Some(band) = self.paper_pick {
-                    ui.label(egui::RichText::new(format!("选中：{}", band.label())).strong());
-                    ui.label(egui::RichText::new(band.fields()).small().monospace());
+                    ui.label(
+                        egui::RichText::new(format!("{} · {}", band.label(), band.fields()))
+                            .size(theme::t::SMALL)
+                            .color(theme::c::INK),
+                    );
                 } else {
                     ui.label(
                         egui::RichText::new("点左侧任一符纸条带，看它对应哪些字段。")
-                            .small()
-                            .weak(),
+                            .size(theme::t::SMALL)
+                            .color(theme::c::INK_MUTED),
                     );
                 }
-                ui.add_space(6.0);
+                widgets::divider(ui, theme::c::HAIRLINE);
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("云篆笔画基元（归一化折线，T39 数据源）")
-                            .small()
-                            .weak(),
+                        egui::RichText::new("云篆笔画基元")
+                            .size(theme::t::SMALL)
+                            .color(theme::c::GOLD),
                     );
                     if ui
                         .small_button(if self.cloud_anim_at.is_some() {
@@ -1753,12 +2367,18 @@ impl FuluApp {
                         self.cloud_anim_at = Some(std::time::Instant::now());
                     }
                 });
+                ui.horizontal_wrapped(|ui| {
+                    widgets::honesty_badge(ui, widgets::Honesty::DisplayOnly);
+                    ui.label(
+                        egui::RichText::new("抽象几何，非书法字形")
+                            .size(theme::t::CAPTION)
+                            .color(theme::c::INK_MUTED),
+                    );
+                });
 
-                // 笔顺演示（T36）：按 T39 描述层把六笔依次「写」出来。纯视觉，
-                // 不影响任何状态；时长分配来自 fulu_script::stroke_schedule，
-                // 截笔来自 partial_polyline——GUI 只做映射与画笔。
-                const CLOUD_ANIM_REQUEST_MS: u64 = 2400;
-                let schedule = fulu_script::stroke_schedule(script.strokes, CLOUD_ANIM_REQUEST_MS);
+                // 笔顺演示：时长分配来自 fulu_script::stroke_schedule，截笔来自
+                // partial_polyline——GUI 只做映射与画笔，纯视觉不影响任何状态。
+                let schedule = fulu_script::stroke_schedule(script.strokes, theme::m::STROKE_MS);
                 let mut anim_ms = self
                     .cloud_anim_at
                     .map(|start| start.elapsed().as_millis() as u64);
@@ -1769,13 +2389,12 @@ impl FuluApp {
                     self.cloud_anim_at = None; // 演示完毕，回到静态完整笔画
                     anim_ms = None;
                 }
-                let ink = egui::Color32::from_rgb(0x2B, 0x24, 0x1B);
+                let ink = theme::c::PAPER_INK;
                 let guide = egui::Color32::from_rgba_unmultiplied(0xB9, 0x8A, 0x4E, 70);
-                let accent = egui::Color32::from_rgb(0xE0, 0x6A, 0x1B);
-
-                let cell = 26.0;
+                let accent = theme::c::EMBER;
+                let cell = 30.0;
                 let (strip, _) = ui.allocate_exact_size(
-                    egui::vec2(cell * script.strokes.len() as f32 + 4.0, cell),
+                    egui::vec2(cell * script.strokes.len() as f32 + 4.0, cell + 12.0),
                     egui::Sense::hover(),
                 );
                 let strip_painter = ui.painter_at(strip);
@@ -1783,7 +2402,6 @@ impl FuluApp {
                     let origin = egui::pos2(strip.left() + index as f32 * cell + 2.0, strip.top());
                     let box_rect = egui::Rect::from_min_size(origin, egui::vec2(cell - 4.0, cell));
 
-                    // 该笔当前处于哪个阶段：未到 / 正在写（千分比进度）/ 已写完。
                     enum Phase {
                         Pending,
                         Active(u32),
@@ -1801,22 +2419,20 @@ impl FuluApp {
                         },
                     };
                     let is_current = matches!(phase, Phase::Active(_));
-
+                    strip_painter.rect_filled(box_rect, 2.0, theme::c::RAISED);
                     strip_painter.rect_stroke(
                         box_rect,
                         2.0,
                         egui::Stroke::new(
-                            if is_current { 1.0 } else { 0.5 },
+                            if is_current { 1.2 } else { 0.6 },
                             if is_current {
                                 accent
                             } else {
-                                egui::Color32::from_rgb(0xB9, 0x8A, 0x4E)
+                                theme::c::GOLD_DEEP
                             },
                         ),
                         egui::StrokeKind::Inside,
                     );
-
-                    // 归一化点 → 像素；正在写的那笔用 partial_polyline 截到当前进度。
                     let to_pixel = |(x, y): &(i32, i32)| {
                         egui::pos2(
                             box_rect.left() + (*x as f32 / 1000.0) * box_rect.width(),
@@ -1837,15 +2453,15 @@ impl FuluApp {
                     if points.len() >= 2 {
                         strip_painter.add(egui::Shape::line(
                             points,
-                            egui::Stroke::new(if is_current { 1.6 } else { 1.2 }, color),
+                            egui::Stroke::new(if is_current { 1.8 } else { 1.3 }, color),
                         ));
                     }
                     strip_painter.text(
                         egui::pos2(box_rect.center().x, box_rect.bottom() + 1.0),
                         egui::Align2::CENTER_TOP,
                         stroke.name,
-                        egui::FontId::proportional(8.0),
-                        egui::Color32::from_rgb(0x8A, 0x6A, 0x3B),
+                        egui::FontId::proportional(theme::t::CAPTION),
+                        theme::c::GOLD,
                     );
                 }
                 if let Some(ms) = anim_ms {
@@ -1859,7 +2475,8 @@ impl FuluApp {
                                 index + 1,
                                 script.strokes[index].name
                             ))
-                            .small(),
+                            .size(theme::t::SMALL)
+                            .color(theme::c::EMBER),
                         );
                     }
                     ui.ctx().request_repaint(); // 动画进行中，每帧重绘
@@ -2064,6 +2681,20 @@ impl FuluApp {
                         .weak(),
                     );
                 });
+                // 清单未固化 sha256 时，界面必须显式标 UNVERIFIED，绝不替清单说好话。
+                // 用统一的诚实性标注原子，而不是只靠文本里的一串英文。
+                if self
+                    .model_lines
+                    .iter()
+                    .any(|line| line.contains("UNVERIFIED"))
+                {
+                    widgets::honesty_badge(ui, widgets::Honesty::Unverified);
+                    ui.label(
+                        egui::RichText::new("清单未固化 sha256 · 界面不替清单说好话")
+                            .size(theme::t::CAPTION)
+                            .color(theme::c::INK_MUTED),
+                    );
+                }
                 egui::ScrollArea::vertical()
                     .id_salt("model_lines")
                     .max_height(90.0)
@@ -2326,7 +2957,9 @@ fn main() -> eframe::Result {
         "符箓台 · 法坛",
         options,
         Box::new(|cc| {
-            // 字体必须在第一帧之前装好，否则首帧中文会先画成方块。
+            // 设计系统与字体都必须在第一帧之前装好：
+            // 主题晚一帧会出现「首帧白底」闪烁，字体晚一帧中文先画成方块。
+            theme::install(&cc.egui_ctx);
             let mut app = FuluApp::new();
             app.cjk_note = fonts::install_cjk_font(&cc.egui_ctx);
             Ok(Box::new(app))
@@ -2346,7 +2979,8 @@ fn is_ruin_file(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_ruin_file;
+    use super::{is_ruin_file, terminal_from_label};
+    use crate::theme::Stage;
     use std::path::Path;
 
     #[test]
@@ -2356,6 +2990,25 @@ mod tests {
         }
         for name in ["a.fu.bak", "notes.txt", "no_ext", "a.FU"] {
             assert!(!is_ruin_file(Path::new(name)), "{name} 不应被列出");
+        }
+    }
+
+    #[test]
+    fn six_terminal_labels_map_to_distinct_stages() {
+        let mapped: Vec<Stage> = ["归档", "破符", "驳回", "炸炉", "过坛", "中止"]
+            .iter()
+            .map(|label| terminal_from_label(label).expect("终态标签必须映射"))
+            .collect();
+        assert_eq!(mapped.len(), 6);
+        for (i, a) in mapped.iter().enumerate() {
+            assert!(a.is_terminal());
+            for b in mapped.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+        // 中间态绝不能被误判成终态。
+        for mid in ["回执", "草稿", "成符", "已盖印", "待焚", "焚化中"] {
+            assert!(terminal_from_label(mid).is_none(), "{mid} 不是终态");
         }
     }
 }

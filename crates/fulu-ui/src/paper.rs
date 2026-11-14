@@ -283,10 +283,15 @@ impl Paper {
 ///
 /// 抽成纯函数是因为「窗口一小，符纸把编辑器和按钮挤出屏幕」是个很容易复发的坑，
 /// 而它又完全可以用几个数字测住，不必占用显示器。
+///
+/// 口径随符文界面独立成屏而更新：符纸现在是**主视觉**，不再是旧版右栏的小缩略图。
+/// 旧规则把宽度硬钳在 120..=240，纸面一窄，18 字的段正文 + 11px 中文必然互相挤压；
+/// 现在按可用宽度的 44% 给纸（右侧「选中段 / 云篆」仍留得住），夹在 260..=380。
+/// 高度按 3:5 比例走，再由可用高度收一次；整栏本来就是可滚的，保底高度不必怕挤出屏幕。
 pub fn fit(aspect: (u32, u32), avail_w: f32, avail_h: f32) -> (f32, f32) {
     let ratio = aspect.1.max(1) as f32 / aspect.0.max(1) as f32;
-    let width_limit = avail_w.clamp(120.0, 240.0);
-    let height_limit = (avail_h * 0.55).max(180.0);
+    let width_limit = (avail_w * 0.44).clamp(260.0, 380.0);
+    let height_limit = (avail_h * 0.78).max(360.0);
     let mut width = width_limit;
     let mut height = width * ratio;
     if height > height_limit {
@@ -393,19 +398,32 @@ mod tests {
 
     #[test]
     fn paper_fit_keeps_the_aspect_and_never_overflows() {
-        // 宽窗：宽度说了算。
-        let (w, h) = fit((3, 5), 400.0, 900.0);
-        assert!((w - 240.0).abs() < 0.01, "宽度上限 240");
+        // 案台宽窗：宽度按可用宽度的 44% 给，夹在上限内。
+        let (w, h) = fit((3, 5), 900.0, 900.0);
+        assert!((w - 380.0).abs() < 0.01, "案台宽度上限 380");
         assert!((h / w - 5.0 / 3.0).abs() < 0.001, "宽高比必须保持 3:5");
 
         // 矮窗：高度说了算，宽度跟着缩。
-        let (w2, h2) = fit((3, 5), 400.0, 300.0);
-        assert!((h2 - 180.0).abs() < 0.01, "高度下限 180");
+        let (w2, h2) = fit((3, 5), 900.0, 300.0);
+        assert!((h2 - 360.0).abs() < 0.01, "高度保底 360");
         assert!((h2 / w2 - 5.0 / 3.0).abs() < 0.001);
 
-        // 极窄窗：宽度下限 120，仍不塌成一条线。
+        // 极窄窗：宽度下限 260，仍不塌成一条线。
         let (w3, _) = fit((3, 5), 20.0, 900.0);
-        assert!((w3 - 120.0).abs() < 0.01);
+        assert!((w3 - 260.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn studio_paper_is_bigger_than_the_old_thumbnail() {
+        // 回归：符文界面独立成屏后，符纸不许再退回旧版 120..=240 的缩略图尺寸，
+        // 否则 18 字段正文与 11px 中文会重新挤成一团（真窗口截图复核发现的缺陷）。
+        let (w, h) = fit((3, 5), 860.0, f32::INFINITY);
+        assert!(w > 260.0, "案台纸面必须明显宽于旧缩略图上限 240");
+        assert!(
+            h > 500.0,
+            "九段条带要有足够高度分行，而不是全部落进 compact 分支"
+        );
+        assert!((h / w - 5.0 / 3.0).abs() < 0.001);
     }
 
     #[test]

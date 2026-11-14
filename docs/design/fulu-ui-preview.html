@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>符箓台 · 玄坛朱箓 UI 设计规范预览 v1.0</title>
+<style>
+/* ===== 设计令牌（与 crates/fulu-ui/src/theme.rs 一一对应） ===== */
+:root{
+  --void:#100D0C; --altar:#181311; --raised:#221B18; --sunken:#0C0A09;
+  --hairline:#3A2E27; --edge:#8A6E56; --edge-strong:#E2BE79;
+  --ink:#F0E6D6; --ink-soft:#C4B6A3; --ink-muted:#938474; --ink-on-red:#FFF5EC;
+  --cinnabar:#E0664C; --cinnabar-deep:#B23B28; --cinnabar-dark:#8C2F20;
+  --gold:#E2BE79; --gold-deep:#B98A4E; --jade:#7FC2B0; --ember:#F0913C;
+  --good:#6FCBA3; --bad:#F0685A; --warn:#E0B454; --info:#7FC2B0;
+  --st-archived:#6FCBA3; --st-broken:#E0B454; --st-rejected:#B79AD6;
+  --st-exploded:#F0685A; --st-timedout:#8FA9D4; --st-cancelled:#B0A395;
+  --paper:#F3E7C8; --paper-edge:#B98A4E; --paper-ink:#2B241B;
+  --paper-brown:#7A5A30; --paper-missing:#E4DFD2; --paper-missing-ink:#5C5548;
+  --seal:#B23B28;
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s6:24px; --s8:32px;
+  --r-badge:2px; --r-control:4px; --r-card:6px;
+  --font-cn:"Microsoft YaHei","PingFang SC","Noto Sans CJK SC",system-ui,sans-serif;
+  --font-mono:Consolas,"JetBrains Mono",monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:#0A0808;color:var(--ink);font-family:var(--font-cn);font-size:14px;line-height:1.55}
+a{color:var(--jade)}
+.banner{max-width:1440px;margin:0 auto;padding:18px 24px 8px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}
+.banner h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.5px}
+.banner p{margin:0;color:var(--ink-muted);font-size:12px}
+.banner .tag{font-family:var(--font-mono);font-size:11px;color:var(--gold-deep);border:1px solid var(--hairline);padding:3px 8px;border-radius:var(--r-badge)}
+.hint{max-width:1440px;margin:0 auto;padding:0 24px 12px;color:var(--ink-muted);font-size:12px}
+
+/* ===== 应用窗口 ===== */
+.app{max-width:1440px;margin:0 auto;border:1px solid var(--edge);border-radius:8px;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.75)}
+.altar-head{background:var(--altar);border-bottom:1px solid var(--hairline);padding:12px var(--s4)}
+.head-row{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap}
+.seal-mark{width:34px;height:34px;background:var(--cinnabar-deep);border:1px solid var(--cinnabar);border-radius:2px;display:grid;place-items:center;font-size:20px;color:var(--ink-on-red);flex:none}
+.brand{display:flex;flex-direction:column;line-height:1.25}
+.brand b{font-size:22px;letter-spacing:2px;font-weight:600}
+.brand small{font-family:var(--font-mono);font-size:10px;color:var(--gold-deep);letter-spacing:.6px}
+.sys-note{font-size:12px;color:var(--ink-soft);margin-left:var(--s4)}
+.head-actions{margin-left:auto;display:flex;gap:8px}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 7px;border-radius:var(--r-badge);background:var(--sunken);border:1px solid var(--hairline);white-space:nowrap}
+.chip.jade{color:var(--jade);border-color:rgba(127,194,176,.35)}
+.chip.gold{color:var(--gold)}
+.chip.muted{color:var(--ink-muted)}
+.chip.red{color:var(--bad);border-color:rgba(240,104,90,.35)}
+.chip.warn{color:var(--warn);border-color:rgba(224,180,84,.35)}
+.chip.ember{color:var(--ember)}
+.chip.good{color:var(--good)}
+.btn{font-family:var(--font-cn);font-size:13px;padding:6px 13px;border-radius:var(--r-control);cursor:pointer;border:1px solid var(--hairline);background:var(--sunken);color:var(--ink-soft);transition:.15s;min-height:30px}
+.btn:hover{border-color:var(--cinnabar);color:var(--ink)}
+.btn.ghost{background:transparent}
+.btn.rite{background:var(--raised);border-color:var(--gold-deep);color:var(--gold)}
+.btn.ignite{background:var(--cinnabar-deep);border-color:var(--cinnabar);color:var(--ink-on-red);font-weight:600}
+.btn.ignite.disabled{background:var(--sunken);border-color:var(--hairline);color:var(--ink-muted);cursor:not-allowed}
+.btn.sm{font-size:11px;padding:3px 9px;min-height:24px}
+.collapse{margin-top:10px;font-size:12px;color:var(--ink-muted)}
+.collapse summary{cursor:pointer;outline:none;list-style:none}
+.collapse summary::-webkit-details-marker{display:none}
+.collapse summary::before{content:"▸ ";color:var(--gold-deep)}
+.collapse[open] summary::before{content:"▾ "}
+.collapse-body{padding:10px 0 2px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.faux-input{background:var(--sunken);border:1px solid var(--edge);border-radius:var(--r-control);padding:5px 10px;font-family:var(--font-mono);font-size:11px;color:var(--ink-soft)}
+
+/* ===== 状态轨道 ===== */
+.rail{background:var(--void);border-bottom:1px solid var(--hairline);padding:12px 24px 8px;position:relative}
+.rail-track{display:flex;align-items:flex-start;justify-content:space-between;max-width:920px;margin:0 auto;position:relative}
+.rail-line{position:absolute;top:15px;left:5%;right:5%;height:2px;background:var(--hairline)}
+.rail-line .done{position:absolute;left:0;top:0;height:2px;width:57%;background:var(--gold)}
+.node{position:relative;z-index:2;width:64px;text-align:center;flex:none}
+.node .dot{width:11px;height:11px;border-radius:50%;background:var(--ink-muted);margin:10px auto 0}
+.node.done .dot{background:var(--gold)}
+.node.current .dot{background:var(--ember);box-shadow:0 0 0 4px rgba(226,190,121,.35)}
+.node .lbl{font-size:12px;color:var(--ink-soft);margin-top:7px}
+.node.current .lbl{color:var(--ink);font-weight:600}
+.gate{position:absolute;top:0;left:calc(5% + 57%);height:38px;border-left:2px solid var(--cinnabar);z-index:3}
+/* 双竖线只做标记；文字说明统一放在轨道下方，避免压住「待焚」节点标签 */
+.gate::after{content:"";position:absolute;left:4px;top:0;height:38px;border-left:1px solid var(--cinnabar)}
+.rail-end{text-align:center;font-size:12px;color:var(--good);margin-top:6px}
+
+/* ===== 三栏 ===== */
+.cols{display:grid;grid-template-columns:240px minmax(0,1fr) 340px;min-height:640px;background:var(--void)}
+.col{padding:var(--s4);overflow:auto}
+.col.left{background:var(--altar);border-right:1px solid var(--hairline)}
+.col.right{background:var(--altar);border-left:1px solid var(--hairline)}
+.col.center{background:var(--void)}
+.sec-title{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.sec-title .bar{width:3px;height:18px;border-radius:1px;background:var(--cinnabar);flex:none}
+.sec-title h2{font-size:18px;margin:0;font-weight:600;letter-spacing:.5px}
+.sec-title small{font-size:12px;color:var(--ink-muted)}
+.divider{height:1px;background:var(--hairline);margin:14px 0}
+.muted{color:var(--ink-muted)}
+.small{font-size:12px}
+.mono{font-family:var(--font-mono)}
+.card{background:var(--raised);border:1px solid var(--hairline);border-left:3px solid var(--gold-deep);border-radius:var(--r-card);padding:var(--s3);margin-bottom:12px}
+.card.red{border-left-color:var(--cinnabar)}
+.card.gold{border-left-color:var(--gold)}
+.card.jade{border-left-color:var(--jade)}
+.card.ember{border-left-color:var(--ember)}
+.card.good{border-left-color:var(--good)}
+.card h3{margin:0 0 8px;font-size:16px;font-weight:600}
+.file-list{margin:10px 0}
+.file{display:flex;gap:10px;align-items:center;padding:6px 8px;border-radius:var(--r-control);cursor:pointer;font-size:12px}
+.file:hover{background:var(--raised)}
+.file .idx{font-family:var(--font-mono);font-size:10px;color:var(--gold-deep)}
+.file .nm{color:var(--ink-soft)}
+.file.on{background:rgba(224,102,76,.12);color:var(--ink)}
+.stat-line{font-size:12px;color:var(--ink-soft);display:flex;justify-content:space-between}
+
+/* ===== 中栏 tabs ===== */
+.tabs{display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--hairline);padding-bottom:10px;margin-bottom:14px}
+.tabs .grow{flex:1}
+.tab{font-size:12px;padding:6px 12px;border-radius:var(--r-control);border:1px solid transparent;background:transparent;color:var(--ink-soft);cursor:pointer;font-family:var(--font-cn)}
+.tab.on{background:var(--raised);border-color:var(--gold-deep);color:var(--gold)}
+.view{display:none}
+.view.on{display:block}
+.action-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0}
+.checkline{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink-soft);margin:8px 0}
+.box{width:14px;height:14px;border:1px solid var(--edge);border-radius:2px;background:var(--sunken);display:inline-grid;place-items:center;font-size:10px;color:var(--cinnabar)}
+.box.on::after{content:"✓"}
+.axes{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;color:var(--ink-muted);margin:10px 0}
+.perm{display:flex;gap:3px}
+.perm i{width:9px;height:9px;border:1px solid var(--edge);border-radius:1px;display:block}
+.perm i.on{background:var(--gold);border-color:var(--gold)}
+.codeblock{background:var(--sunken);border:1px solid var(--hairline);border-radius:var(--r-control);padding:10px;font-family:var(--font-mono);font-size:11px;color:var(--ink-soft);white-space:pre-wrap;line-height:1.6}
+
+/* ===== 符文界面 · 金纸案台 ===== */
+.studio{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+.desk{background:var(--sunken);border:1px solid var(--hairline);border-radius:var(--r-card);padding:12px;position:relative;flex:none}
+.desk-corner{position:absolute;width:3px;height:3px;border-radius:50%;background:var(--gold-deep)}
+.paper{width:236px;height:393px;background:var(--paper);border:2px solid var(--paper-edge);position:relative;overflow:hidden;display:flex;flex-direction:column}
+.paper::after{content:"";position:absolute;inset:5px;border:1px solid rgba(185,138,78,.55);pointer-events:none}
+.cloud-head{height:20px;flex:none;display:flex;align-items:center;justify-content:center;gap:6px;position:relative}
+.cloud-head .dots{display:flex;gap:5px}
+.cloud-head .dots i{width:3px;height:3px;border-radius:50%;background:var(--seal);display:block}
+.cloud-head .curl{width:22px;height:9px;border-top:1px solid var(--gold-deep);border-radius:50% 50% 0 0;opacity:.8}
+.zone{display:flex;gap:6px;padding:2px 8px 2px 6px;position:relative;cursor:pointer;border-bottom:.5px solid rgba(185,138,78,.45);min-height:0;overflow:hidden}
+.zone:hover{background:rgba(122,90,48,.08)}
+.zone.sel{background:rgba(178,59,40,.10)}
+.zone.sel::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--seal)}
+.zone.missing{background:var(--paper-missing);border-top:1px dashed var(--paper-missing-ink)}
+.zone .num{font-family:var(--font-mono);font-size:9px;color:var(--gold-deep);width:15px;flex:none;padding-top:1px}
+.zone .body{min-width:0;flex:1}
+.zone .nm{font-size:11px;color:var(--paper-brown);line-height:1.2}
+.zone .tx{font-size:11px;color:var(--paper-ink);line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.zone.missing .tx{color:var(--paper-missing-ink)}
+.stamp{position:absolute;right:8px;bottom:9px;width:38px;height:38px;border:2px solid var(--seal);border-radius:2px;background:rgba(178,59,40,.08);display:grid;place-items:center;color:var(--seal);font-size:16px}
+.stamp::after{content:"";position:absolute;inset:3px;border:1px solid var(--seal)}
+.stamp small{position:absolute;bottom:-12px;left:0;width:100%;text-align:center;font-family:var(--font-mono);font-size:7px;color:var(--seal)}
+.studio-side{flex:1;min-width:220px}
+.stroke-grid{display:flex;gap:5px;margin:10px 0}
+.stroke-cell{width:30px;height:30px;background:var(--raised);border:1px solid var(--gold-deep);border-radius:2px;position:relative}
+.stroke-cell svg{width:100%;height:100%}
+.stroke-cell .nm{position:absolute;top:31px;left:0;width:100%;text-align:center;font-size:10px;color:var(--gold)}
+
+/* ===== 缴符时间线 ===== */
+.timeline{margin-top:8px}
+.tl-row{display:flex;gap:10px;position:relative;padding:4px 0 8px 0}
+.tl-rail{width:8px;position:relative;flex:none}
+.tl-rail::before{content:"";position:absolute;left:3px;top:0;bottom:0;width:1px;background:rgba(127,194,176,.4)}
+.tl-row:first-child .tl-rail::before{top:7px}
+.tl-row:last-child .tl-rail::before{bottom:calc(100% - 7px)}
+.tl-dot{position:absolute;left:1px;top:5px;width:5px;height:5px;border-radius:50%;background:var(--jade)}
+.tl-idx{font-family:var(--font-mono);font-size:10px;color:var(--ink-muted);width:20px;flex:none}
+.tl-tx{font-family:var(--font-mono);font-size:11px;color:var(--ink-soft);word-break:break-all}
+
+/* ===== 状态栏 ===== */
+.status{background:var(--altar);border-top:1px solid var(--hairline);padding:10px var(--s4);display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:13px}
+
+/* ===== 规范附页 ===== */
+.sheet{max-width:1440px;margin:40px auto 60px;padding:0 24px}
+.sheet h2{font-size:22px;border-left:3px solid var(--cinnabar);padding-left:10px;margin:36px 0 14px}
+.sheet h3{font-size:15px;color:var(--gold);margin:22px 0 10px}
+.palette{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:10px}
+.sw{border:1px solid var(--hairline);border-radius:var(--r-card);overflow:hidden;background:var(--raised)}
+.sw .fill{height:56px;display:flex;align-items:flex-end;padding:6px 8px;font-size:11px;font-family:var(--font-mono)}
+.sw .meta{padding:8px 10px;font-size:11px;line-height:1.5}
+.sw .meta b{display:block;color:var(--ink);font-size:12px}
+.sw .meta span{color:var(--ink-muted)}
+table{width:100%;border-collapse:collapse;font-size:12px;background:var(--altar);border:1px solid var(--hairline)}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--hairline)}
+th{color:var(--gold);font-weight:600;background:var(--raised)}
+td{color:var(--ink-soft)}
+td.mono{font-family:var(--font-mono)}
+.terminals{display:flex;gap:8px;flex-wrap:wrap}
+.axes-demo{background:var(--altar);border:1px solid var(--hairline);border-radius:var(--r-card);padding:14px}
+.note{background:rgba(127,194,176,.06);border-left:3px solid var(--jade);padding:10px 14px;font-size:12px;color:var(--ink-soft);margin:14px 0}
+footer{max-width:1440px;margin:0 auto;padding:24px;color:var(--ink-muted);font-size:11px;border-top:1px solid var(--hairline)}
+@media(max-width:1100px){.cols{grid-template-columns:200px minmax(0,1fr)}.col.right{display:none}}
+@media(max-width:820px){.cols{grid-template-columns:1fr}.col.left{display:none}.sys-note{display:none}}
+</style>
+</head>
+<body>
+
+<div class="banner">
+  <h1>玄坛朱箓 · 符箓台 UI 设计规范预览 <span class="tag">v1.0 / 2026-11-15</span></h1>
+  <p>高保真设计预览 · 非产品界面（产品为 egui 原生自绘，不用 WebView）</p>
+</div>
+<div class="hint">点击中栏「法坛 / 符文」切换视图；点击符纸任一段可选中。所有色值与 <span class="mono">theme.rs</span> 令牌一一对应。</div>
+
+<div class="app">
+  <!-- 坛额 -->
+  <header class="altar-head">
+    <div class="head-row">
+      <div class="seal-mark">符</div>
+      <div class="brand"><b>符 箓 台</b><small>FULÜ ALTAR · 一张提示词，一张符</small></div>
+      <span class="sys-note">模型清单：3 槽位可运行 · 摘要已固化</span>
+      <span class="chip jade">外宗 2 工具 · 3/3 接入</span>
+      <div class="head-actions">
+        <button class="btn ghost sm">太极</button>
+        <button class="btn ghost sm">设置</button>
+      </div>
+    </div>
+    <details class="collapse">
+      <summary>坛务 · 端点 / 工作区 / 外宗接入（只在内存生效）</summary>
+      <div class="collapse-body">
+        <span class="small muted">端点</span><span class="faux-input">http://127.0.0.1:18083</span>
+        <button class="btn ghost sm">设定</button><button class="btn ghost sm">探活</button>
+        <span class="small muted">工作区</span><span class="faux-input">D:\code\rust\taoism-agent</span>
+        <span class="chip jade">只读 · 不管理</span>
+      </div>
+    </details>
+  </header>
+
+  <!-- 仪轨状态轨道 -->
+  <div class="rail">
+    <div class="rail-track">
+      <div class="rail-line"><div class="done"></div></div>
+      <div class="node done"><div class="dot"></div><div class="lbl">书符</div></div>
+      <div class="node done"><div class="dot"></div><div class="lbl">成符</div></div>
+      <div class="node done"><div class="dot"></div><div class="lbl">盖印</div></div>
+      <div class="node current"><div class="dot"></div><div class="lbl">待焚</div></div>
+      <div class="gate"></div>
+      <div class="node"><div class="dot"></div><div class="lbl">焚化</div></div>
+      <div class="node"><div class="dot"></div><div class="lbl">归档</div></div>
+    </div>
+    <div class="rail-end">当前：待焚（dry-run 零网络）· 焚符须先勾选确认，此点之后不可撤销</div>
+  </div>
+
+  <!-- 三栏 -->
+  <div class="cols">
+    <!-- 左：符箓 -->
+    <aside class="col left">
+      <div class="sec-title"><span class="bar"></span><h2>符箓</h2><small>点一下送入法坛</small></div>
+      <div style="margin-top:12px"><button class="btn ghost" style="width:100%">载入内置示例符</button></div>
+      <div class="divider"></div>
+      <div class="stat-line"><span>工作区 5 张符</span><button class="btn ghost sm">重新扫描</button></div>
+      <div class="small muted">.fu / .dsl / .fub 三种形态，按内容识别</div>
+      <div class="file-list">
+        <div class="file on"><span class="idx">01</span><span class="nm">demo-t23-shout.fu</span></div>
+        <div class="file"><span class="idx">02</span><span class="nm">demo-t23-short.fu</span></div>
+        <div class="file"><span class="idx">03</span><span class="nm">sample.fu</span></div>
+        <div class="file"><span class="idx">04</span><span class="nm">召将·问天.dsl</span></div>
+        <div class="file"><span class="idx">05</span><span class="nm">archive.fub</span></div>
+      </div>
+      <div class="divider"></div>
+      <span class="chip jade">只读 · 不管理</span><span class="small muted"> 外宗 / 符胆只展示不管理</span>
+      <div style="margin-top:12px"><button class="btn rite" style="width:100%" onclick="switchView('paper')">去符文界面看这张符</button></div>
+    </aside>
+
+    <!-- 中：双视图 -->
+    <section class="col center">
+      <div class="tabs">
+        <div class="sec-title" style="margin:0"><span class="bar"></span><h2 style="font-size:16px">法坛</h2><small>仪轨 · 判定 · 不可撤销</small></div>
+        <div class="grow"></div>
+        <button class="tab on" id="tab-altar" onclick="switchView('altar')">法坛 · 仪轨</button>
+        <button class="tab" id="tab-paper" onclick="switchView('paper')">符文 · 符纸</button>
+      </div>
+
+      <!-- 法坛视图 -->
+      <div class="view on" id="view-altar">
+        <div class="card">
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <span class="small muted">当前符</span><b style="font-size:16px">召将·急急如律令</b>
+            <span class="chip gold">已盖印</span>
+          </div>
+          <div class="small muted" style="margin-top:8px">符印只认当下的字：正文改一个字，之前的待焚计划立即作废。</div>
+        </div>
+        <button class="btn rite sm">去符文界面改这张符</button>
+        <div class="divider"></div>
+
+        <div class="action-row">
+          <button class="btn rite">① 校验符印</button>
+          <button class="btn rite">② 成符 · 盖印 · 待焚</button>
+          <button class="btn ignite disabled">③ 焚符</button>
+        </div>
+        <div class="checkline"><span class="box"></span> 我确认焚化不可撤销 <span class="chip muted">整符级闸门</span></div>
+        <div class="checkline"><span class="box"></span> 免逐次弹窗：预授权放行全部高危召将 <span class="chip red">无人值守 · 一律敕否</span></div>
+        <div class="small muted">两道闸门互不替代：整符勾选决定是否起炉，逐次敕门决定每个高危召将放不放行。</div>
+        <div class="divider"></div>
+
+        <div class="card red">
+          <div class="sec-title" style="margin-bottom:8px"><span class="bar"></span><h3 style="margin:0;font-size:15px">敕门 · 高危召将等待确认</h3><small>逐次闸门 · 答完即弃</small></div>
+          <div style="font-size:13px;margin-bottom:8px"><b>mcp.demo.shout（破坏性·每次调用）第 1 次调用</b></div>
+          <div class="axes">
+            <span>权限</span>
+            <span class="perm"><i class="on"></i><i class="on"></i><i></i></span><span>受限执行</span>
+            <span style="margin-left:12px">风险</span><span class="chip red">破坏性</span>
+            <span class="chip muted">每次调用</span>
+            <span style="margin-left:12px">来源 · 未随请求下发</span>
+          </div>
+          <div class="small muted">参数原文（模型输出，原样展示，不解释）：</div>
+          <div class="codeblock">{"text":"急急如律令"}</div>
+          <div class="action-row" style="margin-bottom:0"><button class="btn rite sm">敕可 · 本次放行</button><button class="btn ghost sm">敕否 · 本次拒绝</button></div>
+        </div>
+
+        <div class="card gold">
+          <div class="sec-title" style="margin-bottom:8px"><span class="bar" style="background:var(--gold)"></span><h3 style="margin:0;font-size:15px">待焚计划</h3><small>dry-run · 零网络 · 确认前的影响面</small></div>
+          <div class="codeblock">符印 sha256:1f860a88…                 │ 神明 lfm3-1.7b-q4km
+预算 600 tokens · 上限 6 步            │ 沙箱 受限执行
+工具 mcp.demo.shout（破坏性）          │ 凭据 lu://local
+判据 正文含「2」                      │ 外宗影响面 2 工具
+── 确认门：以上计划须勾选后方可起炉 ──</div>
+        </div>
+      </div>
+
+      <!-- 符文视图 -->
+      <div class="view" id="view-paper">
+        <div class="sec-title"><span class="bar" style="background:var(--gold)"></span><h2 style="font-size:16px">符文 · 符纸案台</h2><small>九段部件 · 点段跳字段 · 缺段不伪装</small></div>
+        <div style="margin:10px 0;display:flex;gap:8px;flex-wrap:wrap">
+          <span class="chip jade">纯展示 · 不判定</span>
+          <span class="chip jade">版式由 fulu-script 云篆描述层驱动</span>
+          <span class="chip gold">已盖朱砂印</span>
+        </div>
+        <div class="studio">
+          <div class="desk">
+            <span class="desk-corner" style="left:10px;top:10px"></span><span class="desk-corner" style="right:10px;top:10px"></span>
+            <span class="desk-corner" style="left:10px;bottom:10px"></span><span class="desk-corner" style="right:10px;bottom:10px"></span>
+            <div class="paper" id="paper">
+              <div class="cloud-head"><span class="curl"></span><span class="dots"><i></i><i></i><i></i></span><span class="curl"></span></div>
+              <!-- 九段：flex 权重对应 paper.rs WEIGHTS -->
+              <div class="zone sel" data-band="符头" style="flex:130" onclick="pick(this)"><span class="num">01</span><div class="body"><div class="nm">符头</div><div class="tx">召将·急急如律令 / local-llama</div></div></div>
+              <div class="zone" data-band="神明" style="flex:70" onclick="pick(this)"><span class="num">02</span><div class="body"><div class="nm">神明</div><div class="tx">lfm3-1.7b-q4km · T0.7</div></div></div>
+              <div class="zone" data-band="敕令" style="flex:60" onclick="pick(this)"><span class="num">03</span><div class="body"><div class="nm">敕令</div><div class="tx">lu://local</div></div></div>
+              <div class="zone" data-band="捆仙绳" style="flex:110" onclick="pick(this)"><span class="num">04</span><div class="body"><div class="nm">捆仙绳</div><div class="tx">600 tokens · 60s · 受限 · 6 步</div></div></div>
+              <div class="zone" data-band="天柱" style="flex:100" onclick="pick(this)"><span class="num">05</span><div class="body"><div class="nm">天柱</div><div class="tx">你是符箓台法坛中的行符者…</div></div></div>
+              <div class="zone" data-band="地柱" style="flex:100" onclick="pick(this)"><span class="num">06</span><div class="body"><div class="nm">地柱</div><div class="tx">请召将 shout，令其高呼…</div></div></div>
+              <div class="zone" data-band="风火轮" style="flex:80" onclick="pick(this)"><span class="num">07</span><div class="body"><div class="nm">风火轮</div><div class="tx">mcp.demo.shout</div></div></div>
+              <div class="zone" data-band="符胆" style="flex:270" onclick="pick(this)"><span class="num">08</span><div class="body"><div class="nm">符胆</div><div class="tx">急急如律令</div><div class="tx">召将一声，回声入箓，</div><div class="tx">验其 bytes 而后归档。</div><div class="tx">不得借外宗之手改写符文。</div></div></div>
+              <div class="zone missing" data-band="符脚" style="flex:80" onclick="pick(this)"><span class="num">09</span><div class="body"><div class="nm">符脚</div><div class="tx">未成符</div></div></div>
+              <div class="stamp">符<small>1f860a88</small></div>
+            </div>
+          </div>
+
+          <div class="studio-side">
+            <div class="sec-title"><span class="bar" style="background:var(--seal)"></span><h2 style="font-size:15px">选中段</h2><small id="picked">符头 · name / head.provider_ref</small></div>
+            <div class="divider"></div>
+            <div class="small" style="color:var(--gold)">云篆笔画基元 <button class="btn ghost sm" style="margin-left:8px">笔顺演示</button></div>
+            <div style="margin:8px 0;display:flex;gap:6px;flex-wrap:wrap"><span class="chip jade">纯展示 · 不判定</span><span class="small muted">抽象几何，非书法字形</span></div>
+            <div class="stroke-grid" id="strokes"></div>
+            <div class="note">符纸是<strong>单一信息载体</strong>：九段热区 ↔ 字段一一对应。缺段画成灰底虚线 +「未成符」，绝不假装整张符完整；截断必须显式标出。火光 / 笔顺 / 朱砂印全是纯视觉，不承载任何状态判定。</div>
+            <div class="divider"></div>
+            <div class="small muted">字段表单（点段自动展开对应项）</div>
+            <div class="faux-input" style="margin-top:8px;width:100%">name: 召将·急急如律令</div>
+            <div class="divider"></div>
+            <div class="small" style="color:var(--ink)">符文正文（YAML / .fu）· 改了就要重新盖印</div>
+            <div class="codeblock" style="margin-top:8px">{
+  "name": "召将·急急如律令",
+  "harness": { "sandbox": "limited", …
+  "tool_refs": ["mcp.demo.shout"]
+}</div>
+            <div class="small muted" style="margin-top:8px">保存会按规范格式重写正文（注释 / 字段顺序 / 空行会丢），原文件不会被静默改写。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 右：缴符 -->
+    <aside class="col right">
+      <div class="sec-title"><span class="bar" style="background:var(--jade)"></span><h2>缴符</h2><small>append-only · sha256 链式摘要</small></div>
+      <div style="margin:8px 0;display:flex;gap:6px;flex-wrap:wrap">
+        <span class="chip jade">只读 · 不管理</span><span class="chip jade">已脱敏</span><span class="chip jade">纯展示 · 不判定</span>
+      </div>
+      <div class="divider"></div>
+      <div class="card good">
+        <h3>回执</h3>
+        <span class="chip good">终态 · 归档</span>
+        <div class="codeblock" style="margin-top:8px">符印 1f860a88c4d2…正文 2
+步数 / 用量: 1 步 / 445 tokens</div>
+        <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap"><span class="chip warn">估算</span><span class="chip warn">重试 1 次后成功</span></div>
+      </div>
+      <div class="divider"></div>
+      <div class="small muted">事件链 · 8 条（只读回放，不校验链）</div>
+      <div class="timeline">
+        <div class="tl-row"><div class="tl-rail"><span class="tl-dot"></span></div><span class="tl-idx">01</span><span class="tl-tx">Formed · 成符、内容哈希冻结</span></div>
+        <div class="tl-row"><div class="tl-rail"><span class="tl-dot"></span></div><span class="tl-idx">02</span><span class="tl-tx">Sealed · 箓中身份签名</span></div>
+        <div class="tl-row"><div class="tl-rail"><span class="tl-dot"></span></div><span class="tl-idx">03</span><span class="tl-tx">Pending · 七层提示词装配</span></div>
+        <div class="tl-row"><div class="tl-rail"><span class="tl-dot"></span></div><span class="tl-idx">04</span><span class="tl-tx">Context · 会话头（硬件 / IP 粗粒度）</span></div>
+        <div class="tl-row"><div class="tl-rail"><span class="tl-dot"></span></div><span class="tl-idx">05</span><span class="tl-tx">Invoked · provider 退避重试 1 次</span></div>
+        <div class="tl-row"><div class="tl-rail"><span class="tl-dot"></span></div><span class="tl-idx">06</span><span class="tl-tx">ToolCall · mcp.demo.shout（敕可）</span></div>
+        <div class="tl-row"><div class="tl-rail"><span class="tl-dot"></span></div><span class="tl-idx">07</span><span class="tl-tx">Answered · 正文「2」/ 445 tokens</span></div>
+        <div class="tl-row"><div class="tl-rail"><span class="tl-dot"></span></div><span class="tl-idx">08</span><span class="tl-tx">Archived · 归档，链摘要封存</span></div>
+      </div>
+      <div class="divider"></div>
+      <button class="btn ghost" style="width:100%">导出缴符 JSONL</button>
+      <div class="small muted" style="margin-top:10px">链上每行 = <span class="mono">sha256(prev ‖ canonical(event))</span>，写入前统一脱敏。界面刻意不提供任何删除 / 编辑 / 重排控件。</div>
+    </aside>
+  </div>
+
+  <footer class="status">
+    <span class="chip good">终态 · 归档</span>
+    <span style="color:var(--good)">焚符完成：正文「2」/ 1 步 / 445 tokens / 已达标 / 归档</span>
+    <span class="small muted">中文字体：内嵌思源黑体子集</span>
+    <span style="margin-left:auto" class="small muted">▸ 中文 IME 探针（M0 未完成的人工验收项）</span>
+  </footer>
+</div>
+
+<!-- ===== 规范附页 ===== -->
+<div class="sheet">
+  <h2>01 · 设计哲学</h2>
+  <div class="note">仪轨即界面 · 暗坛金纸 · 诚实性优先 · 正交编码 · fail-closed 默认态。详见 <span class="mono">docs/05-符箓台设计规范系统.md</span>。</div>
+
+  <h2>02 · 色板（令牌即规范）</h2>
+  <h3>坛面 / 墨色 / 品牌</h3>
+  <div class="palette" id="palette"></div>
+
+  <h3>六终态 · 独立色相，绝不复用</h3>
+  <div class="terminals" id="terminals"></div>
+  <div class="note"><strong>中止（Cancelled）刻意用中性暖灰</strong>：它是独立终态，不并入炸炉、不冒充成功、不回滚。把失败折叠成一个红色，界面会诱导用户去查一个不存在的 bug。<span class="mono">theme.rs</span> 有单测锁住六色互不相同。</div>
+
+  <h2>03 · 权限 / 风险正交编码</h2>
+  <div class="axes-demo">
+    <div class="axes"><span>权限（形状档位）</span><span class="perm"><i class="on"></i><i class="on"></i><i></i></span><span>受限执行</span>
+      <span style="margin-left:24px">风险（色彩）</span><span class="chip red">破坏性</span><span class="chip muted">每次调用</span>
+      <span style="margin-left:24px">来源 · 未随请求下发</span></div>
+    <div class="small muted" style="margin-top:8px">权限是箓层静态上限（ReadOnly / Limited / Full），风险是逐次确认强度（Observe / Mutate / Destructive）。两套编码永不合并成一根危险度滑块。</div>
+  </div>
+
+  <h2>04 · 诚实性标注原子</h2>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <span class="chip warn">估算</span><span class="chip red">UNVERIFIED</span><span class="chip warn">已截断</span>
+    <span class="chip jade">只读 · 不管理</span><span class="chip jade">纯展示 · 不判定</span>
+    <span class="chip ember">非回执</span><span class="chip jade">已脱敏</span><span class="chip red">无人值守 · 一律敕否</span>
+  </div>
+
+  <h2>05 · 无障碍（真实复算，锁进 CI 单测）</h2>
+  <table>
+    <tr><th>判据</th><th>组合</th><th>比值</th><th>要求</th></tr>
+    <tr><td>主文本</td><td class="mono">INK on RAISED</td><td class="mono">13.73 : 1</td><td>≥ 4.5 AA</td></tr>
+    <tr><td>弱文本（下限）</td><td class="mono">INK_MUTED on RAISED</td><td class="mono">4.68 : 1</td><td>≥ 4.5 AA</td></tr>
+    <tr><td>交互控件边界</td><td class="mono">EDGE on RAISED</td><td class="mono">3.59 : 1</td><td>≥ 3.0（1.4.11）</td></tr>
+    <tr><td>符纸段名</td><td class="mono">PAPER_BROWN on PAPER</td><td class="mono">5.12 : 1</td><td>≥ 4.5 AA</td></tr>
+    <tr><td>朱砂方印</td><td class="mono">SEAL_RED on PAPER</td><td class="mono">4.81 : 1</td><td>≥ 4.5 AA</td></tr>
+    <tr><td>朱砂按钮文字</td><td class="mono">INK_ON_RED on CINNABAR_DEEP</td><td class="mono">5.50 : 1</td><td>≥ 4.5 AA</td></tr>
+  </table>
+  <div class="note">中文最小字号由历史 9px 提到 <strong>11px（符纸）/ 12px（全局）</strong>；旧值 <span class="mono">#8A6A3B</span>(4.06) 与 <span class="mono">#C0392B</span>(4.42) 未达 AA，已校准。交互目标 ≥ 30px 高。</div>
+
+  <h2>06 · 未验事项（如实）</h2>
+  <table>
+    <tr><th>项</th><th>状态</th></tr>
+    <tr><td>编译 / clippy -D warnings / 全测试</td><td>✅ 已通过</td></tr>
+    <tr><td>GUI 视觉真人验收（颜色观感、150%/200% 缩放、IME 候选框、符纸小字可读性）</td><td>⚠️ 未测，不能由编译通过顶替</td></tr>
+    <tr><td>太极阴阳图（当前仍是文本分层视图）</td><td>⚠️ 未落地，本规范未计入完成</td></tr>
+  </table>
+</div>
+
+<footer>玄坛朱箓 v1.0 · 令牌与组件见 <span class="mono">crates/fulu-ui/src/{theme,widgets}.rs</span> · 本页仅为设计预览，产品界面为 egui 原生自绘</footer>
+
+<script>
+/* 视图切换 */
+function switchView(name){
+  document.getElementById('view-altar').classList.toggle('on', name==='altar');
+  document.getElementById('view-paper').classList.toggle('on', name==='paper');
+  document.getElementById('tab-altar').classList.toggle('on', name==='altar');
+  document.getElementById('tab-paper').classList.toggle('on', name==='paper');
+}
+/* 符纸热区选中 */
+function pick(el){
+  document.querySelectorAll('.zone').forEach(z=>z.classList.remove('sel'));
+  el.classList.add('sel');
+  const fields={'符头':'name / head.provider_ref','神明':'deity.model_id / deity.sampling','敕令':'credential_ref',
+    '捆仙绳':'harness.*','天柱':'system（正文上段）','地柱':'user（正文下段）','风火轮':'tool_refs / allow_tools',
+    '符胆':'skill_refs（sha256 引用）','符脚':'goal / output'};
+  document.getElementById('picked').textContent = el.dataset.band+' · '+fields[el.dataset.band];
+}
+/* 色板生成 */
+const colors=[
+  ['VOID','#100D0C','玄坛底'],['ALTAR','#181311','面板'],['RAISED','#221B18','浮起面'],['SUNKEN','#0C0A09','凹陷面'],
+  ['INK','#F0E6D6','主文本'],['INK_SOFT','#C4B6A3','次文本'],['INK_MUTED','#938474','弱文本'],
+  ['CINNABAR','#E0664C','朱砂 · 动作'],['CINNABAR_DEEP','#B23B28','朱砂 · 填充'],['GOLD','#E2BE79','金 · 状态'],
+  ['JADE','#7FC2B0','青 · 只读'],['EMBER','#F0913C','火光 · 纯视觉'],['PAPER','#F3E7C8','金纸 · 唯一亮面'],
+  ['EDGE','#8A6E56','交互边界 ≥3:1'],['HAIRLINE','#3A2E27','装饰细线']
+];
+const light=new Set(['INK','INK_SOFT','PAPER']);
+const pal=document.getElementById('palette');
+colors.forEach(([n,h,d])=>{
+  const d2=document.createElement('div'); d2.className='sw';
+  d2.innerHTML='<div class="fill" style="background:'+h+';color:'+(light.has(n)?'#100D0C':'#F0E6D6')+'">'+h+'</div>'+
+    '<div class="meta"><b>'+n+'</b><span>'+d+'</span></div>';
+  pal.appendChild(d2);
+});
+/* 六终态 */
+const terms=[['归档 Archived','#6FCBA3'],['破符 Broken','#E0B454'],['驳回 Rejected','#B79AD6'],
+  ['炸炉 Exploded','#F0685A'],['过坛 TimedOut','#8FA9D4'],['中止 Cancelled','#B0A395']];
+const tc=document.getElementById('terminals');
+terms.forEach(([n,h])=>{
+  const s=document.createElement('span'); s.className='chip';
+  s.style.color=h; s.style.borderColor=h+'66'; s.style.padding='6px 12px'; s.style.fontSize='12px';
+  s.textContent='● '+n; tc.appendChild(s);
+});
+/* 云篆六个抽象折线基元 */
+const strokes=[
+  'M2,26 L14,4 L26,26','M2,6 L26,6 M14,6 L14,26','M3,4 L25,24 M25,4 L3,24',
+  'M4,4 C18,4 26,12 26,26','M2,14 L12,4 L22,14 L12,24 Z','M4,26 L4,6 Q14,2 26,8'
+];
+const sg=document.getElementById('strokes');
+strokes.forEach((path,i)=>{
+  const c=document.createElement('div'); c.className='stroke-cell';
+  c.innerHTML='<svg viewBox="0 0 30 30"><path d="'+path+'" fill="none" stroke="'+(i===2?'#F0913C':'#F3E7C8')+'" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="nm">'+['勒','努','趯','策','掠','磔'][i]+'</span>';
+  sg.appendChild(c);
+});
+</script>
+</body>
+</html>
