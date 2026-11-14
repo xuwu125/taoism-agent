@@ -903,10 +903,35 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("接受连接");
-            let mut buffer = vec![0_u8; 8192];
-            let read = stream.read(&mut buffer).unwrap_or(0);
+            // CI/本地双实测：TCP 无消息边界，单次 read 在慢机器上可能只拿到
+            // 请求头、正文还在路上（假红「串台」）。循环读到头 + Content-Length
+            // 声明的正文齐了为止；对端提前断开（read==0）也如实收尾。
+            let mut buffer = Vec::with_capacity(8192);
+            let mut chunk = [0_u8; 8192];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&buffer);
+                let Some(header_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let declared = text
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= header_end + 4 + declared {
+                    break;
+                }
+            }
             sender
-                .send(String::from_utf8_lossy(&buffer[..read]).into_owned())
+                .send(String::from_utf8_lossy(&buffer).into_owned())
                 .ok();
             let raw = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
