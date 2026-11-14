@@ -158,7 +158,9 @@ jobs:
           cp packaging/linux/fulu.desktop "$PKG/usr/share/applications/"
           cp LICENSE THIRD_PARTY_NOTICES.md "$PKG/usr/share/doc/fulu/"
           mkdir -p "$PKG/usr/share/doc/fulu/licenses"
-          cp crates/fulu-ui/assets/fonts/licenses/*.txt crates/fulu-ui/assets/fonts/*.txt "$PKG/usr/share/doc/fulu/licenses/"
+          # 同名冲突同 Unix payload 步骤：分两步，licenses/ 子目录为权威版本。
+          cp crates/fulu-ui/assets/fonts/*.txt "$PKG/usr/share/doc/fulu/licenses/"
+          cp -f crates/fulu-ui/assets/fonts/licenses/*.txt "$PKG/usr/share/doc/fulu/licenses/"
           cat > "$PKG/DEBIAN/control" <<EOF
           Package: fulu
           Version: ${{ steps.version.outputs.value }}
