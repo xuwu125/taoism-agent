@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>符箓台 · 玄坛朱箓 UI 设计规范预览 v1.0</title>
+<title>符箓台 · 玄坛朱箓 UI 设计规范预览 v1.1（写实符纸）</title>
 <style>
 /* ===== 设计令牌（与 crates/fulu-ui/src/theme.rs 一一对应） ===== */
 :root{
@@ -127,29 +127,47 @@ a{color:var(--jade)}
 .perm i.on{background:var(--gold);border-color:var(--gold)}
 .codeblock{background:var(--sunken);border:1px solid var(--hairline);border-radius:var(--r-control);padding:10px;font-family:var(--font-mono);font-size:11px;color:var(--ink-soft);white-space:pre-wrap;line-height:1.6}
 
-/* ===== 符文界面 · 金纸案台 ===== */
-.studio{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
-.desk{background:var(--sunken);border:1px solid var(--hairline);border-radius:var(--r-card);padding:12px;position:relative;flex:none}
+/* ===== 符文界面 · 写实金纸案台 ===== */
+.studio{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start}
+.desk{
+  position:relative;flex:none;padding:14px;border:1px solid var(--hairline);border-radius:var(--r-card);
+  background:
+    repeating-linear-gradient(0deg, rgba(138,110,86,.10) 0 1px, transparent 1px 9px),
+    linear-gradient(90deg, rgba(0,0,0,.38), rgba(34,27,24,.55) 30%, rgba(12,10,9,.78));
+  box-shadow: inset 0 1px 0 rgba(226,190,121,.08), 0 12px 30px rgba(0,0,0,.45);
+}
 .desk-corner{position:absolute;width:3px;height:3px;border-radius:50%;background:var(--gold-deep)}
-.paper{width:236px;height:393px;background:var(--paper);border:2px solid var(--paper-edge);position:relative;overflow:hidden;display:flex;flex-direction:column}
-.paper::after{content:"";position:absolute;inset:5px;border:1px solid rgba(185,138,78,.55);pointer-events:none}
-.cloud-head{height:20px;flex:none;display:flex;align-items:center;justify-content:center;gap:6px;position:relative}
-.cloud-head .dots{display:flex;gap:5px}
-.cloud-head .dots i{width:3px;height:3px;border-radius:50%;background:var(--seal);display:block}
-.cloud-head .curl{width:22px;height:9px;border-top:1px solid var(--gold-deep);border-radius:50% 50% 0 0;opacity:.8}
-.zone{display:flex;gap:6px;padding:2px 8px 2px 6px;position:relative;cursor:pointer;border-bottom:.5px solid rgba(185,138,78,.45);min-height:0;overflow:hidden}
-.zone:hover{background:rgba(122,90,48,.08)}
-.zone.sel{background:rgba(178,59,40,.10)}
-.zone.sel::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--seal)}
-.zone.missing{background:var(--paper-missing);border-top:1px dashed var(--paper-missing-ink)}
-.zone .num{font-family:var(--font-mono);font-size:9px;color:var(--gold-deep);width:15px;flex:none;padding-top:1px}
-.zone .body{min-width:0;flex:1}
-.zone .nm{font-size:11px;color:var(--paper-brown);line-height:1.2}
-.zone .tx{font-size:11px;color:var(--paper-ink);line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.zone.missing .tx{color:var(--paper-missing-ink)}
-.stamp{position:absolute;right:8px;bottom:9px;width:38px;height:38px;border:2px solid var(--seal);border-radius:2px;background:rgba(178,59,40,.08);display:grid;place-items:center;color:var(--seal);font-size:16px}
-.stamp::after{content:"";position:absolute;inset:3px;border:1px solid var(--seal)}
-.stamp small{position:absolute;bottom:-12px;left:0;width:100%;text-align:center;font-family:var(--font-mono);font-size:7px;color:var(--seal)}
+.paper-real{
+  width:260px;height:433px;position:relative;overflow:hidden;
+  background:
+    radial-gradient(ellipse 42% 26% at 28% 22%, rgba(122,90,48,.10), transparent 70%),
+    radial-gradient(ellipse 48% 32% at 78% 57%, rgba(122,90,48,.12), transparent 72%),
+    radial-gradient(ellipse 36% 22% at 42% 86%, rgba(122,90,48,.09), transparent 70%),
+    radial-gradient(ellipse 90% 90% at 50% 46%, #FBF3DC 0%, var(--paper) 52%, #DDC99F 100%);
+  box-shadow: 0 0 0 2px var(--paper-edge), 0 0 0 6px rgba(185,138,78,.12),
+              inset 0 0 26px rgba(122,90,48,.28), 6px 10px 22px rgba(0,0,0,.55);
+}
+.paper-real .grain{position:absolute;inset:0;background:#F3E7C8;filter:url(#grain);opacity:.26;mix-blend-mode:multiply;pointer-events:none;z-index:0}
+.paper-real .creases{position:absolute;inset:0;z-index:1;pointer-events:none;background:
+  linear-gradient(90deg, transparent 36.1%, rgba(255,255,255,.32) 36.5%, rgba(122,90,48,.10) 36.9%, transparent 37.3%),
+  linear-gradient(0deg, transparent 65.2%, rgba(255,255,255,.24) 65.5%, rgba(122,90,48,.08) 65.9%, transparent 66.3%)}
+.paper-real .art{position:absolute;inset:0;width:100%;height:100%;z-index:2;pointer-events:none}
+.paper-real .lewen{position:absolute;right:15px;top:44%;z-index:2;writing-mode:vertical-rl;letter-spacing:3px;
+  font-size:12px;color:var(--paper-ink);line-height:1.4;text-shadow:0 0 1px rgba(43,36,27,.22);pointer-events:none}
+/* 九段热区隐形化：默认纸面只有刻痕，悬停/选中才浮出细框 */
+.hot{position:absolute;left:0;right:0;cursor:pointer;z-index:4}
+.hot::before{content:"";position:absolute;left:2px;top:50%;width:6px;height:1px;background:rgba(185,138,78,.6)}
+.hot:hover{background:rgba(178,59,40,.035);box-shadow:inset 0 0 0 1px rgba(178,59,40,.45)}
+.hot.sel{background:rgba(178,59,40,.09);box-shadow:inset 0 0 0 1.2px rgba(178,59,40,.78), inset 3px 0 0 var(--seal)}
+.hot.missing::after{content:"";position:absolute;left:2px;top:2px;bottom:2px;border-left:1.5px dashed rgba(92,85,72,.9)}
+/* 朱砂印泥：不齐边框 + 斑驳缺口 */
+.stamp-real{position:absolute;right:14px;bottom:18px;width:48px;height:48px;z-index:3;
+  border:2px solid var(--seal);border-radius:2px;background:rgba(178,59,40,.11);
+  display:grid;place-items:center;color:var(--seal);font-size:25px;font-weight:700;
+  box-shadow:inset 0 0 0 1px rgba(178,59,40,.45), 0 0 3px rgba(178,59,40,.25);
+  filter:url(#rough);pointer-events:none}
+.stamp-real::before{content:"";position:absolute;inset:-2px;background-image:radial-gradient(rgba(243,231,200,.85) 1px, transparent 1px);background-size:7px 7px;opacity:.5}
+.stamp-real small{position:absolute;bottom:-13px;left:0;width:100%;text-align:center;font-family:var(--font-mono);font-size:7px;color:var(--seal);font-weight:400}
 .studio-side{flex:1;min-width:220px}
 .stroke-grid{display:flex;gap:5px;margin:10px 0}
 .stroke-cell{width:30px;height:30px;background:var(--raised);border:1px solid var(--gold-deep);border-radius:2px;position:relative}
@@ -194,12 +212,45 @@ footer{max-width:1440px;margin:0 auto;padding:24px;color:var(--ink-muted);font-s
 </style>
 </head>
 <body>
+<svg width="0" height="0" aria-hidden="true" style="position:absolute;pointer-events:none">
+  <defs>
+    <!-- 手工纸纤维：x 高频 / y 低频 = 竖向拉长的纤维束 -->
+    <filter id="grain" x="0" y="0" width="100%" height="100%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.11 0.014" numOctaves="4" seed="9" stitchTiles="stitch" result="n"/>
+      <feColorMatrix in="n" type="saturate" values="0"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.55"/></feComponentTransfer>
+    </filter>
+    <!-- 毛边 / 印泥边缘：轻微位移，不做规则直线 -->
+    <filter id="rough" x="-8%" y="-8%" width="116%" height="116%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.035" numOctaves="3" seed="4" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="2.2" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+    <!-- 墨/朱砂在纸上的洇开 -->
+    <filter id="bleed" x="-15%" y="-15%" width="130%" height="130%">
+      <feGaussianBlur stdDeviation="0.42"/>
+    </filter>
+    <pattern id="keyFret" x="0" y="0" width="14" height="8" patternUnits="userSpaceOnUse">
+      <path d="M1 2 H11 V6 H4" fill="none" stroke="rgba(185,138,78,.55)" stroke-width=".6"/>
+    </pattern>
+    <!-- 云篆示意笔画：六笔基元叠成一个复合符，明确不是真符字形 -->
+    <g id="glyph">
+      <g fill="none" stroke="#2B241B" stroke-linecap="round" stroke-linejoin="round" filter="url(#bleed)">
+        <path d="M12 50 Q32 45 50 50 T88 49" stroke-width="2.7"/>
+        <path d="M50 12 Q45 32 50 50 T51 88" stroke-width="2.7"/>
+        <path d="M76 16 Q62 32 50 50 T24 84" stroke-width="2.3"/>
+        <path d="M24 16 Q38 33 50 50 T76 84" stroke-width="2.3"/>
+        <path d="M22 20 Q50 16 78 21 Q82 50 77 78" stroke-width="2.3"/>
+        <path d="M50 42 Q57 46 62 56" stroke-width="2.3"/>
+      </g>
+    </g>
+  </defs>
+</svg>
 
 <div class="banner">
-  <h1>玄坛朱箓 · 符箓台 UI 设计规范预览 <span class="tag">v1.0 / 2026-11-15</span></h1>
+  <h1>玄坛朱箓 · 符箓台 UI 设计规范预览 <span class="tag">v1.1 · 写实符纸 / 2026-11-15</span></h1>
   <p>高保真设计预览 · 非产品界面（产品为 egui 原生自绘，不用 WebView）</p>
 </div>
-<div class="hint">点击中栏「法坛 / 符文」切换视图；点击符纸任一段可选中。所有色值与 <span class="mono">theme.rs</span> 令牌一一对应。</div>
+<div class="hint">点击中栏「法坛 / 符文」切换视图；悬停 / 点击符纸任一高度可显分段。所有色值与 <span class="mono">theme.rs</span> 令牌一一对应。</div>
 
 <div class="app">
   <!-- 坛额 -->
@@ -319,39 +370,81 @@ footer{max-width:1440px;margin:0 auto;padding:24px;color:var(--ink-muted);font-s
 
       <!-- 符文视图 -->
       <div class="view" id="view-paper">
-        <div class="sec-title"><span class="bar" style="background:var(--gold)"></span><h2 style="font-size:16px">符文 · 符纸案台</h2><small>九段部件 · 点段跳字段 · 缺段不伪装</small></div>
+        <div class="sec-title"><span class="bar" style="background:var(--gold)"></span><h2 style="font-size:16px">符文 · 金纸案台</h2><small>写实符式 · 悬停显分段 · 缺段不伪装</small></div>
         <div style="margin:10px 0;display:flex;gap:8px;flex-wrap:wrap">
           <span class="chip jade">纯展示 · 不判定</span>
-          <span class="chip jade">版式由 fulu-script 云篆描述层驱动</span>
+          <span class="chip jade">云篆为示意笔画 · 非真符字形</span>
           <span class="chip gold">已盖朱砂印</span>
         </div>
         <div class="studio">
           <div class="desk">
             <span class="desk-corner" style="left:10px;top:10px"></span><span class="desk-corner" style="right:10px;top:10px"></span>
             <span class="desk-corner" style="left:10px;bottom:10px"></span><span class="desk-corner" style="right:10px;bottom:10px"></span>
-            <div class="paper" id="paper">
-              <div class="cloud-head"><span class="curl"></span><span class="dots"><i></i><i></i><i></i></span><span class="curl"></span></div>
-              <!-- 九段：flex 权重对应 paper.rs WEIGHTS -->
-              <div class="zone sel" data-band="符头" style="flex:130" onclick="pick(this)"><span class="num">01</span><div class="body"><div class="nm">符头</div><div class="tx">召将·急急如律令 / local-llama</div></div></div>
-              <div class="zone" data-band="神明" style="flex:70" onclick="pick(this)"><span class="num">02</span><div class="body"><div class="nm">神明</div><div class="tx">lfm3-1.7b-q4km · T0.7</div></div></div>
-              <div class="zone" data-band="敕令" style="flex:60" onclick="pick(this)"><span class="num">03</span><div class="body"><div class="nm">敕令</div><div class="tx">lu://local</div></div></div>
-              <div class="zone" data-band="捆仙绳" style="flex:110" onclick="pick(this)"><span class="num">04</span><div class="body"><div class="nm">捆仙绳</div><div class="tx">600 tokens · 60s · 受限 · 6 步</div></div></div>
-              <div class="zone" data-band="天柱" style="flex:100" onclick="pick(this)"><span class="num">05</span><div class="body"><div class="nm">天柱</div><div class="tx">你是符箓台法坛中的行符者…</div></div></div>
-              <div class="zone" data-band="地柱" style="flex:100" onclick="pick(this)"><span class="num">06</span><div class="body"><div class="nm">地柱</div><div class="tx">请召将 shout，令其高呼…</div></div></div>
-              <div class="zone" data-band="风火轮" style="flex:80" onclick="pick(this)"><span class="num">07</span><div class="body"><div class="nm">风火轮</div><div class="tx">mcp.demo.shout</div></div></div>
-              <div class="zone" data-band="符胆" style="flex:270" onclick="pick(this)"><span class="num">08</span><div class="body"><div class="nm">符胆</div><div class="tx">急急如律令</div><div class="tx">召将一声，回声入箓，</div><div class="tx">验其 bytes 而后归档。</div><div class="tx">不得借外宗之手改写符文。</div></div></div>
-              <div class="zone missing" data-band="符脚" style="flex:80" onclick="pick(this)"><span class="num">09</span><div class="body"><div class="nm">符脚</div><div class="tx">未成符</div></div></div>
-              <div class="stamp">符<small>1f860a88</small></div>
+            <div class="paper-real" id="paper">
+              <div class="grain"></div><div class="creases"></div>
+              <svg class="art" viewBox="0 0 260 433" preserveAspectRatio="none">
+                <!-- 纸边：毛边用位移滤镜，内框 + 上下回纹 -->
+                <rect x="3" y="3" width="254" height="427" fill="none" stroke="rgba(122,90,48,.55)" stroke-width="1.3" filter="url(#rough)"/>
+                <rect x="11" y="11" width="238" height="411" fill="none" stroke="rgba(185,138,78,.45)" stroke-width=".7"/>
+                <rect x="12" y="13" width="236" height="8" fill="url(#keyFret)"/>
+                <rect x="12" y="412" width="236" height="8" fill="url(#keyFret)" transform="rotate(180 130 416)"/>
+                <!-- 四角三清点 -->
+                <g fill="rgba(185,138,78,.7)">
+                  <circle cx="15" cy="15" r="1"/><circle cx="18" cy="15" r="1"/><circle cx="21" cy="15" r="1"/>
+                  <circle cx="239" cy="15" r="1"/><circle cx="242" cy="15" r="1"/><circle cx="245" cy="15" r="1"/>
+                  <circle cx="15" cy="418" r="1"/><circle cx="18" cy="418" r="1"/><circle cx="21" cy="418" r="1"/>
+                  <circle cx="239" cy="418" r="1"/><circle cx="242" cy="418" r="1"/><circle cx="245" cy="418" r="1"/>
+                </g>
+                <!-- 符头：三清点 + 三道勾 + 两侧卷云 -->
+                <g fill="#B23B28"><circle cx="117" cy="24" r="2.2"/><circle cx="130" cy="24" r="2.2"/><circle cx="143" cy="24" r="2.2"/></g>
+                <g fill="none" stroke="#B23B28" stroke-linecap="round" stroke-linejoin="round" filter="url(#bleed)">
+                  <path d="M102 36 Q114 47 130 37 Q146 31 158 30" stroke-width="3.1"/>
+                  <path d="M108 46 Q119 56 132 46 Q145 40 153 39" stroke-width="2.7"/>
+                  <path d="M113 56 Q121 64 133 55 Q143 50 149 49" stroke-width="2.3"/>
+                </g>
+                <g fill="none" stroke="rgba(185,138,78,.85)" stroke-width="1">
+                  <path d="M84 62 h9 l4 -5 l-4 -5 h-5"/><path d="M176 62 h-9 l-4 -5 l4 -5 h5"/>
+                </g>
+                <g fill="#B23B28" font-size="13" text-anchor="middle" filter="url(#bleed)">
+                  <text x="130" y="82">敕</text><text x="130" y="98">令</text>
+                </g>
+                <!-- 左侧北斗式星点（纯装饰） -->
+                <g fill="rgba(185,138,78,.75)">
+                  <circle cx="42" cy="118" r="1.7"/><circle cx="55" cy="146" r="1.2"/><circle cx="38" cy="180" r="1.2"/>
+                  <circle cx="56" cy="214" r="1.7"/><circle cx="41" cy="252" r="1.2"/><circle cx="57" cy="288" r="1.2"/>
+                </g>
+                <!-- 三个云篆符：上=天柱、中=符胆、下=符脚；缺段只留虚线框 -->
+                <use href="#glyph" transform="translate(80 106) scale(1.0 0.72) rotate(-7 50 50)"/>
+                <use href="#glyph" transform="translate(74 186) scale(1.12 1.08) rotate(6 50 50)"/>
+                <rect x="88" y="312" width="84" height="44" fill="rgba(228,223,210,.42)" stroke="rgba(92,85,72,.8)" stroke-width="1" stroke-dasharray="4 3"/>
+                <text x="130" y="338" text-anchor="middle" font-size="11" fill="#5C5548">未成符</text>
+                <!-- 符脚：一笔到底的收势 + 三点 -->
+                <path d="M60 366 Q92 392 128 382 Q166 368 180 392 Q188 406 196 414"
+                      fill="none" stroke="#2B241B" stroke-width="3" stroke-linecap="round" filter="url(#bleed)"/>
+                <g fill="#B23B28"><circle cx="122" cy="418" r="1.6"/><circle cx="130" cy="418" r="1.6"/><circle cx="138" cy="418" r="1.6"/></g>
+              </svg>
+              <div class="lewen">急急如律令召将一声…</div>
+              <div class="stamp-real">符<small>1f860a88</small></div>
+              <!-- 九段隐形热区：百分比对应 paper.rs WEIGHTS -->
+              <div class="hot sel" data-band="符头" style="top:0%;height:13%" onclick="pick(this)"></div>
+              <div class="hot" data-band="神明" style="top:13%;height:7%" onclick="pick(this)"></div>
+              <div class="hot" data-band="敕令" style="top:20%;height:6%" onclick="pick(this)"></div>
+              <div class="hot" data-band="捆仙绳" style="top:26%;height:11%" onclick="pick(this)"></div>
+              <div class="hot" data-band="天柱" style="top:37%;height:10%" onclick="pick(this)"></div>
+              <div class="hot" data-band="地柱" style="top:47%;height:10%" onclick="pick(this)"></div>
+              <div class="hot" data-band="风火轮" style="top:57%;height:8%" onclick="pick(this)"></div>
+              <div class="hot" data-band="符胆" style="top:65%;height:27%" onclick="pick(this)"></div>
+              <div class="hot missing" data-band="符脚" style="top:92%;height:8%" onclick="pick(this)"></div>
             </div>
           </div>
 
           <div class="studio-side">
-            <div class="sec-title"><span class="bar" style="background:var(--seal)"></span><h2 style="font-size:15px">选中段</h2><small id="picked">符头 · name / head.provider_ref</small></div>
+            <div class="sec-title"><span class="bar" style="background:var(--seal)"></span><h2 style="font-size:15px">符式分段</h2><small id="picked">符头 · name / head.provider_ref</small></div>
             <div class="divider"></div>
             <div class="small" style="color:var(--gold)">云篆笔画基元 <button class="btn ghost sm" style="margin-left:8px">笔顺演示</button></div>
             <div style="margin:8px 0;display:flex;gap:6px;flex-wrap:wrap"><span class="chip jade">纯展示 · 不判定</span><span class="small muted">抽象几何，非书法字形</span></div>
             <div class="stroke-grid" id="strokes"></div>
-            <div class="note">符纸是<strong>单一信息载体</strong>：九段热区 ↔ 字段一一对应。缺段画成灰底虚线 +「未成符」，绝不假装整张符完整；截断必须显式标出。火光 / 笔顺 / 朱砂印全是纯视觉，不承载任何状态判定。</div>
+            <div class="note">符纸按<strong>写实道教符式</strong>重做：手工黄纸纤维 / 水渍 / 折痕 / 毛边、朱砂洇色、毛笔枯笔、印泥斑驳、三清符头与符脚收笔全是程序化材质。九段热区<strong>隐形化</strong>（悬停才显细框），仍与字段一一对应；缺段用左缘灰虚线标出、绝不假装完整；截断显式标出。云篆是<strong>抽象笔画基元，非真实符篆字形</strong>（真字形数据源仍缺）。朱砂印只认盖印状态，火光 / 笔顺 / 纹样全是纯视觉，不承载任何状态判定。</div>
             <div class="divider"></div>
             <div class="small muted">字段表单（点段自动展开对应项）</div>
             <div class="faux-input" style="margin-top:8px;width:100%">name: 召将·急急如律令</div>
@@ -457,7 +550,7 @@ footer{max-width:1440px;margin:0 auto;padding:24px;color:var(--ink-muted);font-s
   </table>
 </div>
 
-<footer>玄坛朱箓 v1.0 · 令牌与组件见 <span class="mono">crates/fulu-ui/src/{theme,widgets}.rs</span> · 本页仅为设计预览，产品界面为 egui 原生自绘</footer>
+<footer>玄坛朱箓 v1.1 · 令牌 / 组件 / 写实材质见 <span class="mono">crates/fulu-ui/src/{theme,widgets,ink}.rs</span> · 本页仅为设计预览，产品界面为 egui 原生自绘</footer>
 
 <script>
 /* 视图切换 */
@@ -467,9 +560,9 @@ function switchView(name){
   document.getElementById('tab-altar').classList.toggle('on', name==='altar');
   document.getElementById('tab-paper').classList.toggle('on', name==='paper');
 }
-/* 符纸热区选中 */
+/* 写实符纸：隐形热区选中（段名与字段只在右栏显示，纸面不铺表格） */
 function pick(el){
-  document.querySelectorAll('.zone').forEach(z=>z.classList.remove('sel'));
+  document.querySelectorAll('.hot').forEach(z=>z.classList.remove('sel'));
   el.classList.add('sel');
   const fields={'符头':'name / head.provider_ref','神明':'deity.model_id / deity.sampling','敕令':'credential_ref',
     '捆仙绳':'harness.*','天柱':'system（正文上段）','地柱':'user（正文下段）','风火轮':'tool_refs / allow_tools',

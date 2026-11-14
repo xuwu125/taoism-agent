@@ -12,6 +12,7 @@
 
 mod confirm;
 mod fonts;
+mod ink;
 mod paper;
 mod taiji;
 mod theme;
@@ -143,6 +144,8 @@ struct FuluApp {
     provider_timeout_secs: u32,
     /// 中栏视图：法坛（仪轨）/ 符文（符纸案台）。
     view: ViewMode,
+    /// 写实金纸纹理：固定种子确定性生成，只上传一次 GPU，逐帧不闪。
+    paper_tex: Option<egui::TextureHandle>,
 }
 
 /// 字段表单里可被符纸热区定位的输入项。
@@ -264,6 +267,7 @@ impl FuluApp {
             taiji_running: false,
             provider_timeout_secs: provider_default_timeout_secs(),
             view: ViewMode::Altar,
+            paper_tex: None,
         };
         app.refresh_files();
         app.reload_models();
@@ -1897,20 +1901,20 @@ impl FuluApp {
 
     /// 符文界面：把「这张符」当作唯一主角的一屏。
     ///
-    /// 金纸案台（左）+ 选中段与云篆（右）+ 字段表单 + 符文正文编辑器。
-    /// 与法坛视图刻意分开：写符时不需要看仪轨按钮，执行时不需要看九段纸面。
+    /// 写实金纸案台（左）+ 选中段与云篆（右）+ 字段表单 + 符文正文编辑器。
+    /// 与法坛视图刻意分开：写符时不需要看仪轨按钮，执行时不需要看纸面细节。
     fn paper_studio(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         widgets::section_title(
             ui,
-            "符文 · 符纸案台",
-            "九段部件 · 点段跳字段 · 缺段不伪装",
+            "符文 · 金纸案台",
+            "写实符式 · 悬停显分段 · 缺段不伪装",
             theme::c::GOLD,
         );
         ui.horizontal_wrapped(|ui| {
             widgets::honesty_badge(ui, widgets::Honesty::DisplayOnly);
             widgets::chip(
                 ui,
-                "版式由 fulu-script 云篆描述层驱动",
+                "笔画取自 fulu-script 云篆基元",
                 theme::c::JADE,
                 theme::c::SUNKEN,
             );
@@ -1960,18 +1964,19 @@ impl FuluApp {
         );
     }
 
-    /// 符文界面的主视觉：金纸案台 + 九段符纸。
+    /// 符文界面的主视觉：写实金纸案台 + 道教符式版式。
     ///
-    /// 全部用 `egui::Painter` 画矢量，不用 HTML/CSS/WebView；版式数字仍全部来自
-    /// `paper::plan`（背后是 `fulu-script` 云篆描述层），GUI 只把归一化坐标乘成像素。
+    /// 与上一版的区别：旧版把九段画成「段号 + 字段名 + 正文」的横排表格，读起来
+    /// 是数据清单而不是符。这一版按传统符式排布——三清符头、朱砂敕令、竖排云篆符、
+    /// 符胆勒文、符脚收笔、朱砂印、回纹边——并把九段热区**隐形化**：默认只在纸左缘
+    /// 留极淡刻痕，悬停/选中才显露细框，段名与字段交给 hover 提示和右栏。
     ///
-    /// 四条诚实性约束在这里逐条落地：
-    /// 1. 解不出符就**不画**，宁可空白也不拿半张符冒充符纸；
-    /// 2. 缺段是数据判断（`zone.filled`），画成灰底虚线 + 「未成符」，绝不假装完整；
-    /// 3. `truncated` 必须显式标出来，绝不静默丢字；
-    /// 4. 符头云纹 / 朱砂印 / 火光 / 笔顺全是**纯视觉**，不承载任何状态判定。
+    /// 四条诚实性约束逐条落地：
+    /// 1. 解不出符就不画，宁可空白也不拿半张符冒充符纸；
+    /// 2. 缺段是 `zone.filled` 数据判断：左缘灰虚线 + 对应符不落墨 + 纸外 chip；
+    /// 3. 云篆是**抽象笔画基元**，纸外显式标注「示意笔画 · 非真符字形」，不冒充书法字帖；
+    /// 4. 朱砂印只认 `self.seal`；火光、笔顺、纹样全是纯视觉，不承载状态判定。
     fn paper_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // 解不出符就不画。
         let fu = match fulu_app::parse_fu(&self.fu_text) {
             Ok(fu) => fu,
             Err(error) => {
@@ -1988,28 +1993,9 @@ impl FuluApp {
         let script = fulu_script::describe_cloud(&fu);
         let layout = paper::plan(&fu, &script);
 
-        // 纸面文字按可用像素宽度裁剪，超出一定补 `…`：宁可显式说「这里截了」，
-        // 也不让长正文溢出纸边框、糊到下一段上（不静默丢字是符纸的硬约束）。
-        // 中文按 1em 保守估宽，ASCII 会显得短一点，但绝不会越界。
-        fn elide(text: &str, max_width: f32, font_size: f32) -> String {
-            if max_width < font_size {
-                return String::new();
-            }
-            let max_chars = (max_width / font_size).floor() as usize;
-            let chars: Vec<char> = text.chars().collect();
-            if chars.len() <= max_chars {
-                return text.to_owned();
-            }
-            let mut shown: String = chars
-                .into_iter()
-                .take(max_chars.saturating_sub(1))
-                .collect();
-            shown.push('…');
-            shown
-        }
-
+        // 写实纸面不再承担「信息表格」职责：缺段 / 截断 / 示意笔画全部显式标在纸外。
         ui.horizontal_wrapped(|ui| {
-            widgets::chip(ui, "九段 · 3:5 竖长方", theme::c::GOLD, theme::c::SUNKEN);
+            widgets::chip(ui, "3:5 金纸 · 符式版式", theme::c::GOLD, theme::c::SUNKEN);
             let missing = layout.missing();
             if missing.is_empty() {
                 widgets::chip(ui, "九段俱全", theme::c::GOOD, theme::c::SUNKEN);
@@ -2017,7 +2003,7 @@ impl FuluApp {
                 let names: Vec<&str> = missing.iter().map(|band| band.label()).collect();
                 widgets::chip(
                     ui,
-                    &format!("未成符：{}（灰底虚线）", names.join("、")),
+                    &format!("未成符：{}", names.join("、")),
                     theme::c::WARN,
                     theme::c::SUNKEN,
                 );
@@ -2025,257 +2011,151 @@ impl FuluApp {
             if layout.truncated {
                 widgets::honesty_badge(ui, widgets::Honesty::Truncated);
             }
+            widgets::honesty_badge(ui, widgets::Honesty::DisplayOnly);
+            ui.label(
+                egui::RichText::new("云篆为示意笔画 · 非真符字形")
+                    .size(theme::t::CAPTION)
+                    .color(theme::c::INK_MUTED),
+            );
         });
         ui.add_space(theme::s::SM);
 
-        // 纸面尺寸：3:5 竖长方，缩放规则在 paper::fit 里（有单测）。
         let (paper_w, paper_h) =
             paper::fit(layout.aspect, ui.available_width(), ui.available_height());
+
+        // 纸纹只生成一次：固定种子确定性哈希，逐帧不闪；零外部素材、零联网。
+        let texture = match &self.paper_tex {
+            Some(handle) => handle.clone(),
+            None => {
+                let handle = ctx.load_texture(
+                    "fulu_gold_paper",
+                    ink::paper_texture(360, 600),
+                    egui::TextureOptions::LINEAR,
+                );
+                self.paper_tex = Some(handle.clone());
+                handle
+            }
+        };
+
         ui.horizontal_top(|ui| {
-            let desk_w = paper_w + 24.0;
-            let desk_h = paper_h + 24.0;
+            let desk_w = paper_w + 28.0;
+            let desk_h = paper_h + 28.0;
             let (desk_rect, _) =
                 ui.allocate_exact_size(egui::vec2(desk_w, desk_h), egui::Sense::hover());
             let painter = ui.painter_at(desk_rect);
-            widgets::paper_backdrop(&painter, desk_rect);
             let rect = egui::Rect::from_min_size(
-                desk_rect.min + egui::vec2(12.0, 12.0),
+                desk_rect.min + egui::vec2(14.0, 14.0),
                 egui::vec2(paper_w, paper_h),
             );
-            let response = ui.interact(
-                rect,
-                ui.make_persistent_id("fulu_paper_hotspots"),
-                egui::Sense::click(),
-            );
 
-            // 金纸：方正无圆角，双层边框（外粗内细），与界面控件的圆角形成材质对比。
-            painter.rect_filled(rect, theme::r::PAPER, theme::c::PAPER);
+            // 案台 → 金纸纹理 → 纸边 → 毛边 → 回纹。
+            ink::wooden_desk(&painter, desk_rect, rect);
+            painter.image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
             painter.rect_stroke(
                 rect,
                 theme::r::PAPER,
-                egui::Stroke::new(2.0, theme::c::PAPER_EDGE),
+                egui::Stroke::new(1.4, theme::c::PAPER_EDGE),
                 egui::StrokeKind::Inside,
             );
-            painter.rect_stroke(
-                rect.shrink(5.0),
-                theme::r::PAPER,
-                egui::Stroke::new(0.6, theme::c::GOLD_DEEP),
-                egui::StrokeKind::Inside,
+            ink::deckle(&painter, rect);
+            ink::border_pattern(&painter, rect);
+
+            // 符头：三清点 / 三勾 / 卷云 + 朱砂竖书「敕令」。
+            let head = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 8.0, rect.top() + 9.0),
+                egui::vec2(rect.width() - 16.0, rect.height() * 0.20),
             );
+            ink::cloud_head(&painter, head);
 
-            // 符头云纹：抽象几何装饰（三清点 + 两侧卷云），明确不是云篆书法字形。
-            let cx = rect.center().x;
-            let cy = rect.top() + 9.0;
-            for dx in [-8.0, 0.0, 8.0] {
-                painter.circle_filled(egui::pos2(cx + dx, cy), 1.6, theme::c::SEAL_RED);
-            }
-            for side in [-1.0_f32, 1.0] {
-                let base = cx + side * 22.0;
-                painter.add(egui::Shape::line(
-                    vec![
-                        egui::pos2(base, cy + 4.0),
-                        egui::pos2(base + side * 10.0, cy + 4.0),
-                        egui::pos2(base + side * 14.0, cy),
-                        egui::pos2(base + side * 10.0, cy - 4.0),
-                    ],
-                    egui::Stroke::new(1.0, theme::c::GOLD_DEEP),
-                ));
-            }
+            // 左侧星点列：纯装饰，不对应任何数据。
+            let stars = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 8.0, rect.top() + rect.height() * 0.20),
+                egui::vec2(rect.width() * 0.22, rect.height() * 0.62),
+            );
+            ink::star_dots(&painter, stars);
 
-            let hover_y = response
-                .hover_pos()
-                .map(|pos| ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0));
-            let hovered_zone = hover_y.and_then(|y| layout.band_at(y));
-            let hovered = hovered_zone.map(|zone| zone.band);
-
-            for (index, zone) in layout.zones.iter().enumerate() {
-                let top = rect.top() + zone.start * rect.height();
-                let bottom = rect.top() + zone.end * rect.height();
-                let band_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + 5.0, top),
-                    egui::pos2(rect.right() - 5.0, bottom),
-                );
-                let selected = self.paper_pick == Some(zone.band);
-                if selected {
-                    painter.rect_filled(
-                        band_rect,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(0xB2, 0x3B, 0x28, 24),
-                    );
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(
-                            band_rect.min,
-                            egui::vec2(3.0, band_rect.height()),
-                        ),
-                        0.0,
-                        theme::c::SEAL_RED,
-                    );
-                } else if hovered == Some(zone.band) {
-                    painter.rect_filled(
-                        band_rect,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(0x7A, 0x5A, 0x30, 14),
-                    );
-                }
-                if !zone.filled {
-                    // 缺部件：灰底 + 顶部虚线，明确「这里还没写」。
-                    painter.rect_filled(band_rect, 0.0, theme::c::PAPER_MISSING);
-                    let mut x = band_rect.left() + 2.0;
-                    while x < band_rect.right() - 2.0 {
-                        painter.line_segment(
-                            [
-                                egui::pos2(x, band_rect.top() + 1.0),
-                                egui::pos2((x + 4.0).min(band_rect.right()), band_rect.top() + 1.0),
-                            ],
-                            egui::Stroke::new(1.0, theme::c::PAPER_MISSING_INK),
-                        );
-                        x += 7.0;
-                    }
-                }
-                // 段间细线：让九段的节奏可读，而不是一整块黄纸。
-                painter.line_segment(
-                    [
-                        egui::pos2(band_rect.left(), bottom),
-                        egui::pos2(band_rect.right(), bottom),
-                    ],
-                    egui::Stroke::new(
-                        0.5,
-                        egui::Color32::from_rgba_unmultiplied(0xB9, 0x8A, 0x4E, 90),
+            // 三个云篆符各对应一个真实段：上=天柱、中=符胆、下=符脚。
+            // 该段缺字段就不落墨、只留虚线框——纸面不假装这张符是完整的。
+            let strokes: Vec<&[(i32, i32)]> =
+                script.strokes.iter().map(|stroke| stroke.points).collect();
+            let is_filled = |band: paper::Band| -> bool {
+                layout
+                    .zones
+                    .iter()
+                    .find(|zone| zone.band == band)
+                    .is_some_and(|zone| zone.filled)
+            };
+            for (start, end, band, seed) in [
+                (0.23_f32, 0.41_f32, paper::Band::Sky, 0xA1_01_u32),
+                (0.42_f32, 0.71_f32, paper::Band::Dan, 0xA2_02_u32),
+                (0.72_f32, 0.82_f32, paper::Band::Foot, 0xA3_03_u32),
+            ] {
+                let glyph = egui::Rect::from_min_size(
+                    egui::pos2(
+                        rect.left() + rect.width() * 0.27,
+                        rect.top() + rect.height() * start,
                     ),
+                    egui::vec2(rect.width() * 0.46, rect.height() * (end - start)),
                 );
-
-                // 段号（等宽暗金）/ 段名（纸面棕）/ 正文（纸面墨）。
-                // 字号从历史 9.0/9.5 提到 11px——中文小字终于达到可读下限。
-                painter.text(
-                    egui::pos2(band_rect.left() + 2.0, band_rect.top() + 2.0),
-                    egui::Align2::LEFT_TOP,
-                    format!("{:02}", index + 1),
-                    egui::FontId::monospace(theme::t::PAPER_MIN),
-                    theme::c::GOLD_DEEP,
-                );
-                let compact = band_rect.height() < 30.0;
-                let name_x = band_rect.left() + 24.0;
-                painter.text(
-                    egui::pos2(name_x, band_rect.top() + 2.0),
-                    egui::Align2::LEFT_TOP,
-                    zone.band.label(),
-                    egui::FontId::proportional(theme::t::PAPER_MIN),
-                    theme::c::PAPER_BROWN,
-                );
-
-                let empty_label = if zone.filled {
-                    "（空）"
-                } else {
-                    "未成符"
-                };
-                let text_color = if zone.filled {
-                    theme::c::PAPER_INK
-                } else {
-                    theme::c::PAPER_MISSING_INK
-                };
-                if compact {
-                    let first = zone
-                        .lines
-                        .first()
-                        .filter(|line| !line.trim().is_empty())
-                        .map(String::as_str)
-                        .unwrap_or(empty_label);
-                    let body_x = name_x + 48.0;
-                    let body_w = (band_rect.right() - 4.0 - body_x).max(0.0);
-                    painter.text(
-                        egui::pos2(body_x, band_rect.top() + 2.0),
-                        egui::Align2::LEFT_TOP,
-                        elide(first, body_w, theme::t::PAPER_MIN),
-                        egui::FontId::proportional(theme::t::PAPER_MIN),
-                        text_color,
-                    );
-                } else {
-                    let text_top = band_rect.top() + 16.0;
-                    let avail_h = (band_rect.height() - 16.0).max(0.0);
-                    let rows = zone.lines.len().max(1) as f32;
-                    let line_h = (avail_h / rows).clamp(11.0, 15.0);
-                    if zone.lines.is_empty() || zone.lines.iter().all(|line| line.trim().is_empty())
-                    {
-                        painter.text(
-                            egui::pos2(name_x, text_top),
-                            egui::Align2::LEFT_TOP,
-                            empty_label,
-                            egui::FontId::proportional(theme::t::PAPER_MIN),
-                            text_color,
-                        );
-                    } else {
-                        for (line_index, line) in zone.lines.iter().enumerate() {
-                            let y = text_top + line_index as f32 * line_h;
-                            if y + line_h > band_rect.bottom() {
-                                break;
-                            }
-                            painter.text(
-                                egui::pos2(name_x, y),
-                                egui::Align2::LEFT_TOP,
-                                elide(
-                                    line,
-                                    (band_rect.right() - 4.0 - name_x).max(0.0),
-                                    theme::t::PAPER_MIN,
-                                ),
-                                egui::FontId::proportional(theme::t::PAPER_MIN),
-                                text_color,
-                            );
-                        }
-                    }
-                }
+                ink::cloud_glyph(&painter, glyph, &strokes, is_filled(band), seed);
             }
 
-            // 朱砂方印：只有校验过（self.seal 有值）才盖。双框 + 印文 + 符印短摘要。
+            // 符胆勒文：一列竖排小字，取描述层 Body 首行（已按字符裁剪，截断不静默）。
+            let body_line = script
+                .sections
+                .iter()
+                .find(|(slot, _)| *slot == fulu_script::CloudSlot::Body)
+                .and_then(|(_, lines)| lines.first())
+                .cloned()
+                .unwrap_or_default();
+            let lewen_x = rect.right() - 17.0;
+            let lewen_top = rect.top() + rect.height() * 0.44;
+            for (index, ch) in body_line.chars().take(9).enumerate() {
+                painter.text(
+                    egui::pos2(lewen_x, lewen_top + index as f32 * 13.0),
+                    egui::Align2::CENTER_TOP,
+                    ch.to_string(),
+                    egui::FontId::proportional(theme::t::PAPER_MIN),
+                    theme::c::PAPER_INK,
+                );
+            }
+
+            // 符脚：一笔到底的收势。
+            let foot = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.left() + rect.width() * 0.16,
+                    rect.top() + rect.height() * 0.84,
+                ),
+                egui::vec2(rect.width() * 0.68, rect.height() * 0.13),
+            );
+            ink::talisman_foot(&painter, foot);
+
+            // 朱砂印只认 self.seal：没校验过绝不画一个「看着像盖了」的装饰印。
             if let Some(seal) = &self.seal {
-                let side = (paper_w * 0.22).clamp(26.0, 44.0);
+                let side = (paper_w * 0.22).clamp(30.0, 52.0);
                 let stamp = egui::Rect::from_min_size(
-                    egui::pos2(rect.right() - side - 8.0, rect.bottom() - side - 8.0),
+                    egui::pos2(rect.right() - side - 10.0, rect.bottom() - side - 16.0),
                     egui::vec2(side, side),
                 );
-                painter.rect_filled(
-                    stamp,
-                    2.0,
-                    egui::Color32::from_rgba_unmultiplied(0xB2, 0x3B, 0x28, 20),
-                );
-                painter.rect_stroke(
-                    stamp,
-                    2.0,
-                    egui::Stroke::new(2.0, theme::c::SEAL_RED),
-                    egui::StrokeKind::Inside,
-                );
-                painter.rect_stroke(
-                    stamp.shrink(3.0),
-                    0.0,
-                    egui::Stroke::new(0.7, theme::c::SEAL_RED),
-                    egui::StrokeKind::Inside,
-                );
-                painter.text(
-                    stamp.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "符",
-                    egui::FontId::proportional(16.0),
-                    theme::c::SEAL_RED,
-                );
-                painter.text(
-                    egui::pos2(stamp.center().x, stamp.bottom() + 2.0),
-                    egui::Align2::CENTER_TOP,
-                    &seal[..8.min(seal.len())],
-                    egui::FontId::monospace(8.0),
-                    theme::c::SEAL_RED,
-                );
+                ink::seal_stamp(&painter, stamp, &seal[..8.min(seal.len())]);
             }
 
-            // 火光：焚符成功后 0.9 秒内从符心向外淡出。纯视觉，不影响任何状态。
-            if let Some(start) = self.fire_at {
-                let elapsed = start.elapsed().as_secs_f32();
+            // 火光：纯视觉，0.9 秒内淡出，不影响任何状态判定。
+            if let Some(start_time) = self.fire_at {
+                let elapsed = start_time.elapsed().as_secs_f32();
                 if elapsed >= theme::m::FIRE_MS as f32 / 1000.0 {
                     self.fire_at = None;
                 } else {
                     let t = 1.0 - elapsed / (theme::m::FIRE_MS as f32 / 1000.0);
                     let radius = paper_w * (0.25 + 0.55 * (1.0 - t));
                     for ring in 0..3 {
-                        let alpha = ((t * 70.0) as u8).saturating_sub(ring * 18);
-                        if alpha == 0 {
+                        let opacity = ((t * 70.0) as u8).saturating_sub(ring * 18);
+                        if opacity == 0 {
                             continue;
                         }
                         painter.circle_filled(
@@ -2285,11 +2165,90 @@ impl FuluApp {
                                 theme::c::EMBER.r(),
                                 theme::c::EMBER.g(),
                                 theme::c::EMBER.b(),
-                                alpha,
+                                opacity,
                             ),
                         );
                     }
                     ctx.request_repaint();
+                }
+            }
+
+            // 九段热区隐形化：默认纸面只有刻痕，悬停/选中才浮出细框。
+            let response = ui.interact(
+                rect,
+                ui.make_persistent_id("fulu_paper_hotspots"),
+                egui::Sense::click(),
+            );
+            let hover_y = response
+                .hover_pos()
+                .map(|pos| ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0));
+            let hovered_zone = hover_y.and_then(|y| layout.band_at(y));
+            let hovered = hovered_zone.map(|zone| zone.band);
+
+            for zone in &layout.zones {
+                let top = rect.top() + zone.start * rect.height();
+                let bottom = rect.top() + zone.end * rect.height();
+                let mid = (top + bottom) * 0.5;
+                // 刻痕：无数字、无字段名，只是纸缘的一道暗金短划。
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 2.0, mid),
+                        egui::pos2(rect.left() + 7.0, mid),
+                    ],
+                    egui::Stroke::new(
+                        0.8,
+                        egui::Color32::from_rgba_unmultiplied(0xB9, 0x8A, 0x4E, 110),
+                    ),
+                );
+                if !zone.filled {
+                    // 缺段：左缘灰虚线竖条，逐段精确对应，不假装整张符完整。
+                    let mut y = top + 1.0;
+                    while y < bottom - 1.0 {
+                        painter.line_segment(
+                            [
+                                egui::pos2(rect.left() + 2.0, y),
+                                egui::pos2(rect.left() + 2.0, (y + 4.0).min(bottom - 1.0)),
+                            ],
+                            egui::Stroke::new(1.4, theme::c::PAPER_MISSING_INK),
+                        );
+                        y += 8.0;
+                    }
+                }
+                let selected = self.paper_pick == Some(zone.band);
+                if selected || hovered == Some(zone.band) {
+                    let band_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + 3.0, top),
+                        egui::pos2(rect.right() - 3.0, bottom),
+                    );
+                    if selected {
+                        painter.rect_filled(
+                            band_rect,
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(0xB2, 0x3B, 0x28, 22),
+                        );
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                band_rect.min,
+                                egui::vec2(3.0, band_rect.height()),
+                            ),
+                            0.0,
+                            theme::c::SEAL_RED,
+                        );
+                    }
+                    painter.rect_stroke(
+                        band_rect,
+                        0.0,
+                        egui::Stroke::new(
+                            if selected { 1.2 } else { 0.7 },
+                            egui::Color32::from_rgba_unmultiplied(
+                                0xB2,
+                                0x3B,
+                                0x28,
+                                if selected { 190 } else { 110 },
+                            ),
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
                 }
             }
 
@@ -2335,7 +2294,7 @@ impl FuluApp {
 
             // 右侧：选中段的字段清单 + 云篆笔画基元（抽象几何，非书法字形）。
             ui.vertical(|ui| {
-                widgets::section_title(ui, "选中段", "点左侧符纸条带", theme::c::SEAL_RED);
+                widgets::section_title(ui, "符式分段", "悬停 / 点纸面任一高度", theme::c::SEAL_RED);
                 if let Some(band) = self.paper_pick {
                     ui.label(
                         egui::RichText::new(format!("{} · {}", band.label(), band.fields()))

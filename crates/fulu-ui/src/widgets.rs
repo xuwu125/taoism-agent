@@ -375,31 +375,8 @@ pub fn audit_row(ui: &mut egui::Ui, index: usize, line: &str, is_last: bool) {
     );
 }
 
-/// 符纸案台衬底：暗木色几层 + 纸影，让金纸在深色界面里「放上去」而不是「贴上去」。
-/// 纯装饰，不承载任何状态。
-pub fn paper_backdrop(p: &egui::Painter, rect: egui::Rect) {
-    p.rect_filled(rect, r::CARD, c::SUNKEN);
-    p.rect_stroke(
-        rect,
-        r::CARD,
-        Stroke::new(1.0, c::HAIRLINE),
-        egui::StrokeKind::Inside,
-    );
-    // 案台四角的暗金钉：装饰性的「装裱」语汇，不参与交互。
-    let inset = 10.0;
-    for (dx, dy) in [
-        (inset, inset),
-        (rect.width() - inset, inset),
-        (inset, rect.height() - inset),
-        (rect.width() - inset, rect.height() - inset),
-    ] {
-        p.circle_filled(
-            egui::pos2(rect.left() + dx, rect.top() + dy),
-            1.5,
-            c::GOLD_DEEP.linear_multiply(0.6),
-        );
-    }
-}
+// 写实符纸案台已迁到 ink::wooden_desk（程序化木纹 + 软影 + 毛边），
+// 这一层不再画纯色衬底。
 
 /// 分隔线（带语义色，区别于 egui 默认 separator）。
 pub fn divider(ui: &mut egui::Ui, color: Color32) {
