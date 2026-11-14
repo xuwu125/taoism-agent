@@ -284,10 +284,13 @@ mod tests {
     #[test]
     fn dispatch_fu_path_respects_workspace_boundary() {
         let tool = summon_at_max_depth();
-        for bad in [
-            r#"{"fu_path":"C:/evil.fu"}"#,
-            r#"{"fu_path":"../../evil.fu"}"#,
-        ] {
+        // CI 修证：绝对路径样例必须平台匹配——"C:/evil.fu" 在 mac/linux 只是
+        // 一个相对路径（不会被拒），测试在非 Windows 平台假红。
+        #[cfg(windows)]
+        let evil_absolute = r#"{"fu_path":"C:/evil.fu"}"#;
+        #[cfg(not(windows))]
+        let evil_absolute = r#"{"fu_path":"/etc/evil.fu"}"#;
+        for bad in [evil_absolute, r#"{"fu_path":"../../evil.fu"}"#] {
             let result = tool.invoke(&ToolArguments { json: bad.into() }, &ToolPolicy::default());
             assert!(
                 matches!(result, Err(ToolError::PathForbidden(_))),

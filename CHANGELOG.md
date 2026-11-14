@@ -6,6 +6,10 @@
 
 ### 新增
 
+- **CI 根因全清 + 测试修复（2026-11-14，docs/02 §41.6）**：用户只读 token 后首次下载 Actions 日志，**47 个 run 全红的真实根因不是「间歇 flaky」，是四个确定性 bug + 一个 runner 噪音**：①fulu-tools fs/shell 测试共用固定名临时目录，并行时互删文件（windows/mac 稳定复现 NotFound）→ 唯一目录化；②summon 路径越界测试样例 `C:/evil.fu` 在 mac/linux 是相对路径（假红，产品逻辑无恙）→ 平台感知样例；③Linux 上 winit 无窗口后端——工作区 eframe `default-features=false` 缺 `x11`/`wayland`（ubuntu clippy/build 自首跑全红的根因）→ fulu-ui 加 target 专属 feature + Cargo.lock 同步；④cross ARM64 只装了交叉编译器缺 libc 头文件 → CI 补 `libc6-dev-arm64-cross`；⑤Windows runner 回环偶发 refused（provider 头部测试）→ 仅对 refused 限次重试。
+
+### 修复
+
 - **请求超时可配置 + T23 GUI 机器模拟端到端（2026-11-13）**：provider 默认超时 30 s → 180 s（CPU 12.76 t/s 下 30 s 只够 ~380 token），三条配置通道夹紧口径一致（1..=600）：环境变量 `FULU_PROVIDER_TIMEOUT_SECS`、`set_provider_timeout`、GUI 设置面板「请求超时」数字框（焚符时被符文 `timeout_secs` 夹小）。**T23 GUI 逐次弹窗链路以机器模拟走通（非真人，docs/02 §41.4）**：真 MCP mock server 接入 → 1.7B 模型正确发起破坏性召将 → 敕门卡片弹出 → 敕可 → 工具真执行（将回 bytes=15）→ 预算耗尽炸炉如实终态；箓层双向核验首次真机实测（sandbox=strict 被 PermissionTooLow 驳回）；焚符达标回执与中止取消独立终态均经 GUI 走通。顺手修复：法坛窗口矮时动作按钮被裁切（整栏加外层 ScrollArea）。新工具 `tools/gui-drive.py` / `tools/gui-locate.py`（SendInput 坐标点击 + 截图，供 GUI 机器辅助验收）。真人复核敕门观感后才可宣称 T23 GUI 完全通过。
 
 - **T11 量化吞吐基准补齐（2026-11-13，真机实测）**：真权重 + llama.cpp b12314 + 真焚符（缴符 usage 全部 `estimated=false`）——单路生成 12.76 t/s（prefill 211 tok @ 145 t/s，纠正了「除以 usage 得 ~29 t/s」的 prompt+completion 混算假象）；两路并发对打单实例时逐流生成几乎不降（12.31 / 11.50 t/s）、聚合生成吞吐 ≈ 1.4×。**真机数据推翻了「单实例就是串行上限」的旧论证并已修正**：b12314 默认 4 槽位 + 统一 KV，并行收益发生在 llama-server 槽位层（continuous batching），法坛层不需要自己调度；「保持同步、不引入 tokio」的结论不变，主因改为太极 DAG 确定性 + 缴符链线性审计面（docs/02 §22.1/§22.2）。
@@ -46,7 +50,7 @@
 
 ### 修复
 - **Windows MSI 打包失败（T26，2026-11-13，本地复现修复）**：`light.exe` 报 `LGHT0311`——`packaging/windows/fulu.wxs` 的中文字符串在 MSI 数据库默认 CP1252（CI en-US locale）下不可编码；修复 = `Product/@Codepage="936"`，连带修复暴露出的 ICE38（per-user 组件 KeyPath 必须是 HKCU 注册表键，不能是文件）与 ICE64（用户目录卸载须登记 RemoveFolder/RemoveFile）。本地 candle+light（WiX 3.14.1）exit 0 实测产出 MSI；CI 实装待下一次 tag。
-- **CI 可观测性**：ci.yml tests 步骤加 `--no-fail-fast`（windows/mac 的间歇失败需要一次看到全部失败用例，docs/02 §41.5）。首次盘点确认：**CI 47 个 run 自首 push 起全红零成功**；windows/mac tests 间歇失败自太极编排/召将提交起出现，本地（rustc 1.100 同款工具链 + 干净 worktree + CI 环境变量）无法复现，根因 UNVERIFIED 待 CI 日志；ubuntu clippy/build 与 cross ARM64 自首跑起全红，同样待日志定位。
+- **CI 可观测性**：ci.yml tests 步骤加 `--no-fail-fast`。首次盘点确认：**CI 47 个 run 自首 push 起全红零成功**；本地（rustc 1.100 同款工具链 + 干净 worktree + CI 环境变量）无法复现 windows/mac 的 tests 失败——后经 CI 日志确认是测试自身的并行竞争与平台假设问题（根因全清见上「新增」条目与 docs/02 §41.6）。
 - **moli 无头浏览器必须用独立 profile**：用户开着 Edge/Chrome 时（本机实测 41 个 `msedge` 进程），共用默认 `user-data-dir` 的新进程会把请求转交给已有实例后**立刻退出**——退出码 0、stdout 为空。原实现只判退出码，于是把空 DOM 当成功返回，`moli.open` 会静默拉回空页（与「页面无文本要如实报错」的口径冲突，因为根本走不到那一步）。现在每次给 `--user-data-dir=<临时目录>`（另加 `--no-first-run --no-default-browser-check`），先清理 profile 再判错；新增纯函数 `moli_headless_args` 与测试 `moli_headless_args_always_isolate_the_profile` 锁住「不许删掉独立 profile」。真机集成测试的 mock 服务同时改为循环 accept（浏览器一个页面会发不止一个连接），该测试此前的偶发失败（单跑过、连跑 5 轮错 1 轮）由此消除，修后连跑 10 轮零失败。
 
 ### 真人验收结论（2026-11-11，Windows 10）

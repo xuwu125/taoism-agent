@@ -16,3 +16,10 @@ fulu-app.workspace = true
 # 符纸版式（云篆描述层）由 fulu-script 提供：GUI 只消费数据，不自己发明排版。
 fulu-script.workspace = true
 fulu-vault.workspace = true
+
+# Linux 上 winit 需要显式窗口后端特性：工作区把 eframe 设为 default-features = false，
+# 只带 glow/default_fonts，Windows/macOS 自带后端，但 Linux 不加 x11/wayland 会直接
+# compile_error!("The platform you're compiling for is not supported by winit")。
+# CI 的 Linux job 已装对应系统库（libxkbcommon/libwayland/libx11）做链接期检查。
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { workspace = true, features = ["x11", "wayland"] }

@@ -113,7 +113,10 @@ jobs:
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Install cross linker
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+        # gcc-aarch64-linux-gnu 只带交叉编译器；ring 的 build.rs 用 cc 编 C 代码时
+        # 还需要 ARM64 的 libc 头文件（libc6-dev-arm64-cross），否则掉进宿主机
+        # /usr/include 报 bits/libc-header-start.h 缺失（CI 实测）。
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Build CLI for ARM64 Linux
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc

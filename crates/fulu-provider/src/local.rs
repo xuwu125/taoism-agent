@@ -944,7 +944,22 @@ mod tests {
         provider
             .set_endpoint(&format!("http://127.0.0.1:{port}"))
             .expect("端点合法");
-        provider.invoke(&sample_request()).expect("应成功");
+        // CI 修证：windows-latest 上回环连接偶发 refused（runner 已知噪音，与本测试
+        // 要验的「无 Authorization 头」无关）。只对「连接被拒」类传输错误做有限重试；
+        // 一旦请求真正抵达 mock 服务，后续任何错误照旧失败，不掩盖真问题。
+        let mut result = provider.invoke(&sample_request());
+        for _ in 0..3 {
+            match &result {
+                Err(ProviderError::Transport(msg))
+                    if msg.contains("refused") || msg.contains("os error 10061") =>
+                {
+                    std::thread::sleep(Duration::from_millis(200));
+                    result = provider.invoke(&sample_request());
+                }
+                _ => break,
+            }
+        }
+        result.expect("应成功");
         let raw = headers
             .recv_timeout(Duration::from_secs(5))
             .expect("应收到请求");

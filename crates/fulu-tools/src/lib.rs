@@ -1257,7 +1257,7 @@ mod tests {
     }
 
     fn shell_registry_with_temp_root() -> (ToolRegistry, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("fulu_shell_test_{}", std::process::id()));
+        let root = unique_temp_root("fulu_shell_test");
         std::fs::create_dir_all(&root).unwrap();
         let registry = ToolRegistry::new(ToolPolicy {
             root: Some(root.clone()),
@@ -1384,10 +1384,21 @@ mod tests {
         Register::baseline().authorize(&fu).unwrap()
     }
 
-    fn write_registry_with_temp_root() -> (ToolRegistry, PathBuf) {
-        let root = std::env::temp_dir().join(format!("fulu_write_test_{}", std::process::id()));
+    // CI 修证：临时根目录必须每次调用唯一。此前固定 `fulu_write_test_{pid}`，
+    // cargo test 并行跑多个 fs.write 测试时，后来者的 remove_dir_all 会把
+    // 先行者的中间产物删掉（windows/mac 上实测出「备份文件 NotFound」）。
+    static TEMP_ROOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn unique_temp_root(prefix: &str) -> PathBuf {
+        let n = TEMP_ROOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("{prefix}_{}_{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_registry_with_temp_root() -> (ToolRegistry, PathBuf) {
+        let root = unique_temp_root("fulu_write_test");
         let registry = ToolRegistry::new(ToolPolicy {
             root: Some(root.clone()),
             allowed_domains: Vec::new(),
@@ -1458,9 +1469,7 @@ mod tests {
         let first = backup_path_for(Path::new("/w/a.txt"));
         assert_eq!(first, PathBuf::from("/w/a.txt.fulu-bak"));
         // 已存在同名备份时退到编号备份（用真实文件验证 exists 分支）。
-        let root = std::env::temp_dir().join(format!("fulu_bak_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = unique_temp_root("fulu_bak_test");
         let target = root.join("a.txt");
         std::fs::write(&target, "x").unwrap();
         std::fs::write(target.with_file_name("a.txt.fulu-bak"), "y").unwrap();
