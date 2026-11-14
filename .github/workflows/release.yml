@@ -78,7 +78,11 @@ jobs:
           cp LICENSE THIRD_PARTY_NOTICES.md models/manifest.json models/README.md "$STAGE/"
           # T07：二进制内嵌字体 = 分发字体，许可全文必须随包（THIRD_PARTY_NOTICES.md 第 4 节）。
           mkdir -p "$STAGE/licenses"
-          cp crates/fulu-ui/assets/fonts/*.txt crates/fulu-ui/assets/fonts/licenses/*.txt "$STAGE/licenses/"
+          # CI 实测（v0.3.2）：两批许可里 LICENSE-NotoSansSC.txt 同名，一次 cp 多源
+          # 到同目录遇同名 GNU cp 拒绝覆盖（will not overwrite just-created）。
+          # 分两步，licenses/ 子目录为权威版本，后者 -f 覆盖。
+          cp crates/fulu-ui/assets/fonts/*.txt "$STAGE/licenses/"
+          cp -f crates/fulu-ui/assets/fonts/licenses/*.txt "$STAGE/licenses/"
           tar -czf "dist/$OUT.tar.gz" -C stage "$OUT"
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"
 
@@ -93,7 +97,7 @@ jobs:
           Copy-Item "$bin/fulu.exe", "$bin/fulu-ui.exe", "LICENSE", "THIRD_PARTY_NOTICES.md", "models/manifest.json", "models/README.md" -Destination $stage
           # T07：与 Unix 一致，字体许可全文随包。
           New-Item -ItemType Directory -Force -Path "$stage/licenses" | Out-Null
-          Copy-Item "crates/fulu-ui/assets/fonts/*.txt", "crates/fulu-ui/assets/fonts/licenses/*.txt" -Destination "$stage/licenses"
+          Copy-Item "crates/fulu-ui/assets/fonts/*.txt", "crates/fulu-ui/assets/fonts/licenses/*.txt" -Destination "$stage/licenses" -Force
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/$out.zip"
 
       - name: Verify bundled font licenses
@@ -118,7 +122,10 @@ jobs:
           if (-not $candle -or -not $light) { throw "WiX (candle/light) 不可用：MSI 打包失败" }
           $stage = (Resolve-Path "stage/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}").Path
           $msi = "dist/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}.msi"
-          & candle.exe -nologo -dVersion=${{ steps.version.outputs.value }} -dBinDir=$stage -out "stage/fulu.wixobj" packaging/windows/fulu.wxs
+          # CI 实测（v0.3.2）：pwsh 会把 `-dVersion=0.3.2` 按数字裸词切成
+          # `-dVersion=0` + `.3.2` 两个参数（CNDL0103 找不到文件 '.3.2'）——
+          # 整个开关必须加引号，与 bash 行为不同（本地 bash 复现不出来）。
+          & candle.exe -nologo "-dVersion=${{ steps.version.outputs.value }}" "-dBinDir=$stage" -out "stage/fulu.wixobj" packaging/windows/fulu.wxs
           if ($LASTEXITCODE -ne 0) { throw "candle 失败" }
           & light.exe -nologo -out $msi "stage/fulu.wixobj"
           if ($LASTEXITCODE -ne 0) { throw "light 失败" }
