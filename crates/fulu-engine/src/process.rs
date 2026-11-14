@@ -444,12 +444,21 @@ mod tests {
 
     #[test]
     fn occupied_port_is_refused_instead_of_reused() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        assert_eq!(assert_port_free(port), Err(EngineError::PortInUse(port)));
-        drop(listener);
-        // 释放后再次检查应通过（端口此刻空闲）。
-        assert!(assert_port_free(port).is_ok());
+        // CI 修证（macos-15-intel 实测）：drop 后「刚释放的端口」正是内核优先
+        // 复用的对象，并行的 mock（bind 127.0.0.1:0）可能立刻抢走它，
+        // assert_port_free 的 connect 探测随即误报 PortInUse。语义本身
+        // （占用 → 拒用；空闲 → 放行）不变，只是换新端口重试抢占比。
+        for _ in 0..8 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            assert_eq!(assert_port_free(port), Err(EngineError::PortInUse(port)));
+            drop(listener);
+            // 释放后再次检查应通过；被并行测试抢占则换端口重来。
+            if assert_port_free(port).is_ok() {
+                return;
+            }
+        }
+        panic!("连续 8 次刚释放的端口都被并行测试抢占——检查 mock 端口分配");
     }
 
     #[test]

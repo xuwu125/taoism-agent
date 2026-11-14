@@ -890,6 +890,11 @@ mod tests {
     }
 
     /// 起一个只收一次请求的假服务，把**请求头原文**交回来。
+    /// 回环 mock 专用互斥（CI/本地双实测）：并行 bind(127.0.0.1:0) 在 Windows
+    /// 上存在端口共享/顶替的内核行为——别的测试的请求会被送进本测试的 mock，
+    /// 抓到的请求头张冠李戴。mock 类测试必须串行，才谈得上验证各自语义。
+    static MOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn capture_headers_once(response_body: String) -> (u16, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -916,6 +921,7 @@ mod tests {
 
     #[test]
     fn bearer_token_is_sent_only_when_explicitly_injected() {
+        let _mock = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let chat = r#"{"choices":[{"message":{"content":"好"}}]}"#;
         let (port, headers) = capture_headers_once(chat.to_owned());
         let mut provider =
@@ -937,36 +943,54 @@ mod tests {
 
     #[test]
     fn no_authorization_header_without_a_token() {
-        let chat = r#"{"choices":[{"message":{"content":"好"}}]}"#;
-        let (port, headers) = capture_headers_once(chat.to_owned());
-        let mut provider =
-            LocalLfmProvider::from_model("lfm3-1.7b-q4km", 8192, "llama.cpp >= b11960");
-        provider
-            .set_endpoint(&format!("http://127.0.0.1:{port}"))
-            .expect("端点合法");
-        // CI 修证：windows-latest 上回环连接偶发 refused（runner 已知噪音，与本测试
-        // 要验的「无 Authorization 头」无关）。只对「连接被拒」类传输错误做有限重试；
-        // 一旦请求真正抵达 mock 服务，后续任何错误照旧失败，不掩盖真问题。
-        let mut result = provider.invoke(&sample_request());
-        for _ in 0..3 {
-            match &result {
-                Err(ProviderError::Transport(msg))
-                    if msg.contains("refused") || msg.contains("os error 10061") =>
-                {
-                    std::thread::sleep(Duration::from_millis(200));
-                    result = provider.invoke(&sample_request());
+        let _mock = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // CI 修证（两轮实测）：windows-latest 上本测试的回环 mock 会「持续 refused」。
+        // std 在 Windows 默认对监听套接字开 SO_REUSEADDR——并行的多个 mock 可能绑到
+        // 同一端口互相顶掉，被顶掉方端口从此 refused，对同一端口重试无效。
+        // 因此每轮失败就换新端口重建 mock；请求正文带唯一标记，
+        // 防止 connect 落到别的测试的 mock 上串台误判。
+        let mut last_error = String::new();
+        for _ in 0..5 {
+            let chat = r#"{"choices":[{"message":{"content":"好"}}]}"#;
+            let (port, headers) = capture_headers_once(chat.to_owned());
+            let mut provider =
+                LocalLfmProvider::from_model("lfm3-1.7b-q4km", 8192, "llama.cpp >= b11960");
+            provider
+                .set_endpoint(&format!("http://127.0.0.1:{port}"))
+                .expect("端点合法");
+            let request = InvocationRequest {
+                model_id: "lfm3-1.7b-q4km".into(),
+                system: "你是助手".into(),
+                user: "无令牌回环标记-8f3c".into(),
+                tools_json: "[]".into(),
+                sampling: Sampling::default(),
+                budget_tokens: 2048,
+                context_tokens: 8192,
+            };
+            match provider.invoke(&request) {
+                Ok(_) => {
+                    let raw = headers
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("应收到请求");
+                    // 串台防御：抓到的必须是我们这轮的请求。
+                    assert!(
+                        raw.contains("无令牌回环标记-8f3c"),
+                        "抓到的是别的测试的请求（端口串台），本测试无效：{raw}"
+                    );
+                    assert!(
+                        !raw.to_ascii_lowercase().contains("authorization"),
+                        "无令牌时不得出现 Authorization（尤其是空的 Bearer）：{raw}"
+                    );
+                    return;
                 }
-                _ => break,
+                Err(error) => last_error = format!("{error:?}"),
             }
+            if !last_error.contains("refused") && !last_error.contains("10061") {
+                break; // 非连接类错误不重试，直接走 panic。
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
-        result.expect("应成功");
-        let raw = headers
-            .recv_timeout(Duration::from_secs(5))
-            .expect("应收到请求");
-        assert!(
-            !raw.to_ascii_lowercase().contains("authorization"),
-            "无令牌时不得出现 Authorization（尤其是空的 Bearer）：{raw}"
-        );
+        panic!("应成功（连续多轮连接被拒，已换端口重试）：{last_error}");
     }
 
     #[test]
@@ -996,6 +1020,7 @@ mod tests {
 
     #[test]
     fn loaded_models_accepts_openai_data_and_llama_cpp_models_shapes() {
+        let _mock = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // OpenAI 兼容格式
         let (port, _headers) = capture_headers_once(r#"{"data":[{"id":"lfm3"}]}"#.to_owned());
         let mut provider = LocalLfmProvider::from_model("lfm3", 1024, "r");
