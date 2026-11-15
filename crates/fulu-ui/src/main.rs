@@ -712,13 +712,34 @@ impl FuluApp {
         }
     }
 
-    /// 太极编排面板。顺序：说明 → 载入 → 层视图 → 节点表 → 确认 → 焚化 → 进度 → 回执。
+    /// 太极编排面板。顺序：阴阳图 → 载入 → 层视图 → 节点表 → 确认 → 焚化 → 进度 → 回执。
     fn taiji_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("太极编排");
-        ui.label(
-            "整张符图一次性确认；编排器不会替任何节点点头。\
-             本视图不提供中止：单符的中止只在『③ 焚符』可用。",
-        );
+        // 传统阴阳鱼 + 先天八卦环：纯视觉，不承载编排判定；焚化中缓转只是
+        // 活动指示（与旁边的 spinner 同义），静止时正位。
+        let rotation = if self.taiji_running {
+            ui.ctx().request_repaint();
+            let t = ui.ctx().input(|i| i.time) as f32;
+            (t * 0.35) % std::f32::consts::TAU
+        } else {
+            0.0
+        };
+        ui.horizontal(|ui| {
+            let (diagram, _) =
+                ui.allocate_exact_size(egui::vec2(172.0, 172.0), egui::Sense::hover());
+            ink::taiji(ui.painter(), diagram, rotation);
+            ui.vertical(|ui| {
+                ui.heading("太极编排");
+                ui.label(
+                    "整张符图一次性确认；编排器不会替任何节点点头。\
+                     本视图不提供中止：单符的中止只在『③ 焚符』可用。",
+                );
+                ui.label(
+                    egui::RichText::new("图式为传统阴阳鱼与先天八卦环，纯装饰，不承载任何编排判定")
+                        .weak()
+                        .small(),
+                );
+            });
+        });
         ui.separator();
 
         // 载入行（焚化途中不允许换图）。
@@ -2081,8 +2102,20 @@ impl FuluApp {
 
             // 三个云篆符各对应一个真实段：上=天柱、中=符胆、下=符脚。
             // 该段缺字段就不落墨、只留虚线框——纸面不假装这张符是完整的。
-            let strokes: Vec<&[(i32, i32)]> =
-                script.strokes.iter().map(|stroke| stroke.points).collect();
+            // 笔画按传统符式分组取用（不是六笔全叠成一团）：
+            // 天柱 = 天柱骨干 + 云卷顶 + 星点；符胆 = 云卷 + 环钩 + 雷纹 + 星点
+            // （符胆是全符密结所在，笔画最多）；符脚 = 雷纹 + 波曲 + 星点。
+            let primitive = |index: usize| script.strokes[index].points;
+            let glyph_strokes = |band: paper::Band| -> Vec<&[(i32, i32)]> {
+                match band {
+                    paper::Band::Sky => vec![primitive(1), primitive(0), primitive(5)],
+                    paper::Band::Dan => {
+                        vec![primitive(0), primitive(4), primitive(2), primitive(5)]
+                    }
+                    paper::Band::Foot => vec![primitive(2), primitive(3), primitive(5)],
+                    _ => vec![],
+                }
+            };
             let is_filled = |band: paper::Band| -> bool {
                 layout
                     .zones
@@ -2102,7 +2135,7 @@ impl FuluApp {
                     ),
                     egui::vec2(rect.width() * 0.46, rect.height() * (end - start)),
                 );
-                ink::cloud_glyph(&painter, glyph, &strokes, is_filled(band), seed);
+                ink::cloud_glyph(&painter, glyph, &glyph_strokes(band), is_filled(band), seed);
             }
 
             // 符胆勒文：一列竖排小字，取描述层 Body 首行（已按字符裁剪，截断不静默）。

@@ -3,8 +3,10 @@
 //! 边界先说清楚，避免误会：
 //!
 //! - 这里给的是**几何描述**（整数坐标、归一化到 0..=1000），不是字形数据，也不是位图；
-//! - 内置的六种「笔画基元」是**抽象折线**（横、竖、撇、捺、折、点），用来让 GUI 先把版式
-//!   与笔顺跑通，**不冒充书法字帖**；真正的云篆字形需要字形数据源，属后续工作；
+//! - 内置的六种「笔画基元」按**传统云篆造型规律**重绘（云卷 / 天柱 / 雷纹 / 波曲 /
+//!   环钩 / 星点，见 [`STROKE_PRIMITIVES`] 注释），用来让 GUI 把版式与笔顺跑通；
+//!   造型规律参考传统，**不冒充逐字考据的书法字帖**；真正的云篆字形需要字形数据源，
+//!   属后续工作；
 //! - 全部整数、无浮点，与项目「canonical 序列化无浮点」的约定一致；
 //! - 本模块不做渲染，也不依赖任何 GUI 库——`fulu-ui` 只消费这些结构。
 //!
@@ -154,29 +156,132 @@ pub fn stroke_schedule(strokes: &[Stroke], total_ms: u64) -> Vec<(u64, u64)> {
 }
 
 /// 六种笔画基元。**抽象几何，不是书法字形。**
+/// 六种笔画基元：**按传统道教云篆的造型规律重绘**（2026-11-15，用户要求
+/// 「参考传统道教的图形来处理」）。
+///
+/// - 「云卷」＝内卷螺旋，即符箓常见的卷云头 / 螺纹；
+/// - 「天柱」＝竖钩蚓笔（S 形波动 + 底部出钩），符的骨干竖笔；
+/// - 「雷纹」＝折电之形，符胆里常见的锯齿笔画；
+/// - 「波曲」＝横波蚓笔，即符头下「三勾」式的波浪横笔；
+/// - 「环钩」＝开环带尾钩，云篆的环形笔画；
+/// - 「星点」＝短点，对应符面的星辰点缀。
+///
+/// **诚实边界**：这些是**几何描述**（整数坐标、归一化 0..=1000），造型规律
+/// 参考了传统云篆（卷云 / 蚓笔 / 雷纹 / 环钩），但**不是逐字考据的真实
+/// 符篆字形**——真字形仍需数据源（docs/02 §28.5），不冒充书法字帖。
 pub const STROKE_PRIMITIVES: &[Stroke] = &[
     Stroke {
-        name: "横",
-        points: &[(120, 500), (880, 500)],
+        name: "云卷",
+        points: &[
+            (520, 100),
+            (667, 144),
+            (782, 238),
+            (849, 364),
+            (861, 500),
+            (821, 625),
+            (740, 720),
+            (633, 774),
+            (520, 782),
+            (418, 747),
+            (342, 678),
+            (301, 591),
+            (297, 500),
+            (328, 420),
+            (383, 363),
+            (452, 335),
+            (520, 337),
+            (577, 363),
+            (615, 405),
+            (630, 454),
+            (624, 500),
+            (603, 534),
+            (573, 553),
+            (543, 555),
+        ],
     },
     Stroke {
-        name: "竖",
-        points: &[(500, 120), (500, 880)],
+        name: "天柱",
+        points: &[
+            (500, 80),
+            (519, 131),
+            (533, 182),
+            (540, 232),
+            (537, 283),
+            (527, 334),
+            (510, 385),
+            (490, 435),
+            (473, 486),
+            (463, 537),
+            (460, 588),
+            (467, 638),
+            (481, 689),
+            (500, 740),
+            (560, 770),
+            (640, 830),
+            (700, 790),
+        ],
     },
     Stroke {
-        name: "撇",
-        points: &[(760, 160), (240, 840)],
+        name: "雷纹",
+        points: &[
+            (180, 150),
+            (450, 300),
+            (310, 430),
+            (560, 570),
+            (420, 700),
+            (680, 850),
+        ],
     },
     Stroke {
-        name: "捺",
-        points: &[(240, 160), (760, 840)],
+        name: "波曲",
+        points: &[
+            (120, 480),
+            (152, 503),
+            (183, 523),
+            (215, 538),
+            (247, 548),
+            (278, 550),
+            (310, 545),
+            (342, 533),
+            (373, 515),
+            (405, 494),
+            (437, 471),
+            (468, 449),
+            (500, 431),
+            (532, 417),
+            (563, 411),
+            (595, 411),
+            (627, 419),
+            (658, 434),
+            (690, 453),
+            (722, 475),
+            (753, 498),
+            (785, 519),
+            (817, 536),
+            (848, 546),
+            (880, 550),
+        ],
     },
     Stroke {
-        name: "折",
-        points: &[(220, 200), (780, 200), (780, 780)],
+        name: "环钩",
+        points: &[
+            (500, 220),
+            (640, 258),
+            (742, 360),
+            (780, 500),
+            (742, 640),
+            (640, 742),
+            (500, 780),
+            (360, 742),
+            (258, 640),
+            (220, 500),
+            (258, 360),
+            (170, 420),
+            (240, 330),
+        ],
     },
     Stroke {
-        name: "点",
+        name: "星点",
         points: &[(500, 420), (620, 560)],
     },
 ];
@@ -305,17 +410,18 @@ mod tests {
 
     #[test]
     fn partial_cut_walks_the_corner_not_the_chord() {
-        // 「折」是三点的 L 形：截到一半必须沿横段走到拐角，再沿竖段往下，不许直线切角。
-        let fold = &STROKE_PRIMITIVES[4];
-        let half = partial_polyline(fold.points, 500);
-        assert_eq!(half[0], (220, 200));
-        assert_eq!(half[1], (780, 200), "横段 560 已走完（到拐角）");
-        assert_eq!(half[2].0, 780, "末点必须在竖段上（x 不变）");
-        assert!(
-            half[2].1 > 200 && half[2].1 < 780,
-            "y 应落在竖段中间：{:?}",
-            half
-        );
+        // 「环钩」是 13 点的开环带尾钩：截到一半必须沿折线逐点走，不许直线切角。
+        // 长度是唯一裁判：半程的部分折线长度 ≈ 总长的一半（坐标取整允许小误差）。
+        let hook = &STROKE_PRIMITIVES[4];
+        let half = partial_polyline(hook.points, 500);
+        assert_eq!(half[0], hook.points[0], "起点不变");
+        assert!(half.len() >= 3, "半程至少走到第三个点：{:?}", half);
+        let total = polyline_length(hook.points);
+        let walked = polyline_length(&half);
+        let drift = (walked as i64 - total as i64 / 2).unsigned_abs();
+        assert!(drift <= total / 20, "半程长度误差应 ≤5%：{drift} / {total}");
+        // 完整走完必须原样返回。
+        assert_eq!(partial_polyline(hook.points, 1000), hook.points.to_vec());
     }
 
     #[test]
@@ -330,10 +436,10 @@ mod tests {
             assert!(end - start >= 90, "每笔至少 90 ms，否则看不出笔顺");
             assert!(start < end);
         }
-        // 长笔（撇 ~856）分到的时长必须多于短笔（横 760）。
-        let heng = schedule[0].1 - schedule[0].0;
-        let pie = schedule[2].1 - schedule[2].0;
-        assert!(pie > heng, "时长应与折线长度成正比：{pie} vs {heng}");
+        // 长笔（云卷螺旋 ~2100）分到的时长必须多于短笔（星点 ~193）。
+        let juan = schedule[0].1 - schedule[0].0;
+        let dian = schedule[5].1 - schedule[5].0;
+        assert!(juan > dian, "时长应与折线长度成正比：{juan} vs {dian}");
         // 调用方应以末笔 end 为总时长，而不是请求值：比例时长向下取整、
         // 保底 90 ms 都可能让总长偏离请求值，只保证量级不变。
         let total = schedule.last().unwrap().1;
@@ -351,7 +457,81 @@ mod tests {
             }
         }
         let names: Vec<&str> = STROKE_PRIMITIVES.iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["横", "竖", "撇", "捺", "折", "点"]);
+        assert_eq!(names, vec!["云卷", "天柱", "雷纹", "波曲", "环钩", "星点"]);
+    }
+
+    #[test]
+    fn cloud_strokes_follow_traditional_forms() {
+        // 传统云篆造型规律的可测断言：云卷必须内卷（首末点距离远小于半径跨度）、
+        // 天柱必须近似竖直（x 跨度小、y 跨度大）、雷纹必须折返（x 方向至少两次反向）、
+        // 波曲必须横向波动（y 有起有伏）、环钩必须绕行（方位角覆盖 > 270°）。
+        let juan = &STROKE_PRIMITIVES[0];
+        // 卷心 (520,500)：首点在外圈（距心 > 300），末点必须卷回内圈（距心 < 150）。
+        let dist = |p: (i32, i32)| -> u64 {
+            let (dx, dy) = (p.0 as i64 - 520, p.1 as i64 - 500);
+            (dx * dx + dy * dy) as u64
+        };
+        assert!(dist(juan.points[0]) > 90_000, "首点应在外圈");
+        assert!(
+            dist(*juan.points.last().unwrap()) < 22_500,
+            "末点应卷回内圈"
+        );
+
+        let zhu = &STROKE_PRIMITIVES[1];
+        let span_x = zhu
+            .points
+            .iter()
+            .map(|p| p.0)
+            .fold(i32::MAX, i32::min)
+            .abs_diff(zhu.points.iter().map(|p| p.0).fold(i32::MIN, i32::max));
+        let span_y = zhu
+            .points
+            .iter()
+            .map(|p| p.1)
+            .fold(i32::MAX, i32::min)
+            .abs_diff(zhu.points.iter().map(|p| p.1).fold(i32::MIN, i32::max));
+        assert!(span_y > span_x * 3, "天柱应以竖为主：{span_y} vs {span_x}");
+
+        let lei = &STROKE_PRIMITIVES[2];
+        let mut reversals = 0;
+        for w in lei.points.windows(3) {
+            let d1 = (w[1].0 - w[0].0).signum();
+            let d2 = (w[2].1 - w[1].1).signum();
+            let _ = d2;
+            let dx2 = (w[2].0 - w[1].0).signum();
+            if d1 != 0 && dx2 != 0 && d1 != dx2 {
+                reversals += 1;
+            }
+        }
+        assert!(reversals >= 3, "雷纹应至少三次折返：{reversals}");
+
+        let bo = &STROKE_PRIMITIVES[3];
+        let ys: Vec<i32> = bo.points.iter().map(|p| p.1).collect();
+        let min_y = *ys.iter().min().unwrap();
+        let max_y = *ys.iter().max().unwrap();
+        assert!(max_y - min_y >= 100, "波曲应有明显起伏：{}", max_y - min_y);
+
+        let huan = &STROKE_PRIMITIVES[4];
+        // 绕行判定：环上相邻点的方位角增量同号且累计 > 270°。
+        let cx = 500.0_f64;
+        let cy = 500.0_f64;
+        let mut total = 0.0_f64;
+        let mut prev: Option<f64> = None;
+        for p in huan.points.iter().take(11) {
+            let ang = ((p.0 as f64 - cx).atan2(p.1 as f64 - cy)).to_degrees();
+            if let Some(p0) = prev {
+                let mut d = ang - p0;
+                if d > 180.0 {
+                    d -= 360.0;
+                }
+                if d < -180.0 {
+                    d += 360.0;
+                }
+                total += d;
+            }
+            prev = Some(ang);
+        }
+        assert!(total.abs() > 270.0, "环钩应绕行超过 270°：{total}");
     }
 
     #[test]

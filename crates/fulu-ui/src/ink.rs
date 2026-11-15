@@ -582,3 +582,114 @@ pub fn seal_stamp(p: &Painter, rect: Rect, short_digest: &str) {
         );
     }
 }
+
+/// 传统太极阴阳鱼 + 先天八卦环（纯矢量、纯视觉）。
+///
+/// 式样按传统道教图形：外圆一环；阴阳鱼由「右半阳、左半阴、上凸入阴、
+/// 下凸入阳」四块扇形拼出 S 曲线；鱼眼两点（阳中有阴眼、阴中有阳眼）。
+/// 外圈先天八卦（乾上坤下、离左坎右、兑居左上……），每卦三爻，阳爻整画、
+/// 阴爻断画，爻画沿切向排布。
+///
+/// **诚实边界**：这是纯视觉装饰。分层与执行顺序的唯一权威仍是
+/// `taiji::layers` 与 `TaijiGraph::validate`——太极图不承载任何编排判定。
+/// `rotation`（弧度）由调用方给出：运行中的缓转只是活动指示，绝不改变
+/// 任何状态语义；静止时传 `0.0`。
+pub fn taiji(p: &Painter, rect: Rect, rotation: f32) {
+    use std::f32::consts::{FRAC_PI_2, PI, TAU};
+    let center = rect.center();
+    let fish_r = (rect.width().min(rect.height()) * 0.5 - 26.0).max(28.0);
+    let yang = theme::c::GOLD;
+    let yin = theme::c::VOID;
+    let ring = theme::c::GOLD_DEEP;
+    let quarter_pi = PI * 0.25;
+
+    // 半盘（≤180° 的扇形）：圆心 + 弧上采样点构成凸多边形。整体随 rotation 转。
+    let half_disc = |cx: f32, cy: f32, r: f32, start: f32, end: f32, fill: Color32| {
+        let steps = 24;
+        let mut pts = vec![Pos2::new(cx, cy)];
+        for i in 0..=steps {
+            let a = start + (end - start) * i as f32 / steps as f32 + rotation;
+            pts.push(Pos2::new(cx + r * a.cos(), cy + r * a.sin()));
+        }
+        p.add(Shape::convex_polygon(pts, fill, Stroke::NONE));
+    };
+    // 阴盘打底（整圆），阳的右半、上凸、下凸逐块叠出 S 曲线。
+    p.circle_filled(center, fish_r, yin);
+    // 右半阳：上 → 右 → 下。
+    half_disc(center.x, center.y, fish_r, -FRAC_PI_2, FRAC_PI_2, yang);
+    // 上凸（半幅阳鱼头探入阴区）。
+    half_disc(
+        center.x,
+        center.y - fish_r * 0.5,
+        fish_r * 0.5,
+        FRAC_PI_2,
+        3.0 * FRAC_PI_2,
+        yang,
+    );
+    // 下凸（半幅阴鱼头探入阳区）。
+    half_disc(
+        center.x,
+        center.y + fish_r * 0.5,
+        fish_r * 0.5,
+        -FRAC_PI_2,
+        FRAC_PI_2,
+        yin,
+    );
+    // 鱼眼：阳头里一点阴，阴头里一点阳；随鱼身旋转。
+    let eye = |ang: f32, color: Color32| {
+        let a = ang + rotation;
+        p.circle_filled(
+            Pos2::new(
+                center.x + (fish_r * 0.5) * a.cos(),
+                center.y + (fish_r * 0.5) * a.sin(),
+            ),
+            (fish_r * 0.11).max(1.6),
+            color,
+        );
+    };
+    eye(-FRAC_PI_2, yin);
+    eye(FRAC_PI_2, yang);
+    // 外环两道：细金环收边。
+    p.circle_stroke(center, fish_r, Stroke::new(2.0, ring));
+    p.circle_stroke(center, fish_r - 3.0, Stroke::new(0.8, ring));
+
+    // 先天八卦环（不随鱼身旋转，保持方位恒定）。爻位：自鱼向外为初爻→上爻。
+    // bits = (初爻, 二爻, 上爻)，1 = 阳爻整画，0 = 阴爻断画。
+    let bagua: [(f32, [u8; 3]); 8] = [
+        (-FRAC_PI_2, [1, 1, 1]),        // 乾 · 上
+        (-3.0 * quarter_pi, [1, 1, 0]), // 兑 · 左上
+        (PI, [1, 0, 1]),                // 离 · 左
+        (3.0 * quarter_pi, [1, 0, 0]),  // 震 · 左下
+        (-quarter_pi, [0, 1, 1]),       // 巽 · 右上
+        (0.0, [0, 1, 0]),               // 坎 · 右
+        (quarter_pi, [0, 0, 1]),        // 艮 · 右下
+        (FRAC_PI_2, [0, 0, 0]),         // 坤 · 下
+    ];
+    let bar_len = fish_r * 0.62;
+    let bar_gap = (fish_r * 0.13).max(4.5);
+    let line = theme::c::GOLD_DEEP;
+    for (theta, bits) in bagua {
+        let dir = egui::vec2(theta.cos(), theta.sin());
+        let tangent = egui::vec2(-dir.y, dir.x);
+        for (i, solid) in bits.iter().enumerate() {
+            let pos = Pos2::new(
+                center.x + dir.x * (fish_r + 9.0 + i as f32 * bar_gap),
+                center.y + dir.y * (fish_r + 9.0 + i as f32 * bar_gap),
+            );
+            let a = pos - tangent * bar_len * 0.5;
+            let b = pos + tangent * bar_len * 0.5;
+            if *solid == 1 {
+                p.line_segment([a, b], Stroke::new(2.0, line));
+            } else {
+                // 阴爻断画：中间留三分之一空。
+                let cut = tangent * bar_len * 0.18;
+                let mid_a = pos - cut;
+                let mid_b = pos + cut;
+                p.line_segment([a, mid_a], Stroke::new(2.0, line));
+                p.line_segment([mid_b, b], Stroke::new(2.0, line));
+            }
+        }
+    }
+    // 让旋转角参与确定性（防止编译器警告未使用；rotation 已在扇形里用过）。
+    let _ = TAU;
+}
