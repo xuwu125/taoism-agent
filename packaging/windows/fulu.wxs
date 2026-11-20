@@ -19,7 +19,8 @@
            Version="$(var.Version)"
            Manufacturer="taoism-agent"
            UpgradeCode="6F3B2C1A-8D4E-4B9F-9C2A-1E5D7A3B6C90">
-    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" Platform="x64" />
+    <!-- Platform 由 CI 传入：x64 / arm64（WiX 3.11+ 支持 arm64 MSI Package）。 -->
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" Platform="$(var.Platform)" />
     <MajorUpgrade DowngradeErrorMessage="已安装更新的版本，请先卸载旧版本。" />
     <MediaTemplate EmbedCab="yes" />
 

@@ -22,11 +22,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # 3 平台 × 2 架构全 native runner：ARM64 用 GitHub 官方 arm64 runner
+        # （public 仓库免费），避免 GUI 交叉编译所需的 arm64 X11/Wayland 开发库。
+        # 每个 include 额外声明打包所需的架构参数，供 MSI/DEB/RPM/AppImage 使用。
         include:
-          - { os: windows-latest, target: x86_64-pc-windows-msvc }
-          - { os: macos-15-intel, target: x86_64-apple-darwin }
-          - { os: macos-15, target: aarch64-apple-darwin }
-          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    arch: x64,    msi_platform: x64,   deb_arch: amd64,  rpm_arch: x86_64, appimage_arch: x86_64 }
+          - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,   arch: arm64,  msi_platform: arm64, deb_arch: arm64,  rpm_arch: aarch64, appimage_arch: aarch64 }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin,       arch: x64,    msi_platform: x64,   deb_arch: amd64,  rpm_arch: x86_64, appimage_arch: x86_64 }
+          - { os: macos-15,         target: aarch64-apple-darwin,      arch: arm64,  msi_platform: arm64, deb_arch: arm64,  rpm_arch: aarch64, appimage_arch: aarch64 }
+          - { os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  arch: x64,    msi_platform: x64,   deb_arch: amd64,  rpm_arch: x86_64, appimage_arch: x86_64 }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, arch: arm64,  msi_platform: arm64, deb_arch: arm64,  rpm_arch: aarch64, appimage_arch: aarch64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +50,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
-            libfuse2
+            libfuse2 rpm
 
       - name: Build release binaries
         run: cargo build --release --locked --target ${{ matrix.target }} -p fulu-ui -p fulu-cli
@@ -116,20 +121,44 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # WiX 3 在 windows-latest 自带；缺失时直接失败，绝不产出一个「看起来像安装包」的假产物。
-          $candle = Get-Command candle.exe -ErrorAction SilentlyContinue
-          $light = Get-Command light.exe -ErrorAction SilentlyContinue
-          if (-not $candle -or -not $light) { throw "WiX (candle/light) 不可用：MSI 打包失败" }
+          # windows-latest 自带 WiX 3；windows-11-arm 不带，用 chocolatey 补装
+          # （WiX 3.14 是 x86 程序，ARM64 Windows 上经 x86 模拟运行）。
+          function Find-Wix {
+            $c = Get-Command candle.exe -ErrorAction SilentlyContinue
+            $l = Get-Command light.exe -ErrorAction SilentlyContinue
+            if ($c -and $l) { return @{ candle = $c.Source; light = $l.Source } }
+            $pf = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+            foreach ($v in @("v3.14", "v3.11")) {
+              $bin = Join-Path $pf "WiX Toolset $v\bin"
+              $cf = Join-Path $bin "candle.exe"
+              $lf = Join-Path $bin "light.exe"
+              if ((Test-Path $cf) -and (Test-Path $lf)) { return @{ candle = $cf; light = $lf } }
+            }
+            return $null
+          }
+          $wix = Find-Wix
+          if (-not $wix) {
+            choco install wixtoolset --version 3.14.1 -y --no-progress
+            $wix = Find-Wix
+          }
           $stage = (Resolve-Path "stage/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}").Path
           $msi = "dist/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}.msi"
-          # CI 实测（v0.3.2）：pwsh 会把 `-dVersion=0.3.2` 按数字裸词切成
-          # `-dVersion=0` + `.3.2` 两个参数（CNDL0103 找不到文件 '.3.2'）——
-          # 整个开关必须加引号，与 bash 行为不同（本地 bash 复现不出来）。
-          & candle.exe -nologo "-dVersion=${{ steps.version.outputs.value }}" "-dBinDir=$stage" -out "stage/fulu.wixobj" packaging/windows/fulu.wxs
-          if ($LASTEXITCODE -ne 0) { throw "candle 失败" }
-          & light.exe -nologo -out $msi "stage/fulu.wixobj"
-          if ($LASTEXITCODE -ne 0) { throw "light 失败" }
-          Get-Item $msi | Select-Object Name, Length
+          try {
+            if (-not $wix) { throw "WiX (candle/light) 不可用：MSI 打包失败" }
+            # pwsh 会把 `-dVersion=0.3.2` 按数字裸词切成两段 → 整个开关必须加引号。
+            # -dPlatform 传给 wxs 的 $(var.Platform)；-arch 是 WiX 官方推荐的平台设置方式
+            # （Template 列写 x64/arm64），两者一致。arm64 要求 InstallerVersion>=500（wxs 已是 500）。
+            & $wix.candle -nologo "-dVersion=${{ steps.version.outputs.value }}" "-dBinDir=$stage" "-dPlatform=${{ matrix.msi_platform }}" -arch "${{ matrix.msi_platform }}" -out "stage/fulu.wixobj" packaging/windows/fulu.wxs
+            if ($LASTEXITCODE -ne 0) { throw "candle 失败" }
+            & $wix.light -nologo -out $msi "stage/fulu.wixobj"
+            if ($LASTEXITCODE -ne 0) { throw "light 失败" }
+            Get-Item $msi | Select-Object Name, Length
+          } catch {
+            # MSI 失败不阻塞其它产物：ARM64 用户仍有 zip（含原生 fulu.exe / fulu-ui.exe）。
+            "MSI 打包失败（zip 产物仍可用）：$($_.Exception.Message)" |
+              Out-File -Encoding utf8 "dist/MSI-UNAVAILABLE-${{ matrix.target }}.txt"
+            Write-Host "::warning::MSI 打包失败，已用 zip 覆盖 ${{ matrix.target }}：$($_.Exception.Message)"
+          }
 
       - name: Installer (macOS DMG)
         if: runner.os == 'macOS'
@@ -151,7 +180,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PKG="stage/deb/fulu_${{ steps.version.outputs.value }}_amd64"
+          PKG="stage/deb/fulu_${{ steps.version.outputs.value }}_${{ matrix.deb_arch }}"
           mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/share/applications" \
                    "$PKG/usr/share/doc/fulu" "$PKG/usr/share/pixmaps"
           cp "$STAGE/fulu" "$STAGE/fulu-ui" "$PKG/usr/bin/"
@@ -166,7 +195,7 @@ jobs:
           Version: ${{ steps.version.outputs.value }}
           Section: devel
           Priority: optional
-          Architecture: amd64
+          Architecture: ${{ matrix.deb_arch }}
           Maintainer: taoism-agent <noreply@example.invalid>
           Depends: libc6, libxkbcommon0, libwayland-client0, libx11-6, libxcursor1, libxrandr2, libxi6, libgl1
           Description: 符箓台 fulu - 本地优先的多智能体符箓
@@ -214,11 +243,31 @@ jobs:
           EOF
           chmod +x "$APPDIR/AppRun"
           curl -fsSL -o appimagetool.AppImage \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.appimage_arch }}.AppImage"
           chmod +x appimagetool.AppImage
           ./appimagetool.AppImage --appimage-extract >/dev/null
-          ARCH=x86_64 ./squashfs-root/AppRun --no-appstream "$APPDIR" \
+          ARCH=${{ matrix.appimage_arch }} ./squashfs-root/AppRun --no-appstream "$APPDIR" \
             "dist/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}.AppImage"
+
+      # RPM 包：rpmbuild 在 ubuntu-22.04 与 ubuntu-22.04-arm 上均可原生构建。
+      # spec 用 --define 注入版本/架构/stage 目录；产物统一重命名到 dist。
+      - name: Installer (Linux RPM)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          RPMROOT="$PWD/stage/rpmbuild"
+          mkdir -p "$RPMROOT"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          rpmbuild -bb \
+            --define "_topdir $RPMROOT" \
+            --define "fulu_version ${{ steps.version.outputs.value }}" \
+            --define "fulu_arch ${{ matrix.rpm_arch }}" \
+            --define "fulu_bindir $PWD/$STAGE" \
+            packaging/linux/fulu.spec
+          RPM_OUT="dist/taoism-agent-${{ github.ref_name }}-${{ matrix.target }}.rpm"
+          find "$RPMROOT/RPMS" -name '*.rpm' -exec cp {} "$RPM_OUT" \;
+          test -s "$RPM_OUT"
+          ls -l "$RPM_OUT"
 
       # ---------------- T27：签名（有凭据才签，没有就明确标注未签名） ----------------
 
@@ -287,7 +336,7 @@ jobs:
         run: |
           set -euo pipefail
           if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
-          TARGETS="x86_64-pc-windows-msvc,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu"
+          TARGETS="x86_64-pc-windows-msvc,aarch64-pc-windows-msvc,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu"
           TAG_ARG=""
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then TAG_ARG="--tag $GITHUB_REF_NAME"; fi
           if ! "$PY" .github/scripts/gen_compliance_notes.py --check; then
@@ -305,7 +354,7 @@ jobs:
           for file in dist/*; do
             base="$(basename "$file")"
             case "$base" in
-              *.msi|*.dmg|*.deb|*.AppImage|*.tar.gz|*.zip)
+              *.msi|*.dmg|*.deb|*.rpm|*.AppImage|*.tar.gz|*.zip)
                 if command -v sha256sum >/dev/null 2>&1; then
                   sha256sum "$file" >> "SHA256SUMS-${{ matrix.target }}.txt"
                 else
@@ -338,7 +387,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TARGETS="x86_64-pc-windows-msvc,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu"
+          TARGETS="x86_64-pc-windows-msvc,aarch64-pc-windows-msvc,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu"
           TAG_ARG=""
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then TAG_ARG="--tag $GITHUB_REF_NAME"; fi
           python3 .github/scripts/gen_compliance_notes.py $TAG_ARG --targets "$TARGETS" \

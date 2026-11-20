@@ -2,6 +2,14 @@
 
 本项目采用「里程碑 + 补记」双轨：架构文档 `docs/02` 第 13–30 节记录设计决策与验证，本文件只记可交付的版本变化。
 
+## v0.4.0（2026-11-21）
+
+### 修复
+
+- **双架构发布矩阵：3 平台 × 2 架构 = 6 target 全部发布（用户要求「windows / linux / macos 的 arm 与 x64 都支持」，docs/02 §41.11、docs/03 §1 第 4 条改判）**：旧 v0.3.2 矩阵仅 4 target（Win/Linux 只有 x64、macOS 双架构），Windows ARM64 完全缺、Linux ARM64 只有 CLI build-only 无安装包。本次补齐 `aarch64-pc-windows-msvc`（`windows-11-arm`）与 `aarch64-unknown-linux-gnu`（`ubuntu-22.04-arm`），均用 GitHub 官方**原生 ARM64 runner**（public 仓库免费），GUI+CLI 完整编译，绕开交叉编译工具链障碍。矩阵每个 leg 注入 `arch`/`msi_platform`/`deb_arch`/`rpm_arch`/`appimage_arch` 打包参数；`fulu.wxs` 的 `Platform` 参数化，`windows-11-arm` 无 WiX 由 CI `choco install wixtoolset` 补装、MSI 失败只告警写 `MSI-UNAVAILABLE-<target>.txt`（zip 仍覆盖、不伪装成功）；macOS DMG、Windows/MSI、Unix tar.gz 均按 target 区分产物名。
+- **Linux 每架构四种安装包**：在 x64/arm64 两个 target 上各出 `.deb`（Architecture 注入 amd64/arm64）、**`.rpm`（新增 `packaging/linux/fulu.spec`，`rpmbuild --define` 注入版本/架构/stage 目录，release.yml 装 `rpm` 包）**、`.AppImage`（appimagetool 按架构选 x86_64/aarch64 版）、`.tar.gz`；Checksums 纳入 `*.rpm`。
+- **合规与校验同步 6 target**：release 两处 `Compliance TARGETS` 扩为 6 项；`SHA256SUMS` / `UNSIGNED` / 签名步骤按 target 分文件。**验证边界**：YAML 双文件 js-yaml 解析、wxs XML、6 唯一 target、每 leg 字段齐全、spec 宏齐全均本地静态验证通过；`rpmbuild`/`dpkg-deb`/WiX/appimagetool 需目标平台（本机 Windows 无工具、Docker daemon 不可用），打包实跑交由 CI 6 target 验证，未验不标完成。
+
 ## v0.3.1（2026-11-11，进行中）
 
 ### 新增
